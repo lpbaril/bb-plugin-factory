@@ -12,6 +12,14 @@ export const GH_ALLOWED = [
 ] as const;
 
 export const hostContract = defineRpcContract({
+  save_report: {
+    input: z.object({
+      /** File name only, such as rafter-<scan id>.json. */
+      name: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$/),
+      content: z.string().max(50_000_000),
+    }),
+    output: z.object({ path: z.string() }),
+  },
   gh: {
     input: z.object({
       args: z.array(z.string().max(20_000)).min(2).max(30),

@@ -1,6 +1,7 @@
 // Host worker: runs an allowlisted set of `gh pr` commands for the server.
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
+import { mkdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { experimental_defineHostEntry } from "@get-bb/plugin-sdk";
@@ -21,6 +22,13 @@ function findGh(): string {
 export default experimental_defineHostEntry({
   contract: hostContract,
   handlers: {
+    save_report: async ({ name, content }, ctx) => {
+      const dir = join(ctx.experimental_paths.dataDir, "rafter");
+      await mkdir(dir, { recursive: true });
+      const path = join(dir, name);
+      await writeFile(path, content, { mode: 0o600 });
+      return { path };
+    },
     gh: ({ args, stdin }, ctx) => {
       const allowed = GH_ALLOWED.some(([group, command]) => args[0] === group && args[1] === command);
       if (!allowed) {

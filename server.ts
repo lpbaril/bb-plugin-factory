@@ -765,13 +765,18 @@ export default async function plugin(bb: BbPluginApi) {
         focused[key] = value;
       }
     }
-    focused.factory_note = `Kept ${kept} findings that mention a file this PR changes (${files.join(", ")}). Omitted ${omitted} findings in other files: they predate this PR.`;
+    focused.factory_note = `${kept} findings mention a file this PR changes (${files.join(", ")}); ${omitted} others are only in the full report.`;
     return focused;
   }
-  function findingsText(data: unknown): string {
+  function findingsText(data: unknown, fullReportPath: string | null): string {
     // Scan output quotes repository code, so it is untrusted: keep it from closing the fenced block.
     const text = JSON.stringify(data, null, 1).replaceAll("```", "ʼʼʼ");
-    return text.length > 40_000 ? `${text.slice(0, 40_000)}\n… (truncated)` : text;
+    const where =
+      fullReportPath === null
+        ? "WARNING: the full report could not be saved, so you only have this excerpt. Do not APPROVE on the strength of Rafter alone; say the scan evidence is incomplete."
+        : `The full report, with every finding, is at ${fullReportPath}. Read it with your file tools: the excerpt below only lists findings that name a changed file, and this PR can also make code in other files reachable or worse.`;
+    const excerpt = text.length > 40_000 ? `${text.slice(0, 40_000)}\n… (excerpt cut here; see the full report)` : text;
+    return `${where}\n\n${excerpt}`;
   }
 
   const SENSITIVE_PATH = /(auth|login|session|token|secret|crypt|password|permission|rbac|rls|payment|billing|stripe|migration|alembic|\.sql$|terraform|docker|k8s|helm|\.github\/workflows|infra)/i;
@@ -901,7 +906,20 @@ export default async function plugin(bb: BbPluginApi) {
         bb.log.warn(`could not list files of PR #${pr.number}: ${String(error)}`);
       }
     }
-    const findings = result.status === "completed" ? findingsText(focusFindings(result.data, changedFiles)) : null;
+    let fullReportPath: string | null = null;
+    if (result.status === "completed" && scan.scanId !== null) {
+      try {
+        const saved = await host.call(
+          "save_report",
+          { name: `rafter-${scan.scanId.replace(/[^A-Za-z0-9._-]/g, "_")}.json`, content: JSON.stringify(result.data, null, 1) },
+          { hostId, timeoutMs: 60_000 },
+        );
+        fullReportPath = saved.path;
+      } catch (error) {
+        bb.log.warn(`could not save the Rafter report: ${String(error)}`);
+      }
+    }
+    const findings = result.status === "completed" ? findingsText(focusFindings(result.data, changedFiles), fullReportPath) : null;
     const failure = result.status === "failed" ? result.error : null;
     if (failure !== null) {
       await prComment(hostId, repo, pr.number, `**Factory:** the Rafter security scan failed: ${failure}. The Security reviewer continues without it.`);
