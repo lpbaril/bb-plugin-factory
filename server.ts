@@ -1387,6 +1387,15 @@ ${findings}`;
     if (pr === null || current === null || (current.verdict !== "changes" && current.verdict !== "pending")) {
       throw new PluginCliError(`${task.key} has no shadow review holding its PR.`, { code: "nothing_to_dismiss" });
     }
+    if (current.verdict === "pending") {
+      // A pending shadow can only be released by the person, and only once it has positively stopped.
+      if (args.by.kind !== "person") {
+        throw new PluginCliError("The shadow Security reviewer hasn't recorded a verdict yet; only a REQUEST CHANGES can be dismissed.", { code: "shadow_still_pending" });
+      }
+      const thread = current.threadId === null ? null : await bb.sdk.threads.get({ threadId: current.threadId }).catch(() => null);
+      const stopped = pr.shadowStallNotifiedAt !== null || (thread !== null && (thread.status === "idle" || thread.status === "error"));
+      if (!stopped) throw new PluginCliError("The shadow Security reviewer is still working; wait for its verdict.", { code: "shadow_still_running" });
+    }
     if (args.by.kind === "thread") {
       const incumbents = new Set(pr.reviews.filter((review) => review.role === "security").map((review) => review.threadId));
       if (args.by.threadId === null || !incumbents.has(args.by.threadId)) {
