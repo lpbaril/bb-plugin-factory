@@ -95,13 +95,14 @@ const VERDICT_STYLE: Record<PrSummary["checks"][number]["verdict"], { mark: stri
   approve: { mark: "✓", className: "text-emerald-600 dark:text-emerald-400" },
   changes: { mark: "✗", className: "text-destructive" },
   pending: { mark: "…", className: "text-muted-foreground" },
+  dismissed: { mark: "–", className: "text-muted-foreground" },
 };
 
 /** The latest verdict per role, in a fixed order. */
 function latestChecks(pr: PrSummary) {
   const byRole = new Map<string, PrSummary["checks"][number]>();
   for (const check of pr.checks) byRole.set(check.role, check);
-  return ["review1", "review2", "security"].flatMap((role) => byRole.get(role) ?? []);
+  return ["review1", "review2", "security", "shadow"].flatMap((role) => byRole.get(role) ?? []);
 }
 
 function PrChips({ pr }: { pr: PrSummary }) {
@@ -130,7 +131,7 @@ function PrChips({ pr }: { pr: PrSummary }) {
       </span>
       {latestChecks(pr).map((check) => (
         <span key={check.role} className="inline-flex items-center gap-0.5 rounded border border-border px-1.5 py-0.5" title={`${check.label}: ${check.verdict}`}>
-          {check.label === "Security" ? "Sec" : check.label.replace("Reviewer ", "R")}
+          {check.role === "shadow" ? "Shadow" : check.label === "Security" ? "Sec" : check.label.replace("Reviewer ", "R")}
           <span className={VERDICT_STYLE[check.verdict].className}>{VERDICT_STYLE[check.verdict].mark}</span>
         </span>
       ))}
@@ -726,6 +727,9 @@ function TaskDialog({
               <div className="space-y-1">
                 <div className="text-xs font-medium text-muted-foreground">Pull request</div>
                 <PrChips pr={task.pr} />
+                {latestChecks(task.pr).some((check) => check.role === "shadow" && check.verdict === "changes") ? (
+                  <ShadowDismiss taskKey={task.key} />
+                ) : null}
               </div>
             )}
 
@@ -821,6 +825,47 @@ function TaskDialog({
         )}
       </DialogContent>
     </Dialog>
+  );
+}
+
+/** The person's way to clear a shadow block they judge to be a false alarm. */
+function ShadowDismiss({ taskKey }: { taskKey: string }) {
+  const rpc = useRpc<typeof rpcContract>();
+  const [reason, setReason] = useState("");
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const dismiss = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setPending(true);
+    setError(null);
+    try {
+      await rpc.call("shadow_dismiss", { taskKey, reason: reason.trim() });
+      setReason("");
+    } catch (cause) {
+      setError(errorText(cause));
+    } finally {
+      setPending(false);
+    }
+  };
+  return (
+    <form onSubmit={dismiss} className="mt-2 space-y-2 rounded-md border border-amber-500/40 bg-amber-500/5 p-3">
+      <p className="text-xs">
+        The shadow Security reviewer requested changes, so this PR stays in draft. Fix the findings, or dismiss them
+        with a reason. The task's activity has its findings.
+      </p>
+      <div className="flex gap-2">
+        <Input
+          value={reason}
+          onChange={(event) => setReason(event.target.value)}
+          placeholder="Why the findings don't hold"
+          aria-label="Reason for dismissing"
+        />
+        <Button type="submit" variant="outline" disabled={pending || reason.trim().length < 3}>
+          Dismiss
+        </Button>
+      </div>
+      {error === null ? null : <p className="text-xs text-destructive">{error}</p>}
+    </form>
   );
 }
 

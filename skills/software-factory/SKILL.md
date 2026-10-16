@@ -36,7 +36,8 @@ In review, Done and Blocked; cards show their pull request and its verdicts.
 | `bb factory create --prefix APP [--project proj_...] [--name "..."]` | Create a factory and its Tasks tracker (or reuse a tracker with that prefix). The project defaults to the current thread's. |
 | `bb factory start APP [--goal "..."]` | Start the Lead thread. |
 | `bb factory assign APP-12 --role build\|qa\|design\|review1\|review2\|security [--instructions "..."]` | Spawn a specialist for the task as the Lead's child. Builder and Designer get a new worktree; the others reuse the task's builder worktree. PR reviewers are normally started automatically instead. |
-| `bb factory verdict APP-12 --role review1\|review2\|security --verdict approve\|changes [--pr N]` | Record a reviewer's verdict on the task's PR, after posting it as a PR comment. |
+| `bb factory verdict APP-12 --role review1\|review2\|security\|shadow --verdict approve\|changes [--pr N]` | Record a reviewer's verdict on the task's PR, after posting it (as a PR comment; the shadow reviewer posts a task comment). Only the reviewer thread the factory started can record it. |
+| `bb factory dismiss APP-12 --reason "..."` | Dismiss the shadow Security reviewer's REQUEST CHANGES. Only the task's Security reviewer can run this; the person can also dismiss from the task on the Factory page. |
 | `bb factory rafter check` | Check the Rafter API key and show the scan quota (never prints the key). |
 | `bb factory rafter scan APP-12` | Rescan the task's open PR with Rafter and hand the results to its Security reviewer. |
 | `bb factory rafter report APP-12` | Save the full report of the latest finished scan and print its path. |
@@ -58,8 +59,12 @@ Tasks themselves are managed with `bb tasks` (`create`, `show`, `update
 permissions, automatic PR reviews on or off, the changed-line threshold for
 Reviewer 2, the secret Rafter API key and optional GitHub token for Rafter, and
 the shadow security reviewer (provider, model, and when it runs: off, the next N
-PRs, or every sensitive PR). The shadow reviewer never gates a merge: it posts
-only a task comment, and a comparison thread scores it against the incumbent.
+PRs, or every sensitive PR, judged by changed paths and the PR title). The shadow
+reviewer posts only task comments, and a comparison thread scores it against the
+incumbent. With **Shadow REQUEST CHANGES blocks the ready gate** on, its REQUEST
+CHANGES keeps the PR in draft until a new commit fixes it (the shadow re-reviews)
+or the Security reviewer or the person dismisses it with a reason. The Lead sends
+real findings to the builder; it never dismisses them.
 
 ## Rules
 
