@@ -885,12 +885,15 @@ export default async function plugin(bb: BbPluginApi) {
     return thread === null || thread.status === "idle" || thread.status === "error";
   }
 
-  async function maybeCompareTrial(): Promise<void> {
+  async function maybeCompareTrial(): Promise<string> {
     const trial = await readTrial();
-    if (trial.runs.length === 0 || trial.comparisonThreadId !== null) return;
-    if ((await settings.get()).shadowPrs > 0) return;
+    if (trial.runs.length === 0) return "the trial has no runs yet";
+    if (trial.comparisonThreadId !== null) return `already compared in ${trial.comparisonThreadId}`;
+    const { shadowPrs } = await settings.get();
+    if (shadowPrs > 0) return `${shadowPrs} shadow reviews still to come`;
     for (const run of trial.runs) {
-      if (!(await threadDone(run.securityThreadId)) || !(await threadDone(run.shadowThreadId))) return;
+      if (!(await threadDone(run.securityThreadId))) return `waiting for ${run.securityThreadId} (PR #${run.pr})`;
+      if (!(await threadDone(run.shadowThreadId))) return `waiting for ${run.shadowThreadId} (PR #${run.pr})`;
     }
     const sections: string[] = [];
     for (const run of trial.runs) {
@@ -940,6 +943,7 @@ ${sections.join("\n\n---\n\n")}`;
       current.comparisonThreadId = thread.id;
     });
     bb.log.info(`started the reviewer trial comparison: ${thread.id}`);
+    return `started ${thread.id}`;
   }
 
   async function startScan(prefix: string, repo: string, prNumber: number, phase: "open" | "ready"): Promise<string | null> {
@@ -1494,6 +1498,12 @@ ${sections.join("\n\n---\n\n")}`;
             const tokenSet = typeof rafterGithubToken === "string" && rafterGithubToken.trim() !== "";
             if (input.options.json) return { exitCode: 0, stdout: JSON.stringify({ ok: true, usage: JSON.parse(text), githubTokenSet: tokenSet }) };
             return { exitCode: 0, stdout: `Rafter key works. GitHub token for Rafter: ${tokenSet ? "set" : "not set"}.\nUsage: ${text}` };
+          },
+        }),
+        "shadow compare": cliCommand({
+          summary: "Start the shadow reviewer trial's comparison now if every review is done, or say what it waits for",
+          async run() {
+            return { exitCode: 0, stdout: await maybeCompareTrial() };
           },
         }),
         "shadow backfill": cliCommand({
