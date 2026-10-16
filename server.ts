@@ -743,6 +743,31 @@ export default async function plugin(bb: BbPluginApi) {
       return { status: "running" };
     }
   }
+  /**
+   * Rafter scans the whole branch. Keep the findings that mention a file this PR
+   * changes, and summarize the rest, so the reviewer sees what matters untruncated.
+   */
+  function focusFindings(data: unknown, files: string[]): unknown {
+    if (files.length === 0 || typeof data !== "object" || data === null) return data;
+    let kept = 0;
+    let omitted = 0;
+    const focused: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(data)) {
+      if (Array.isArray(value) && value.some((item) => typeof item === "object" && item !== null)) {
+        const inPr = value.filter((item) => {
+          const text = JSON.stringify(item);
+          return files.some((file) => text.includes(file));
+        });
+        kept += inPr.length;
+        omitted += value.length - inPr.length;
+        focused[key] = inPr;
+      } else {
+        focused[key] = value;
+      }
+    }
+    focused.factory_note = `Kept ${kept} findings that mention a file this PR changes (${files.join(", ")}). Omitted ${omitted} findings in other files: they predate this PR.`;
+    return focused;
+  }
   function findingsText(data: unknown): string {
     // Scan output quotes repository code, so it is untrusted: keep it from closing the fenced block.
     const text = JSON.stringify(data, null, 1).replaceAll("```", "ʼʼʼ");
@@ -867,7 +892,16 @@ export default async function plugin(bb: BbPluginApi) {
       target.status = result.status;
       target.error = result.status === "failed" ? result.error : null;
     });
-    const findings = result.status === "completed" ? findingsText(result.data) : null;
+    let changedFiles: string[] = [];
+    if (result.status === "completed") {
+      try {
+        const view = JSON.parse(await gh(hostId, ["pr", "view", String(pr.number), "--repo", repo, "--json", "files"])) as { files?: { path: string }[] };
+        changedFiles = (view.files ?? []).map((file) => file.path);
+      } catch (error) {
+        bb.log.warn(`could not list files of PR #${pr.number}: ${String(error)}`);
+      }
+    }
+    const findings = result.status === "completed" ? findingsText(focusFindings(result.data, changedFiles)) : null;
     const failure = result.status === "failed" ? result.error : null;
     if (failure !== null) {
       await prComment(hostId, repo, pr.number, `**Factory:** the Rafter security scan failed: ${failure}. The Security reviewer continues without it.`);
@@ -1268,6 +1302,47 @@ export default async function plugin(bb: BbPluginApi) {
               threadId: ctx.threadId ?? null,
             });
             return { exitCode: 0, stdout: `Recorded ${input.options.verdict} from ${ROLES[input.options.role as PrReviewRole].label} on PR #${pr.number}.` };
+          },
+        }),
+        "rafter check": cliCommand({
+          summary: "Check the Rafter API key and show scan quota (never prints the key)",
+          options: { json },
+          async run(input) {
+            const key = await rafterKey();
+            if (key === null) {
+              throw new PluginCliError("No Rafter API key is set.", { code: "no_rafter_key", hint: "Add it in Settings → Plugins → Factory." });
+            }
+            const response = await fetch("https://rafter.so/api/static/usage", {
+              redirect: "manual",
+              headers: { "x-api-key": key },
+              signal: AbortSignal.timeout(30_000),
+            });
+            const text = await response.text();
+            if (response.status !== 200) {
+              throw new PluginCliError(`Rafter rejected the key (HTTP ${response.status}): ${text.slice(0, 200)}`, { code: "rafter_key_rejected" });
+            }
+            const { rafterGithubToken } = await settings.get();
+            const tokenSet = typeof rafterGithubToken === "string" && rafterGithubToken.trim() !== "";
+            if (input.options.json) return { exitCode: 0, stdout: JSON.stringify({ ok: true, usage: JSON.parse(text), githubTokenSet: tokenSet }) };
+            return { exitCode: 0, stdout: `Rafter key works. GitHub token for Rafter: ${tokenSet ? "set" : "not set"}.\nUsage: ${text}` };
+          },
+        }),
+        "rafter scan": cliCommand({
+          summary: "Run a Rafter scan of a task's open PR now and hand the results to its Security reviewer",
+          positionals: [{ name: "task", description: "Task key, such as APP-12", required: true }],
+          async run(input) {
+            const task = await getTaskByKey(input.positionals.task);
+            const factory = await factoryForTaskKey(task.key);
+            const pr = latestPr(factory, task.key);
+            if (pr === null || pr.state !== "open") {
+              throw new PluginCliError(`${task.key} has no open pull request the factory is tracking.`, { code: "no_pr" });
+            }
+            const { repo } = await projectHost(factory);
+            if (repo === null) throw new PluginCliError("The project has no GitHub remote.", { code: "no_repo" });
+            const error = await startScan(factory.prefix, repo, pr.number, pr.isDraft ? "open" : "ready");
+            if (error !== null) throw new PluginCliError(`Rafter could not start the scan: ${error}`, { code: "rafter_failed" });
+            wakePrWatch();
+            return { exitCode: 0, stdout: `Rafter is scanning ${pr.branch} for PR #${pr.number}. The Security reviewer gets the results when it finishes.` };
           },
         }),
         block: cliCommand({
