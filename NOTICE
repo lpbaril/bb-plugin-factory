@@ -10,3 +10,6 @@ Version 2.0. The adaptation replaces OpenRig's coordination commands with bb's.
 The UI components in components/, hooks/ and lib/ come from the bb plugin
 registry (https://github.com/get-bb/bb), built on shadcn/ui
 (https://ui.shadcn.com), both under the MIT License.
+
+The factory icon (assets/factory.svg) is from Lucide (https://lucide.dev),
+licensed under the ISC License.

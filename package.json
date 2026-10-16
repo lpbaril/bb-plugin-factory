@@ -62,5 +62,13 @@
     "agents",
     "software-factory",
     "code-review"
-  ]
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lpbaril/bb-plugin-factory.git"
+  },
+  "homepage": "https://github.com/lpbaril/bb-plugin-factory#readme",
+  "bugs": {
+    "url": "https://github.com/lpbaril/bb-plugin-factory/issues"
+  }
 }

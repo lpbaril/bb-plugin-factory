@@ -15,7 +15,7 @@ From bb's plugin marketplace, search for **Software Factory**. Or install
 from Git:
 
 ```sh
-bb plugin install git:https://github.com/OWNER/bb-plugin-factory.git
+bb plugin install git:https://github.com/lpbaril/bb-plugin-factory.git
 ```
 
 Then open **Factory** in the left navigation rail, choose **New factory**, pick
