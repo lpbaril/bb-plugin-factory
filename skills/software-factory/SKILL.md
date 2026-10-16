@@ -37,6 +37,11 @@ In review, Done and Blocked; cards show their pull request and its verdicts.
 | `bb factory start APP [--goal "..."]` | Start the Lead thread. |
 | `bb factory assign APP-12 --role build\|qa\|design\|review1\|review2\|security [--instructions "..."]` | Spawn a specialist for the task as the Lead's child. Builder and Designer get a new worktree; the others reuse the task's builder worktree. PR reviewers are normally started automatically instead. |
 | `bb factory verdict APP-12 --role review1\|review2\|security --verdict approve\|changes [--pr N]` | Record a reviewer's verdict on the task's PR, after posting it as a PR comment. |
+| `bb factory rafter check` | Check the Rafter API key and show the scan quota (never prints the key). |
+| `bb factory rafter scan APP-12` | Rescan the task's open PR with Rafter and hand the results to its Security reviewer. |
+| `bb factory rafter report APP-12` | Save the full report of the latest finished scan and print its path. |
+| `bb factory shadow compare [--now]` | Start the shadow reviewer comparison if its condition is met, or say what it waits for. |
+| `bb factory shadow backfill APP-12` | Add an already-reviewed open PR to the shadow reviewer trial. |
 | `bb factory block APP-12 --reason "..."` | Mark the task Blocked and record why. |
 | `bb factory unblock APP-12 [--note "..."]` | Clear Blocked. |
 | `bb factory status [APP]` | Print the board, the agents on each task, and each task's branch or PR with its verdicts. |
@@ -51,7 +56,10 @@ Tasks themselves are managed with `bb tasks` (`create`, `show`, `update
 
 `bb plugin config factory` shows them: the provider for each role, agent
 permissions, automatic PR reviews on or off, the changed-line threshold for
-Reviewer 2, and the secret Rafter API key and optional GitHub token for Rafter.
+Reviewer 2, the secret Rafter API key and optional GitHub token for Rafter, and
+the shadow security reviewer (provider, model, and when it runs: off, the next N
+PRs, or every sensitive PR). The shadow reviewer never gates a merge: it posts
+only a task comment, and a comparison thread scores it against the incumbent.
 
 ## Rules
 

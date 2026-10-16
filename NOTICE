@@ -1,0 +1,12 @@
+Software Factory for bb
+Copyright 2026 lpbaril
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product includes role prompts and team culture adapted from OpenRig
+(https://github.com/mvschwarz/openrig), licensed under the Apache License,
+Version 2.0. The adaptation replaces OpenRig's coordination commands with bb's.
+
+The UI components in components/, hooks/ and lib/ come from the bb plugin
+registry (https://github.com/get-bb/bb), built on shadcn/ui
+(https://ui.shadcn.com), both under the MIT License.

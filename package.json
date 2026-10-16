@@ -7,8 +7,8 @@
     "bbPluginSdk": ">=0.6.37"
   },
   "bb": {
-    "name": "Factory",
-    "description": "Run a software factory: a Lead agent that delegates tasks to builder, QA, designer and reviewer agents, with a live board of their work.",
+    "name": "Software Factory",
+    "description": "A Lead agent plans tasks and starts builder, QA and designer agents; independent agents review every pull request; a board shows the work.",
     "branding": {
       "icon": "./assets/factory.svg",
       "experimental_icons": {
@@ -54,6 +54,13 @@
     "tailwind-merge": "^3.4.0",
     "vaul": "^1.1.2"
   },
-  "description": "A software factory in bb: a Lead agent, specialist agents and a kanban board of their tasks.",
-  "license": "Apache-2.0"
+  "description": "Run a team of AI agents on your repo: a Lead plans tasks, specialists build them, and independent agents review every pull request.",
+  "license": "Apache-2.0",
+  "keywords": [
+    "bb",
+    "bb-plugin",
+    "agents",
+    "software-factory",
+    "code-review"
+  ]
 }
