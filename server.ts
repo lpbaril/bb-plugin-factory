@@ -119,6 +119,8 @@ const prSchema = z.object({
   openedAt: z.string(),
   /** Touches paths the shadow reviewer covers in "sensitive" mode. */
   shadow: z.boolean().default(false),
+  /** When the factory reported a shadow review that ended without a verdict. */
+  shadowStallNotifiedAt: z.string().nullable().default(null),
 });
 type Pr = z.infer<typeof prSchema>;
 
@@ -1072,6 +1074,7 @@ ${sections.join("\n\n---\n\n")}`;
         readyRequested: false,
         openedAt: new Date().toISOString(),
         shadow: wantsShadow(files, gp.title).length > 0,
+        shadowStallNotifiedAt: null,
       });
     });
     const task = await getTaskByKey(taskKey);
@@ -1184,6 +1187,21 @@ ${sections.join("\n\n---\n\n")}`;
     }
   }
 
+  /** A shadow review that ended without a verdict holds the PR; say so once so the person can dismiss it. */
+  async function maybeReportShadowStall(factory: Factory, hostId: string, repo: string, pr: Pr, shadow: Pr["reviews"][number]): Promise<void> {
+    if (pr.shadowStallNotifiedAt !== null || shadow.threadId === null) return;
+    if (Date.now() - Date.parse(shadow.at) < 5 * 60_000) return;
+    const thread = await bb.sdk.threads.get({ threadId: shadow.threadId }).catch(() => null);
+    // Unknown state stays "still running": report only a thread positively known to have stopped.
+    if (thread === null || (thread.status !== "idle" && thread.status !== "error")) return;
+    await mutateFactory(factory.prefix, (current) => {
+      const target = current.prs.find((candidate) => candidate.number === pr.number);
+      if (target !== undefined) target.shadowStallNotifiedAt = new Date().toISOString();
+    });
+    await prComment(hostId, repo, pr.number, `**Factory:** every reviewer approves, but the shadow Security reviewer stopped without recording a verdict, so this PR stays in draft. The owner can dismiss it from task ${pr.taskKey} on the Factory page.`);
+    await tellLead(factory, `[factory] PR #${pr.number} (${pr.taskKey}) is approved but held: the shadow Security reviewer (\`${shadow.threadId}\`) stopped without a verdict. Ask the person to check its task comment and dismiss it on the Factory page, or ask the shadow to finish with \`bb thread tell\`.`);
+  }
+
   async function maybeMarkReady(factory: Factory, hostId: string, repo: string, pr: Pr): Promise<void> {
     if (!pr.isDraft || pr.readyRequested || pr.state !== "open") return;
     if (pr.scans.some((scan) => scan.status === "running")) return;
@@ -1191,10 +1209,10 @@ ${sections.join("\n\n---\n\n")}`;
     if (!roles.every((role) => reviewFor(pr, role)?.verdict === "approve")) return;
     if ((await settings.get()).shadowBlocks) {
       const shadow = reviewFor(pr, "shadow");
-      if (shadow !== null) {
-        if (shadow.verdict === "changes") return;
-        // Wait for a running shadow review; one that ended without a verdict doesn't hold the PR.
-        if (shadow.verdict === "pending" && shadow.threadId !== null && !(await threadDone(shadow.threadId))) return;
+      // Fail closed: only an explicit approve or dismissal from the shadow opens the gate.
+      if (shadow !== null && shadow.verdict !== "approve" && shadow.verdict !== "dismissed") {
+        if (shadow.verdict === "pending") await maybeReportShadowStall(factory, hostId, repo, pr, shadow);
+        return;
       }
     }
     await gh(hostId, ["pr", "ready", String(pr.number), "--repo", repo]);
@@ -1365,8 +1383,9 @@ ${findings}`;
     const task = await getTaskByKey(args.taskKey);
     const factory = await factoryForTaskKey(task.key);
     const pr = latestPr(factory, task.key);
-    if (pr === null || reviewFor(pr, "shadow")?.verdict !== "changes") {
-      throw new PluginCliError(`${task.key} has no shadow REQUEST CHANGES to dismiss.`, { code: "nothing_to_dismiss" });
+    const current = pr === null ? null : reviewFor(pr, "shadow");
+    if (pr === null || current === null || (current.verdict !== "changes" && current.verdict !== "pending")) {
+      throw new PluginCliError(`${task.key} has no shadow review holding its PR.`, { code: "nothing_to_dismiss" });
     }
     if (args.by.kind === "thread") {
       const incumbents = new Set(pr.reviews.filter((review) => review.role === "security").map((review) => review.threadId));
@@ -1463,8 +1482,8 @@ ${findings}`;
     },
     task_assign: async (input) => ({ threadId: await assign(input) }),
     shadow_dismiss: async ({ taskKey, reason }, ctx) => {
-      // Only the Factory page (the person) may dismiss over RPC; another plugin may not.
-      if (ctx.experimental_caller?.kind === "plugin") throw new Error("Plugins cannot dismiss a shadow block.");
+      // Allow-list: only a client call (the Factory page) may dismiss; other plugins and unknown callers may not.
+      if (ctx.experimental_caller?.kind !== "client") throw new Error("Only the Factory page can dismiss a shadow block.");
       return { pr: (await dismissShadow({ taskKey, reason, by: { kind: "person" } })).number };
     },
   });

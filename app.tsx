@@ -727,7 +727,7 @@ function TaskDialog({
               <div className="space-y-1">
                 <div className="text-xs font-medium text-muted-foreground">Pull request</div>
                 <PrChips pr={task.pr} />
-                {latestChecks(task.pr).some((check) => check.role === "shadow" && check.verdict === "changes") ? (
+                {latestChecks(task.pr).some((check) => check.role === "shadow" && (check.verdict === "changes" || check.verdict === "pending")) ? (
                   <ShadowDismiss taskKey={task.key} />
                 ) : null}
               </div>
@@ -850,8 +850,9 @@ function ShadowDismiss({ taskKey }: { taskKey: string }) {
   return (
     <form onSubmit={dismiss} className="mt-2 space-y-2 rounded-md border border-amber-500/40 bg-amber-500/5 p-3">
       <p className="text-xs">
-        The shadow Security reviewer requested changes, so this PR stays in draft. Fix the findings, or dismiss them
-        with a reason. The task's activity has its findings.
+        The shadow Security reviewer requested changes or hasn't finished, so this PR stays in draft once the other
+        reviewers approve. Fix its findings, wait for it, or dismiss it with a reason. Its review is in the task's
+        activity.
       </p>
       <div className="flex gap-2">
         <Input
