@@ -1496,6 +1496,64 @@ ${sections.join("\n\n---\n\n")}`;
             return { exitCode: 0, stdout: `Rafter key works. GitHub token for Rafter: ${tokenSet ? "set" : "not set"}.\nUsage: ${text}` };
           },
         }),
+        "shadow backfill": cliCommand({
+          summary: "Add a task's open PR, already reviewed by the Security reviewer, to the shadow reviewer trial",
+          positionals: [{ name: "task", description: "Task key, such as APP-12", required: true }],
+          async run(input) {
+            const task = await getTaskByKey(input.positionals.task);
+            const factory = await factoryForTaskKey(task.key);
+            const pr = latestPr(factory, task.key);
+            if (pr === null || pr.state !== "open") {
+              throw new PluginCliError(`${task.key} has no open pull request the factory is tracking.`, { code: "no_pr" });
+            }
+            const incumbent = pr.reviews.find((review) => review.role === "security" && review.threadId !== null);
+            if (incumbent === undefined || incumbent.threadId === null) {
+              throw new PluginCliError(`PR #${pr.number} has no Security review to compare against.`, { code: "no_security_review" });
+            }
+            if ((await readTrial()).runs.some((run) => run.prefix === factory.prefix && run.pr === pr.number)) {
+              throw new PluginCliError(`PR #${pr.number} is already in the trial.`, { code: "already_in_trial" });
+            }
+            // Rebuild the input the Security reviewer got: the first finished Rafter scan, focused on the PR's files.
+            const { hostId, repo } = await projectHost(factory);
+            let findings: string | null = null;
+            const scan = pr.scans.find((candidate) => candidate.phase === "open" && candidate.status === "completed" && candidate.scanId !== null);
+            if (scan !== undefined && scan.scanId !== null && repo !== null) {
+              const result = await rafterPoll(scan.scanId);
+              if (result.status === "completed") {
+                const view = JSON.parse(await gh(hostId, ["pr", "view", String(pr.number), "--repo", repo, "--json", "files"])) as { files?: { path: string }[] };
+                const saved = await host.call(
+                  "save_report",
+                  { name: `rafter-${scan.scanId.replace(/[^A-Za-z0-9._-]/g, "_")}.json`, content: JSON.stringify(result.data, null, 1) },
+                  { hostId, timeoutMs: 60_000 },
+                );
+                findings = findingsText(focusFindings(result.data, (view.files ?? []).map((file) => file.path)), saved.path);
+              }
+            }
+            const { shadowPrs, shadowModel, shadowProvider } = await settings.get();
+            const shadowThreadId = await assign({
+              taskKey: task.key,
+              role: "shadow",
+              instructions: "This PR was already reviewed; review its current head as if you were first.",
+              pr: { number: pr.number, url: pr.url },
+              findings,
+            });
+            await mutateTrial((trial) => {
+              trial.comparisonThreadId = null;
+              trial.runs.push({
+                prefix: factory.prefix,
+                pr: pr.number,
+                url: pr.url,
+                taskKey: task.key,
+                securityThreadId: incumbent.threadId!,
+                shadowThreadId,
+                shadowModel: `${shadowProvider}/${shadowModel || "default"}`,
+                startedAt: new Date().toISOString(),
+              });
+            });
+            if (shadowPrs > 0) await settings.experimental_set({ shadowPrs: shadowPrs - 1 });
+            return { exitCode: 0, stdout: `Shadow reviewer ${shadowThreadId} started on PR #${pr.number}${findings === null ? " (no Rafter results available)" : ""}.` };
+          },
+        }),
         "rafter report": cliCommand({
           summary: "Save the full report of the latest finished Rafter scan of a task's PR, and print its path",
           positionals: [{ name: "task", description: "Task key, such as APP-12", required: true }],
