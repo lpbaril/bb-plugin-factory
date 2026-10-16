@@ -15,12 +15,16 @@ import {
   type BbPluginApi,
 } from "@get-bb/plugin-sdk";
 import { z } from "zod";
+import { hostContract } from "./host-contract";
 import {
+  PR_REVIEW_ROLES,
   ROLES,
   ROLE_IDS,
   WORKER_ROLE_IDS,
   leadPrompt,
+  reReviewMessage,
   workerPrompt,
+  type PrReviewRole,
   type RoleId,
   type WorkerRoleId,
 } from "./roles";
@@ -72,8 +76,48 @@ const agentSchema = z.object({
   taskKey: z.string().nullable(),
   providerId: z.string(),
   createdAt: z.string(),
+  /** The pull request a reviewer was started for. */
+  pr: z.number().nullable().default(null),
 });
 export type Agent = z.infer<typeof agentSchema>;
+
+const VERDICTS = ["pending", "approve", "changes"] as const;
+type Verdict = (typeof VERDICTS)[number];
+
+const prReviewSchema = z.object({
+  role: z.enum(PR_REVIEW_ROLES),
+  threadId: z.string().nullable(),
+  /** The head commit this verdict is about. */
+  sha: z.string(),
+  verdict: z.enum(VERDICTS),
+  at: z.string(),
+});
+
+const rafterScanSchema = z.object({
+  phase: z.enum(["open", "ready"]),
+  sha: z.string(),
+  scanId: z.string().nullable(),
+  status: z.enum(["running", "completed", "failed"]),
+  error: z.string().nullable(),
+  startedAt: z.string(),
+});
+
+const prSchema = z.object({
+  number: z.number(),
+  url: z.string(),
+  taskKey: z.string(),
+  branch: z.string(),
+  headSha: z.string(),
+  isDraft: z.boolean(),
+  state: z.enum(["open", "merged", "closed"]),
+  /** Large or sensitive diff: Reviewer 2 is required too. */
+  deep: z.boolean(),
+  reviews: z.array(prReviewSchema),
+  scans: z.array(rafterScanSchema),
+  readyRequested: z.boolean(),
+  openedAt: z.string(),
+});
+type Pr = z.infer<typeof prSchema>;
 
 const factorySchema = z.object({
   /** The tracker prefix, which is also the factory's id. */
@@ -85,8 +129,21 @@ const factorySchema = z.object({
   leadThreadId: z.string().nullable(),
   agents: z.array(agentSchema),
   createdAt: z.string(),
+  /** GitHub owner/name, from the project's remote. */
+  repo: z.string().nullable().default(null),
+  prs: z.array(prSchema).default([]),
 });
 type Factory = z.infer<typeof factorySchema>;
+
+const prSummarySchema = z.object({
+  number: z.number(),
+  url: z.string(),
+  isDraft: z.boolean(),
+  state: z.enum(["open", "merged", "closed"]),
+  checks: z.array(z.object({ role: z.enum(PR_REVIEW_ROLES), label: z.string(), verdict: z.enum(VERDICTS) })),
+  scan: z.enum(["running", "completed", "failed"]).nullable(),
+});
+export type PrSummary = z.infer<typeof prSummarySchema>;
 
 const boardTaskSchema = z.object({
   id: z.string(),
@@ -96,10 +153,11 @@ const boardTaskSchema = z.object({
   column: z.enum(COLUMNS),
   priority: z.string(),
   updatedAt: z.string(),
+  pr: prSummarySchema.nullable(),
 });
 export type BoardTask = z.infer<typeof boardTaskSchema>;
 
-const factorySummarySchema = factorySchema.omit({ agents: true }).extend({
+const factorySummarySchema = factorySchema.omit({ agents: true, prs: true }).extend({
   bbProjectName: z.string(),
 });
 export type FactorySummary = z.infer<typeof factorySummarySchema>;
@@ -182,6 +240,33 @@ export default async function plugin(bb: BbPluginApi) {
       options: ["auto", "accept-edits", "full"],
       default: "auto",
     },
+    prReviews: {
+      type: "boolean",
+      label: "Review factory pull requests automatically",
+      description:
+        "When the Lead opens a PR for a task, start Reviewer 1 (and Reviewer 2 for large or sensitive diffs) plus the Security reviewer. Each posts its verdict as a PR comment.",
+      default: true,
+    },
+    deepReviewLines: {
+      type: "number",
+      label: "Add Reviewer 2 above this many changed lines",
+      experimental_schema: z.number().int().min(1).max(100_000),
+      default: 300,
+    },
+    securityProvider: { type: "select", label: "Security reviewer runs on", options: providerOptions, default: "claude-code" },
+    rafterApiKey: {
+      type: "string",
+      label: "Rafter API key",
+      description: "Needs the Read & Scan scope. Leave empty to run the Security reviewer without Rafter.",
+      secret: true,
+    },
+    rafterGithubToken: {
+      type: "string",
+      label: "GitHub token for Rafter (private repos)",
+      description:
+        "Only needed when Rafter can't otherwise read a private repo. Use a fine-grained, read-only token for that repo; it is sent to Rafter with each scan.",
+      secret: true,
+    },
   });
   async function permissionMode(): Promise<"auto" | "accept-edits" | "full"> {
     const { agentPermissions } = await settings.get();
@@ -190,6 +275,26 @@ export default async function plugin(bb: BbPluginApi) {
   async function providerFor(role: RoleId): Promise<string> {
     const values = await settings.get();
     return values[`${role}Provider`];
+  }
+
+  // ----- gh on the project's machine -----
+
+  const host = bb.hosts.experimental_client({ contract: hostContract });
+  async function projectHost(factory: Factory): Promise<{ hostId: string; repo: string | null }> {
+    const project = (await bb.sdk.projects.get({ projectId: factory.bbProjectId })) as {
+      gitRemoteUrl?: string | null;
+      sources?: { hostId?: string; isDefault?: boolean }[];
+    };
+    const source = project.sources?.find((candidate) => candidate.isDefault) ?? project.sources?.[0];
+    const hostId = source?.hostId ?? (await bb.sdk.system.config()).primaryHostId;
+    if (hostId == null) throw new Error(`No machine found for project ${factory.bbProjectId}.`);
+    const match = /github\.com[/:]([^/]+)\/([^/]+?)(?:\.git)?\/?$/.exec(project.gitRemoteUrl ?? "");
+    return { hostId, repo: match === null ? null : `${match[1]}/${match[2]}` };
+  }
+  async function gh(hostId: string, args: string[], stdin: string | null = null) {
+    const result = await host.call("gh", { args, stdin }, { hostId, timeoutMs: 150_000 });
+    if (result.code !== 0) throw new Error(`gh ${args.slice(0, 2).join(" ")} failed: ${result.stderr.trim().slice(0, 500)}`);
+    return result.stdout;
   }
 
   // ----- Tasks plugin access -----
@@ -244,6 +349,27 @@ export default async function plugin(bb: BbPluginApi) {
       column: blocked ? "blocked" : (task.status as Column),
       priority: task.priority,
       updatedAt: task.updatedAt,
+      pr: prSummary(factory, task.key),
+    };
+  }
+  function latestPr(factory: Factory, taskKey: string): Pr | null {
+    const prs = factory.prs.filter((pr) => pr.taskKey === taskKey);
+    return prs.find((pr) => pr.state === "open") ?? prs.at(-1) ?? null;
+  }
+  function prSummary(factory: Factory, taskKey: string): PrSummary | null {
+    const pr = latestPr(factory, taskKey);
+    if (pr === null) return null;
+    const scan = pr.scans.at(-1) ?? null;
+    return {
+      number: pr.number,
+      url: pr.url,
+      isDraft: pr.isDraft,
+      state: pr.state,
+      checks: PR_REVIEW_ROLES.flatMap((role) => {
+        const review = reviewFor(pr, role);
+        return review === null ? [] : [{ role, label: ROLES[role].label, verdict: review.verdict }];
+      }),
+      scan: scan?.status ?? null,
     };
   }
   async function comment(taskId: string, body: string): Promise<void> {
@@ -279,6 +405,19 @@ export default async function plugin(bb: BbPluginApi) {
     await bb.storage.kv.set(KEY_PREFIX + factory.prefix, factory);
     bb.realtime.publish(BOARD_CHANGED, { prefix: factory.prefix });
   }
+  /** Serializes read-modify-write of one factory record; keep `change` free of slow I/O. */
+  const factoryLocks = new Map<string, Promise<unknown>>();
+  function mutateFactory<T>(prefix: string, change: (factory: Factory) => T): Promise<T> {
+    const previous = factoryLocks.get(prefix) ?? Promise.resolve();
+    const next = previous.then(async () => {
+      const factory = await findFactory(prefix);
+      const result = change(factory);
+      await saveFactory(factory);
+      return result;
+    });
+    factoryLocks.set(prefix, next.catch(() => undefined));
+    return next;
+  }
   async function summarize(factory: Factory): Promise<FactorySummary> {
     let bbProjectName = factory.bbProjectId;
     try {
@@ -286,7 +425,7 @@ export default async function plugin(bb: BbPluginApi) {
     } catch {
       // A deleted project keeps its id as the name.
     }
-    const { agents: _agents, ...rest } = factory;
+    const { agents: _agents, prs: _prs, ...rest } = factory;
     return { ...rest, bbProjectName };
   }
 
@@ -333,6 +472,8 @@ export default async function plugin(bb: BbPluginApi) {
       leadThreadId: null,
       agents: [],
       createdAt: new Date().toISOString(),
+      repo: null,
+      prs: [],
     };
     await saveFactory(factory);
     return factory;
@@ -361,15 +502,17 @@ export default async function plugin(bb: BbPluginApi) {
       prompt: leadPrompt({ factoryName: factory.name, prefix: factory.prefix, goal }),
       pluginMetadata: { factory: factory.prefix, role: "lead" },
     });
-    factory.leadThreadId = thread.id;
-    factory.agents.push({
-      threadId: thread.id,
-      role: "lead",
-      taskKey: null,
-      providerId,
-      createdAt: new Date().toISOString(),
+    await mutateFactory(factory.prefix, (current) => {
+      current.leadThreadId = thread.id;
+      current.agents.push({
+        threadId: thread.id,
+        role: "lead",
+        taskKey: null,
+        providerId,
+        createdAt: new Date().toISOString(),
+        pr: null,
+      });
     });
-    await saveFactory(factory);
     return thread.id;
   }
 
@@ -392,6 +535,8 @@ export default async function plugin(bb: BbPluginApi) {
     taskKey: string;
     role: WorkerRoleId;
     instructions: string | null;
+    pr?: { number: number; url: string } | null;
+    findings?: string | null;
   }): Promise<string> {
     const task = await getTaskByKey(args.taskKey);
     const factory = await factoryForTaskKey(task.key);
@@ -410,12 +555,13 @@ export default async function plugin(bb: BbPluginApi) {
       });
     }
     const providerId = await providerFor(args.role);
+    const pr = args.pr ?? null;
     const base = {
       projectId: factory.bbProjectId,
       providerId,
       permissionMode: await permissionMode(),
       parentThreadId: factory.leadThreadId,
-      title: `${task.key} · ${role.label}: ${task.title}`.slice(0, 200),
+      title: `${task.key} · ${role.label}${pr === null ? "" : ` · PR #${pr.number}`}: ${task.title}`.slice(0, 200),
       prompt: workerPrompt({
         role: args.role,
         factoryName: factory.name,
@@ -423,8 +569,10 @@ export default async function plugin(bb: BbPluginApi) {
         task,
         instructions: args.instructions,
         builderThreadId: builder?.threadId ?? null,
+        pr,
+        findings: args.findings ?? null,
       }),
-      pluginMetadata: { factory: factory.prefix, role: args.role, taskKey: task.key },
+      pluginMetadata: { factory: factory.prefix, role: args.role, taskKey: task.key, ...(pr === null ? {} : { pr: pr.number }) },
     };
     let thread;
     if (builder !== null) {
@@ -436,7 +584,11 @@ export default async function plugin(bb: BbPluginApi) {
       try {
         thread = await bb.sdk.threads.spawn({
           ...base,
-          environment: { type: "host", workspace: { type: "managed-worktree", baseBranch: { kind: "default" } } },
+          environment: {
+            type: "host",
+            hostId: (await projectHost(factory)).hostId,
+            workspace: { type: "managed-worktree", baseBranch: { kind: "default" } },
+          },
         });
       } catch (error) {
         // Not a Git project (or no commits yet): work in the project checkout.
@@ -444,14 +596,16 @@ export default async function plugin(bb: BbPluginApi) {
         thread = await bb.sdk.threads.spawn({ ...base, environment: { type: "project-default" } });
       }
     }
-    factory.agents.push({
-      threadId: thread.id,
-      role: args.role,
-      taskKey: task.key,
-      providerId,
-      createdAt: new Date().toISOString(),
+    await mutateFactory(factory.prefix, (current) => {
+      current.agents.push({
+        threadId: thread.id,
+        role: args.role,
+        taskKey: task.key,
+        providerId,
+        createdAt: new Date().toISOString(),
+        pr: pr?.number ?? null,
+      });
     });
-    await saveFactory(factory);
 
     const order: TaskStatus[] = ["backlog", "todo", "in_progress", "in_review"];
     const target = role.movesTaskTo;
@@ -460,7 +614,8 @@ export default async function plugin(bb: BbPluginApi) {
         await tasksRpc("updateTask", { taskId: task.id, status: target, authorName: "Factory" }, taskResultSchema),
       );
     }
-    await comment(task.id, `Assigned to **${role.label}** (${providerId}) · thread \`${thread.id}\``);
+    const where = pr === null ? "" : ` for [PR #${pr.number}](${pr.url})`;
+    await comment(task.id, `Assigned to **${role.label}** (${providerId})${where} · thread \`${thread.id}\``);
     return thread.id;
   }
 
@@ -500,6 +655,389 @@ export default async function plugin(bb: BbPluginApi) {
     if (current.status === column) return current;
     return unwrap(await tasksRpc("boardMove", { taskId, status: column, authorName: "You" }, taskResultSchema));
   }
+
+  // ----- Pull requests: automatic review, Rafter scans, ready gate -----
+
+  async function tellLead(factory: Factory, text: string): Promise<void> {
+    if (factory.leadThreadId === null) return;
+    await bb.sdk.threads
+      .send({ threadId: factory.leadThreadId, mode: "auto", input: [{ type: "text", text, mentions: [] }] })
+      .catch((error: unknown) => bb.log.warn(`could not message the Lead: ${String(error)}`));
+  }
+  async function tellThread(threadId: string, text: string): Promise<boolean> {
+    try {
+      const thread = await bb.sdk.threads.get({ threadId });
+      if (thread.archivedAt !== null || thread.deletedAt !== null) return false;
+      await bb.sdk.threads.send({ threadId, mode: "auto", input: [{ type: "text", text, mentions: [] }] });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  function reviewFor(pr: Pr, role: PrReviewRole) {
+    return pr.reviews.filter((review) => review.role === role).at(-1) ?? null;
+  }
+  function requiredRoles(pr: Pr): PrReviewRole[] {
+    return pr.deep ? ["review1", "review2", "security"] : ["review1", "security"];
+  }
+  async function prComment(hostId: string, repo: string, number: number, body: string): Promise<void> {
+    await gh(hostId, ["pr", "comment", String(number), "--repo", repo, "--body-file", "-"], body).catch((error: unknown) =>
+      bb.log.warn(`could not comment on PR #${number}: ${String(error)}`),
+    );
+  }
+
+  // Rafter's REST API, as used by rafter-cli: POST starts a scan, GET polls it.
+  const RAFTER_SCAN_URL = "https://rafter.so/api/static/scan";
+  async function rafterKey(): Promise<string | null> {
+    const { rafterApiKey } = await settings.get();
+    return typeof rafterApiKey === "string" && rafterApiKey.trim() !== "" ? rafterApiKey.trim() : null;
+  }
+  async function rafterStart(repo: string, branch: string): Promise<{ scanId: string } | { error: string }> {
+    const key = await rafterKey();
+    if (key === null) return { error: "no Rafter API key is set" };
+    const { rafterGithubToken } = await settings.get();
+    const body: Record<string, string> = { repository_name: repo, branch_name: branch, scan_mode: "fast" };
+    if (typeof rafterGithubToken === "string" && rafterGithubToken.trim() !== "") body.github_token = rafterGithubToken.trim();
+    try {
+      const response = await fetch(RAFTER_SCAN_URL, {
+        method: "POST",
+        // Never follow a redirect with the API key attached.
+        redirect: "manual",
+        headers: { "x-api-key": key, "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(120_000),
+      });
+      const text = await response.text();
+      if (response.status === 200) {
+        const scanId = (JSON.parse(text) as { scan_id?: unknown }).scan_id;
+        return scanId == null ? { error: "Rafter returned no scan id" } : { scanId: String(scanId) };
+      }
+      if (response.status === 429 || (response.status === 403 && text.includes("scan_mode"))) {
+        return { error: "Rafter scan quota is used up for this billing period" };
+      }
+      if (response.status === 403) return { error: "the Rafter API key lacks the Read & Scan scope" };
+      return { error: `Rafter answered ${response.status}: ${text.slice(0, 300)}` };
+    } catch (error) {
+      return { error: `could not reach Rafter: ${String(error)}` };
+    }
+  }
+  async function rafterPoll(
+    scanId: string,
+  ): Promise<{ status: "running" } | { status: "completed"; data: unknown } | { status: "failed"; error: string }> {
+    const key = await rafterKey();
+    if (key === null) return { status: "failed", error: "no Rafter API key is set" };
+    try {
+      const url = `${RAFTER_SCAN_URL}?scan_id=${encodeURIComponent(scanId)}&format=json`;
+      const response = await fetch(url, {
+        redirect: "manual",
+        headers: { "x-api-key": key },
+        signal: AbortSignal.timeout(60_000),
+      });
+      if (response.status === 404) return { status: "failed", error: `scan ${scanId} not found` };
+      if (response.status < 200 || response.status >= 300) return { status: "running" };
+      const data = (await response.json()) as { status?: string };
+      if (data.status === "completed") return { status: "completed", data };
+      if (data.status === "failed") return { status: "failed", error: "Rafter reported the scan as failed" };
+      return { status: "running" };
+    } catch {
+      return { status: "running" };
+    }
+  }
+  function findingsText(data: unknown): string {
+    const text = JSON.stringify(data, null, 1);
+    return text.length > 40_000 ? `${text.slice(0, 40_000)}\n… (truncated)` : text;
+  }
+
+  const SENSITIVE_PATH = /(auth|login|session|token|secret|crypt|password|permission|rbac|rls|payment|billing|stripe|migration|alembic|\.sql$|terraform|docker|k8s|helm|\.github\/workflows|infra)/i;
+
+  async function startPrReviewer(prefix: string, prNumber: number, role: PrReviewRole, findings: string | null, instructions: string | null) {
+    const factory = await findFactory(prefix);
+    const pr = factory.prs.find((candidate) => candidate.number === prNumber);
+    if (pr === undefined) return;
+    const threadId = await assign({ taskKey: pr.taskKey, role, instructions, pr: { number: pr.number, url: pr.url }, findings });
+    await mutateFactory(prefix, (current) => {
+      const target = current.prs.find((candidate) => candidate.number === prNumber);
+      target?.reviews.push({ role, threadId, sha: target.headSha, verdict: "pending", at: new Date().toISOString() });
+    });
+  }
+
+  async function startScan(prefix: string, repo: string, prNumber: number, phase: "open" | "ready"): Promise<string | null> {
+    const factory = await findFactory(prefix);
+    const pr = factory.prs.find((candidate) => candidate.number === prNumber);
+    if (pr === undefined) return null;
+    const started = await rafterStart(repo, pr.branch);
+    await mutateFactory(prefix, (current) => {
+      const target = current.prs.find((candidate) => candidate.number === prNumber);
+      target?.scans.push({
+        phase,
+        sha: pr.headSha,
+        scanId: "scanId" in started ? started.scanId : null,
+        status: "scanId" in started ? "running" : "failed",
+        error: "error" in started ? started.error : null,
+        startedAt: new Date().toISOString(),
+      });
+    });
+    return "error" in started ? started.error : null;
+  }
+
+  type GhPr = { number: number; url: string; headRefName: string; headRefOid: string; isDraft: boolean; additions: number; deletions: number };
+
+  async function onPrOpened(factory: Factory, hostId: string, repo: string, gp: GhPr, taskKey: string): Promise<void> {
+    const { deepReviewLines } = await settings.get();
+    let files: string[] = [];
+    try {
+      const view = JSON.parse(await gh(hostId, ["pr", "view", String(gp.number), "--repo", repo, "--json", "files"])) as { files?: { path: string }[] };
+      files = (view.files ?? []).map((file) => file.path);
+    } catch (error) {
+      bb.log.warn(`could not list files of PR #${gp.number}: ${String(error)}`);
+    }
+    const sensitive = files.filter((path) => SENSITIVE_PATH.test(path));
+    const deep = gp.additions + gp.deletions > deepReviewLines || sensitive.length > 0;
+    await mutateFactory(factory.prefix, (current) => {
+      if (current.prs.some((pr) => pr.number === gp.number)) return;
+      current.prs.push({
+        number: gp.number,
+        url: gp.url,
+        taskKey,
+        branch: gp.headRefName,
+        headSha: gp.headRefOid,
+        isDraft: gp.isDraft,
+        state: "open",
+        deep,
+        reviews: [],
+        scans: [],
+        readyRequested: false,
+        openedAt: new Date().toISOString(),
+      });
+    });
+    const task = await getTaskByKey(taskKey);
+    const why = deep
+      ? ` Reviewer 2 added: ${gp.additions + gp.deletions} changed lines${sensitive.length > 0 ? `, sensitive paths (${sensitive.slice(0, 5).join(", ")})` : ""}.`
+      : "";
+    await comment(task.id, `[PR #${gp.number}](${gp.url}) opened${gp.isDraft ? " as a draft" : ""}. Automatic review started.${why}`);
+
+    await startPrReviewer(factory.prefix, gp.number, "review1", null, null);
+    if (deep) await startPrReviewer(factory.prefix, gp.number, "review2", null, null);
+    let securityNote = "";
+    if ((await rafterKey()) !== null) {
+      const error = await startScan(factory.prefix, repo, gp.number, "open");
+      if (error === null) securityNote = " A Rafter scan is running; the Security reviewer starts when it finishes.";
+      else {
+        securityNote = ` Rafter could not scan (${error}), so the Security reviewer reviews the diff by hand.`;
+        await prComment(hostId, repo, gp.number, `**Factory:** the Rafter security scan could not start: ${error}. The Security reviewer is reviewing this PR without it.`);
+        await startPrReviewer(factory.prefix, gp.number, "security", null, `Rafter could not scan this branch (${error}). Review the diff for security issues yourself.`);
+      }
+    } else {
+      await startPrReviewer(factory.prefix, gp.number, "security", null, null);
+    }
+    await tellLead(
+      factory,
+      `[factory] PR #${gp.number} for ${taskKey} is picked up: Reviewer 1${deep ? ", Reviewer 2" : ""} and Security are reviewing it.${securityNote} You'll get each reviewer's result; send REQUEST CHANGES findings to the builder.`,
+    );
+  }
+
+  async function onPrPushed(factory: Factory, gp: GhPr, pr: Pr): Promise<void> {
+    await mutateFactory(factory.prefix, (current) => {
+      const target = current.prs.find((candidate) => candidate.number === pr.number);
+      if (target !== undefined) target.headSha = gp.headRefOid;
+    });
+    for (const role of PR_REVIEW_ROLES) {
+      const review = reviewFor(pr, role);
+      if (review === null || review.verdict !== "changes") continue;
+      const message = reReviewMessage({ role, taskKey: pr.taskKey, prNumber: pr.number, sha: gp.headRefOid, findings: null });
+      const delivered = review.threadId !== null && (await tellThread(review.threadId, message));
+      if (delivered) {
+        await mutateFactory(factory.prefix, (current) => {
+          const target = current.prs.find((candidate) => candidate.number === pr.number);
+          target?.reviews.push({ role, threadId: review.threadId, sha: gp.headRefOid, verdict: "pending", at: new Date().toISOString() });
+        });
+      } else {
+        await startPrReviewer(factory.prefix, pr.number, role, null, `Re-review after new commits (now at ${gp.headRefOid.slice(0, 7)}); an earlier review requested changes.`);
+      }
+    }
+  }
+
+  async function onScanFinished(factory: Factory, hostId: string, repo: string, pr: Pr, scan: Pr["scans"][number]): Promise<void> {
+    const result = scan.scanId === null ? ({ status: "failed", error: scan.error ?? "unknown" } as const) : await rafterPoll(scan.scanId);
+    if (result.status === "running") return;
+    await mutateFactory(factory.prefix, (current) => {
+      const target = current.prs.find((candidate) => candidate.number === pr.number)?.scans.find((candidate) => candidate.scanId === scan.scanId && candidate.startedAt === scan.startedAt);
+      if (target === undefined) return;
+      target.status = result.status;
+      target.error = result.status === "failed" ? result.error : null;
+    });
+    const findings = result.status === "completed" ? findingsText(result.data) : null;
+    const failure = result.status === "failed" ? result.error : null;
+    if (failure !== null) {
+      await prComment(hostId, repo, pr.number, `**Factory:** the Rafter security scan failed: ${failure}. The Security reviewer continues without it.`);
+      await tellLead(factory, `[factory] The Rafter scan for PR #${pr.number} (${pr.taskKey}) failed: ${failure}. The Security reviewer is reviewing by hand.`);
+    }
+    const security = reviewFor(pr, "security");
+    if (scan.phase === "open" && security === null) {
+      await startPrReviewer(
+        factory.prefix,
+        pr.number,
+        "security",
+        findings,
+        failure === null ? null : `The Rafter scan failed (${failure}). Review the diff for security issues yourself.`,
+      );
+      return;
+    }
+    // A later scan (on a ready PR): the existing Security reviewer checks for anything new.
+    const text =
+      failure === null
+        ? `PR #${pr.number} is now ready for review, and the final Rafter scan finished. Compare it with what you reviewed before. If this PR's changes now have a blocking finding, post REQUEST CHANGES; otherwise post a short "Final scan: no new blocking findings" comment. Record the result with \`bb factory verdict ${pr.taskKey} --role security --verdict approve|changes\`.\n\n\`\`\`json\n${findings}\n\`\`\``
+        : `The final Rafter scan for PR #${pr.number} failed (${failure}). Re-check the latest commits by hand and record your verdict again with \`bb factory verdict ${pr.taskKey} --role security --verdict approve|changes\`.`;
+    if (security !== null && security.threadId !== null && (await tellThread(security.threadId, text))) {
+      await mutateFactory(factory.prefix, (current) => {
+        const target = current.prs.find((candidate) => candidate.number === pr.number);
+        target?.reviews.push({ role: "security", threadId: security.threadId, sha: target.headSha, verdict: "pending", at: new Date().toISOString() });
+      });
+    } else {
+      await startPrReviewer(factory.prefix, pr.number, "security", findings, null);
+    }
+  }
+
+  async function maybeMarkReady(factory: Factory, hostId: string, repo: string, pr: Pr): Promise<void> {
+    if (!pr.isDraft || pr.readyRequested || pr.state !== "open") return;
+    if (pr.scans.some((scan) => scan.status === "running")) return;
+    const roles = requiredRoles(pr);
+    if (!roles.every((role) => reviewFor(pr, role)?.verdict === "approve")) return;
+    await gh(hostId, ["pr", "ready", String(pr.number), "--repo", repo]);
+    await mutateFactory(factory.prefix, (current) => {
+      const target = current.prs.find((candidate) => candidate.number === pr.number);
+      if (target !== undefined) target.readyRequested = true;
+    });
+    const labels = roles.map((role) => `${ROLES[role].label} ✓`).join(", ");
+    await prComment(hostId, repo, pr.number, `**Factory:** every reviewer approves (${labels}). Marked ready for review${(await rafterKey()) !== null ? "; a final Rafter scan is running" : ""}. Merging is up to you.`);
+    const task = await getTaskByKey(pr.taskKey);
+    await comment(task.id, `[PR #${pr.number}](${pr.url}) approved by ${labels} and marked ready for review.`);
+    await tellLead(factory, `[factory] PR #${pr.number} (${pr.taskKey}) has every approval and is marked ready for review. Tell the person it's ready for them to merge.`);
+  }
+
+  async function onPrClosed(factory: Factory, hostId: string, repo: string, pr: Pr): Promise<void> {
+    let state: "merged" | "closed" | "open" = "open";
+    try {
+      const view = JSON.parse(await gh(hostId, ["pr", "view", String(pr.number), "--repo", repo, "--json", "state"])) as { state?: string };
+      state = view.state === "MERGED" ? "merged" : view.state === "CLOSED" ? "closed" : "open";
+    } catch (error) {
+      bb.log.warn(`could not read PR #${pr.number}: ${String(error)}`);
+      return;
+    }
+    if (state === "open") return;
+    await mutateFactory(factory.prefix, (current) => {
+      const target = current.prs.find((candidate) => candidate.number === pr.number);
+      if (target !== undefined) target.state = state;
+    });
+    const task = await getTaskByKey(pr.taskKey);
+    if (state === "merged") {
+      if (task.status !== "done") await moveTask(factory, task.id, "done");
+      await comment(task.id, `[PR #${pr.number}](${pr.url}) was merged. Done.`);
+      await tellLead(factory, `[factory] PR #${pr.number} (${pr.taskKey}) was merged; the task is Done.`);
+    } else {
+      await comment(task.id, `[PR #${pr.number}](${pr.url}) was closed without merging.`);
+      await tellLead(factory, `[factory] PR #${pr.number} (${pr.taskKey}) was closed without merging. Decide with the person what happens to the task.`);
+    }
+  }
+
+  async function watchPrs(prefix: string): Promise<void> {
+    let factory = await findFactory(prefix);
+    const { hostId, repo } = await projectHost(factory);
+    if (repo === null) return;
+    if (factory.repo !== repo) factory = await mutateFactory(prefix, (current) => ((current.repo = repo), current));
+
+    // Each builder's worktree branch identifies its task's PR.
+    const threads = (await bb.sdk.threads.list({ projectId: factory.bbProjectId, originPluginId: "factory", includeHidden: true, limit: 500 })) as {
+      id: string;
+      environmentBranchName: string | null;
+    }[];
+    const branchOf = new Map(threads.map((thread) => [thread.id, thread.environmentBranchName]));
+    const taskByBranch = new Map<string, string>();
+    for (const agent of factory.agents) {
+      const branch = branchOf.get(agent.threadId);
+      if (agent.role === "build" && agent.taskKey !== null && branch) taskByBranch.set(branch, agent.taskKey);
+    }
+
+    const open = JSON.parse(
+      await gh(hostId, ["pr", "list", "--repo", repo, "--state", "open", "--limit", "100", "--json", "number,url,headRefName,headRefOid,isDraft,additions,deletions"]),
+    ) as GhPr[];
+    for (const gp of open) {
+      const known = factory.prs.find((pr) => pr.number === gp.number);
+      if (known === undefined) {
+        const taskKey = taskByBranch.get(gp.headRefName);
+        if (taskKey !== undefined) await onPrOpened(factory, hostId, repo, gp, taskKey);
+        continue;
+      }
+      if (known.headSha !== gp.headRefOid) await onPrPushed(factory, gp, known);
+      if (known.isDraft !== gp.isDraft) {
+        await mutateFactory(prefix, (current) => {
+          const target = current.prs.find((pr) => pr.number === gp.number);
+          if (target !== undefined) target.isDraft = gp.isDraft;
+        });
+        if (!gp.isDraft && (await rafterKey()) !== null && !known.scans.some((scan) => scan.phase === "ready" && scan.sha === gp.headRefOid)) {
+          await startScan(prefix, repo, gp.number, "ready");
+        }
+      }
+    }
+    factory = await findFactory(prefix);
+    for (const pr of factory.prs.filter((candidate) => candidate.state === "open")) {
+      if (!open.some((gp) => gp.number === pr.number)) await onPrClosed(factory, hostId, repo, pr);
+    }
+    factory = await findFactory(prefix);
+    for (const pr of factory.prs.filter((candidate) => candidate.state === "open")) {
+      for (const scan of pr.scans.filter((candidate) => candidate.status === "running" || (candidate.status === "failed" && candidate.scanId === null && !pr.reviews.some((review) => review.role === "security")))) {
+        await onScanFinished(factory, hostId, repo, pr, scan);
+      }
+    }
+    factory = await findFactory(prefix);
+    for (const pr of factory.prs) await maybeMarkReady(factory, hostId, repo, pr);
+  }
+
+  async function recordVerdict(args: { taskKey: string; role: PrReviewRole; verdict: Exclude<Verdict, "pending">; pr: number | null; threadId: string | null }) {
+    const task = await getTaskByKey(args.taskKey);
+    const factory = await factoryForTaskKey(task.key);
+    const pr =
+      args.pr === null ? latestPr(factory, task.key) : factory.prs.find((candidate) => candidate.number === args.pr) ?? null;
+    if (pr === null) {
+      throw new PluginCliError(`${task.key} has no pull request the factory is tracking.`, {
+        code: "no_pr",
+        hint: "Verdicts are for factory PRs; comment on the task instead.",
+      });
+    }
+    await mutateFactory(factory.prefix, (current) => {
+      const target = current.prs.find((candidate) => candidate.number === pr.number);
+      target?.reviews.push({ role: args.role, threadId: args.threadId ?? reviewFor(pr, args.role)?.threadId ?? null, sha: pr.headSha, verdict: args.verdict, at: new Date().toISOString() });
+    });
+    await comment(task.id, `**${ROLES[args.role].label}:** ${args.verdict === "approve" ? "APPROVE" : "REQUEST CHANGES"} on [PR #${pr.number}](${pr.url}) at \`${pr.headSha.slice(0, 7)}\``);
+    wakePrWatch();
+    return pr;
+  }
+
+  let wakePrWatch: () => void = () => undefined;
+  const PR_POLL_MS = 120_000;
+  bb.background.service("pr-watch", {
+    async start(signal) {
+      while (!signal.aborted) {
+        if ((await settings.get()).prReviews) {
+          for (const factory of await listFactories()) {
+            try {
+              await watchPrs(factory.prefix);
+            } catch (error) {
+              bb.log.warn(`PR watch failed for ${factory.prefix}: ${String(error)}`);
+            }
+          }
+        }
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, PR_POLL_MS);
+          wakePrWatch = () => {
+            clearTimeout(timer);
+            resolve();
+          };
+          signal.addEventListener("abort", () => wakePrWatch(), { once: true });
+        });
+      }
+    },
+  });
 
   // ----- RPC for the Factory page -----
 
@@ -699,6 +1237,25 @@ export default async function plugin(bb: BbPluginApi) {
             };
           },
         }),
+        verdict: cliCommand({
+          summary: "Record a reviewer's verdict on the task's pull request (after posting it as a PR comment)",
+          positionals: [{ name: "task", description: "Task key, such as APP-12", required: true }],
+          options: {
+            role: { type: "enum", values: PR_REVIEW_ROLES, required: true, description: "review1, review2 or security" },
+            verdict: { type: "enum", values: ["approve", "changes"], required: true, description: "approve, or changes to request changes" },
+            pr: { type: "integer", min: 1, max: 10_000_000, description: "PR number; defaults to the task's open PR" },
+          },
+          async run(input, ctx) {
+            const pr = await recordVerdict({
+              taskKey: input.positionals.task,
+              role: input.options.role as PrReviewRole,
+              verdict: input.options.verdict as "approve" | "changes",
+              pr: input.options.pr ?? null,
+              threadId: ctx.threadId ?? null,
+            });
+            return { exitCode: 0, stdout: `Recorded ${input.options.verdict} from ${ROLES[input.options.role as PrReviewRole].label} on PR #${pr.number}.` };
+          },
+        }),
         block: cliCommand({
           summary: "Mark a task Blocked, with the reason",
           positionals: [{ name: "task", description: "Task key", required: true }],
@@ -742,6 +1299,11 @@ export default async function plugin(bb: BbPluginApi) {
               const value = { factory: await summarize(factory), agents: factory.agents, tasks };
               return { exitCode: 0, stdout: JSON.stringify(value) };
             }
+            const listed = (await bb.sdk.threads.list({ projectId: factory.bbProjectId, originPluginId: "factory", includeHidden: true, limit: 500 })) as {
+              id: string;
+              environmentBranchName: string | null;
+            }[];
+            const branches = new Map(listed.map((thread) => [thread.id, thread.environmentBranchName]));
             const lines = [`Factory ${factory.prefix} · ${factory.name} · Lead ${factory.leadThreadId ?? "not started"}`];
             for (const column of COLUMNS) {
               const inColumn = tasks.filter((task) => task.column === column);
@@ -751,6 +1313,13 @@ export default async function plugin(bb: BbPluginApi) {
                   .filter((agent) => agent.taskKey === task.key)
                   .map((agent) => `${ROLES[agent.role].label} ${agent.threadId}`);
                 lines.push(`  ${task.key}  ${task.title}${agents.length > 0 ? `  [${agents.join(", ")}]` : ""}`);
+                const builderBranch = factory.agents.find((agent) => agent.role === "build" && agent.taskKey === task.key);
+                if (task.pr !== null) {
+                  const checks = task.pr.checks.map((check) => `${check.label} ${check.verdict}`).join(", ");
+                  lines.push(`      PR #${task.pr.number} ${task.pr.state}${task.pr.isDraft ? " draft" : ""}${checks === "" ? "" : ` · ${checks}`}${task.pr.scan === null ? "" : ` · Rafter ${task.pr.scan}`}`);
+                } else if (builderBranch !== undefined && branches.get(builderBranch.threadId)) {
+                  lines.push(`      branch ${branches.get(builderBranch.threadId)}`);
+                }
               }
             }
             return { exitCode: 0, stdout: lines.join("\n") };

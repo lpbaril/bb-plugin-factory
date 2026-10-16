@@ -19,7 +19,8 @@
     "app": "./app.tsx",
     "skills": [
       "skills"
-    ]
+    ],
+    "host": "./host.ts"
   },
   "dependencies": {
     "@radix-ui/react-checkbox": "^1.3.7",

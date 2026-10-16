@@ -23,6 +23,8 @@
   "include": [
     "server.ts",
     "roles.ts",
+    "host.ts",
+    "host-contract.ts",
     "app.tsx",
     "components",
     "lib",

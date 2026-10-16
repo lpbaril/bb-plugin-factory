@@ -17,7 +17,7 @@ import {
   useRpc,
 } from "@get-bb/plugin-sdk/app";
 import type { PluginSidebarThread } from "@get-bb/plugin-sdk/app";
-import type { Agent, BoardTask, Column, FactorySummary, TaskComment, rpcContract } from "./server";
+import type { Agent, BoardTask, Column, FactorySummary, PrSummary, TaskComment, rpcContract } from "./server";
 import { ROLES, WORKER_ROLE_IDS, type WorkerRoleId } from "./roles";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -88,6 +88,66 @@ function useLiveAgents(agents: Agent[]) {
   }, [agents, threads]);
 }
 type LiveAgent = ReturnType<typeof useLiveAgents>[number];
+
+// ---------- Pull request chips ----------
+
+const VERDICT_STYLE: Record<PrSummary["checks"][number]["verdict"], { mark: string; className: string }> = {
+  approve: { mark: "✓", className: "text-emerald-600 dark:text-emerald-400" },
+  changes: { mark: "✗", className: "text-destructive" },
+  pending: { mark: "…", className: "text-muted-foreground" },
+};
+
+/** The latest verdict per role, in a fixed order. */
+function latestChecks(pr: PrSummary) {
+  const byRole = new Map<string, PrSummary["checks"][number]>();
+  for (const check of pr.checks) byRole.set(check.role, check);
+  return ["review1", "review2", "security"].flatMap((role) => byRole.get(role) ?? []);
+}
+
+function PrChips({ pr }: { pr: PrSummary }) {
+  const navigate = useBbNavigate();
+  const state = pr.state === "merged" ? "merged" : pr.state === "closed" ? "closed" : pr.isDraft ? "draft" : "ready";
+  return (
+    <div className="flex flex-wrap items-center gap-1 text-[10px]">
+      <span
+        role="link"
+        tabIndex={0}
+        onClick={(event) => {
+          event.stopPropagation();
+          navigate.openUrl(pr.url);
+        }}
+        onKeyDown={(event) => {
+          if (event.key === "Enter") {
+            event.stopPropagation();
+            navigate.openUrl(pr.url);
+          }
+        }}
+        className="inline-flex items-center gap-1 rounded border border-border px-1.5 py-0.5 font-medium hover:bg-state-hover"
+        title={pr.url}
+      >
+        <Icon name="GitPullRequest" fallback="Link" className="size-3" />#{pr.number}
+        <span className="text-muted-foreground">{state}</span>
+      </span>
+      {latestChecks(pr).map((check) => (
+        <span key={check.role} className="inline-flex items-center gap-0.5 rounded border border-border px-1.5 py-0.5" title={`${check.label}: ${check.verdict}`}>
+          {check.label === "Security" ? "Sec" : check.label.replace("Reviewer ", "R")}
+          <span className={VERDICT_STYLE[check.verdict].className}>{VERDICT_STYLE[check.verdict].mark}</span>
+        </span>
+      ))}
+      {pr.scan === null ? null : (
+        <span
+          className={cn(
+            "rounded border border-border px-1.5 py-0.5",
+            pr.scan === "failed" ? "text-destructive" : pr.scan === "running" ? "text-muted-foreground" : "",
+          )}
+          title={`Rafter scan ${pr.scan}`}
+        >
+          Rafter {pr.scan === "running" ? "…" : pr.scan === "failed" ? "✗" : "✓"}
+        </span>
+      )}
+    </div>
+  );
+}
 
 // ---------- Data ----------
 
@@ -501,6 +561,7 @@ const TaskCard = memo(function TaskCard({
         )}
       </div>
       <div className="line-clamp-3 text-sm leading-snug">{task.title}</div>
+      {task.pr === null ? null : <PrChips pr={task.pr} />}
       {agents.length === 0 ? null : (
         <div className="flex flex-wrap gap-1">
           {agents.map(({ agent, thread }) => {
@@ -657,6 +718,13 @@ function TaskDialog({
                 <Markdown content={detail.description} />
               )}
             </div>
+
+            {task.pr === null ? null : (
+              <div className="space-y-1">
+                <div className="text-xs font-medium text-muted-foreground">Pull request</div>
+                <PrChips pr={task.pr} />
+              </div>
+            )}
 
             {live.length === 0 ? null : (
               <div className="space-y-1">
