@@ -744,7 +744,8 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
   function findingsText(data: unknown): string {
-    const text = JSON.stringify(data, null, 1);
+    // Scan output quotes repository code, so it is untrusted: keep it from closing the fenced block.
+    const text = JSON.stringify(data, null, 1).replaceAll("```", "ʼʼʼ");
     return text.length > 40_000 ? `${text.slice(0, 40_000)}\n… (truncated)` : text;
   }
 
@@ -959,9 +960,15 @@ export default async function plugin(bb: BbPluginApi) {
     }
 
     const open = JSON.parse(
-      await gh(hostId, ["pr", "list", "--repo", repo, "--state", "open", "--limit", "100", "--json", "number,url,headRefName,headRefOid,isDraft,additions,deletions"]),
-    ) as GhPr[];
-    for (const gp of open) {
+      await gh(hostId, [
+        "pr", "list", "--repo", repo, "--state", "open", "--limit", "100", "--author", "@me",
+        "--json", "number,url,headRefName,headRefOid,isDraft,additions,deletions,isCrossRepository",
+      ]),
+    ) as (GhPr & { isCrossRepository: boolean })[];
+    // Never review a PR from a fork: its branch name can collide with a builder's
+    // branch, and its code would reach full-access agents.
+    const sameRepo = open.filter((gp) => !gp.isCrossRepository);
+    for (const gp of sameRepo) {
       const known = factory.prs.find((pr) => pr.number === gp.number);
       if (known === undefined) {
         const taskKey = taskByBranch.get(gp.headRefName);
@@ -981,7 +988,7 @@ export default async function plugin(bb: BbPluginApi) {
     }
     factory = await findFactory(prefix);
     for (const pr of factory.prs.filter((candidate) => candidate.state === "open")) {
-      if (!open.some((gp) => gp.number === pr.number)) await onPrClosed(factory, hostId, repo, pr);
+      if (!sameRepo.some((gp) => gp.number === pr.number)) await onPrClosed(factory, hostId, repo, pr);
     }
     factory = await findFactory(prefix);
     for (const pr of factory.prs.filter((candidate) => candidate.state === "open")) {
@@ -1004,9 +1011,16 @@ export default async function plugin(bb: BbPluginApi) {
         hint: "Verdicts are for factory PRs; comment on the task instead.",
       });
     }
+    const reviewers = new Set(pr.reviews.filter((review) => review.role === args.role).map((review) => review.threadId));
+    if (args.threadId === null || !reviewers.has(args.threadId)) {
+      throw new PluginCliError(`Only the ${ROLES[args.role].label} thread the factory started for PR #${pr.number} can record this verdict.`, {
+        code: "not_the_reviewer",
+        hint: "Run this from that reviewer's thread. Builders and the Lead cannot approve their own work.",
+      });
+    }
     await mutateFactory(factory.prefix, (current) => {
       const target = current.prs.find((candidate) => candidate.number === pr.number);
-      target?.reviews.push({ role: args.role, threadId: args.threadId ?? reviewFor(pr, args.role)?.threadId ?? null, sha: pr.headSha, verdict: args.verdict, at: new Date().toISOString() });
+      target?.reviews.push({ role: args.role, threadId: args.threadId, sha: pr.headSha, verdict: args.verdict, at: new Date().toISOString() });
     });
     await comment(task.id, `**${ROLES[args.role].label}:** ${args.verdict === "approve" ? "APPROVE" : "REQUEST CHANGES"} on [PR #${pr.number}](${pr.url}) at \`${pr.headSha.slice(0, 7)}\``);
     wakePrWatch();
