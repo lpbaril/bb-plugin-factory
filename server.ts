@@ -174,7 +174,19 @@ export default async function plugin(bb: BbPluginApi) {
     designProvider: { type: "select", label: "Designer runs on", options: providerOptions, default: "claude-code" },
     review1Provider: { type: "select", label: "Reviewer 1 runs on", options: providerOptions, default: "claude-code" },
     review2Provider: { type: "select", label: "Reviewer 2 runs on", options: providerOptions, default: "codex" },
+    agentPermissions: {
+      type: "select",
+      label: "Agent permissions",
+      description:
+        "Permission mode for new factory agents. auto: commands outside the sandbox wait for your approval. accept-edits: file edits run, commands ask. full: no approvals at all; agents can run any command on this machine, so the factory can work while you're away.",
+      options: ["auto", "accept-edits", "full"],
+      default: "auto",
+    },
   });
+  async function permissionMode(): Promise<"auto" | "accept-edits" | "full"> {
+    const { agentPermissions } = await settings.get();
+    return agentPermissions === "full" || agentPermissions === "accept-edits" ? agentPermissions : "auto";
+  }
   async function providerFor(role: RoleId): Promise<string> {
     const values = await settings.get();
     return values[`${role}Provider`];
@@ -343,6 +355,7 @@ export default async function plugin(bb: BbPluginApi) {
       projectId: factory.bbProjectId,
       environment: { type: "project-default" },
       providerId,
+      permissionMode: await permissionMode(),
       title: `${factory.name} · Lead`,
       pinned: true,
       prompt: leadPrompt({ factoryName: factory.name, prefix: factory.prefix, goal }),
@@ -400,6 +413,7 @@ export default async function plugin(bb: BbPluginApi) {
     const base = {
       projectId: factory.bbProjectId,
       providerId,
+      permissionMode: await permissionMode(),
       parentThreadId: factory.leadThreadId,
       title: `${task.key} · ${role.label}: ${task.title}`.slice(0, 200),
       prompt: workerPrompt({
