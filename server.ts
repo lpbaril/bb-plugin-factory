@@ -137,6 +137,8 @@ const factorySchema = z.object({
   /** GitHub owner/name, from the project's remote. */
   repo: z.string().nullable().default(null),
   prs: z.array(prSchema).default([]),
+  /** Archived factories leave the Factory page tabs, take no new agents, and are not watched. */
+  archivedAt: z.string().nullable().default(null),
 });
 type Factory = z.infer<typeof factorySchema>;
 
@@ -173,6 +175,12 @@ const prefixSchema = z
   .toUpperCase()
   .regex(/^[A-Z][A-Z0-9]{0,9}$/, "Prefix: 1-10 letters or digits, starting with a letter");
 
+const deleteResultSchema = z.object({
+  prefix: z.string(),
+  tasksDeleted: z.boolean(),
+  threadsArchived: z.number(),
+});
+
 export const rpcContract = defineRpcContract({
   factories_list: {
     input: z.null(),
@@ -189,6 +197,18 @@ export const rpcContract = defineRpcContract({
       name: z.string().trim().min(1).max(80),
     }),
     output: factorySummarySchema,
+  },
+  factory_archive: {
+    input: z.object({ prefix: z.string() }),
+    output: factorySummarySchema,
+  },
+  factory_restore: {
+    input: z.object({ prefix: z.string() }),
+    output: factorySummarySchema,
+  },
+  factory_delete: {
+    input: z.object({ prefix: z.string(), deleteTasks: z.boolean(), archiveThreads: z.boolean() }),
+    output: deleteResultSchema,
   },
   factory_board: {
     input: z.object({ prefix: z.string() }),
@@ -518,14 +538,71 @@ export default async function plugin(bb: BbPluginApi) {
       createdAt: new Date().toISOString(),
       repo: null,
       prs: [],
+      archivedAt: null,
     };
     await saveFactory(factory);
     return factory;
   }
 
+  function assertActive(factory: Factory): void {
+    if (factory.archivedAt !== null) {
+      throw new PluginCliError(`Factory ${factory.prefix} is archived.`, {
+        code: "factory_archived",
+        hint: `Restore it first: \`bb factory restore ${factory.prefix}\`, or from the Archived list on the Factory page.`,
+      });
+    }
+  }
+
+  function setArchived(prefix: string, archived: boolean): Promise<Factory> {
+    return mutateFactory(prefix.trim().toUpperCase(), (factory) => {
+      factory.archivedAt = archived ? (factory.archivedAt ?? new Date().toISOString()) : null;
+      return factory;
+    });
+  }
+
+  /** Removes the factory record for good; its tracker and agent threads go too only when asked. */
+  async function deleteFactory(args: {
+    prefix: string;
+    deleteTasks: boolean;
+    archiveThreads: boolean;
+  }): Promise<z.infer<typeof deleteResultSchema>> {
+    const factory = await findFactory(args.prefix);
+    let threadsArchived = 0;
+    if (args.archiveThreads) {
+      for (const agent of factory.agents) {
+        const thread = await bb.sdk.threads.get({ threadId: agent.threadId }).catch(() => null);
+        if (thread === null || thread.archivedAt !== null || thread.deletedAt !== null) continue;
+        try {
+          await bb.sdk.threads.archive({ threadId: agent.threadId });
+          threadsArchived += 1;
+        } catch (error) {
+          bb.log.warn(`could not archive ${agent.threadId} of ${factory.prefix}: ${String(error)}`);
+        }
+      }
+    }
+    let tasksDeleted = false;
+    if (args.deleteTasks) {
+      const result = await tasksRpc(
+        "deleteProject",
+        { projectId: factory.trackerProjectId, force: true },
+        z.object({ ok: z.boolean(), error: z.object({ code: z.string(), message: z.string() }).optional() }),
+      );
+      if (!result.ok) throw new Error(`Could not delete the task board: ${result.error?.message ?? "unknown error"}`);
+      tasksDeleted = true;
+    }
+    const previous = factoryLocks.get(factory.prefix) ?? Promise.resolve();
+    await previous;
+    await bb.storage.kv.delete(KEY_PREFIX + factory.prefix);
+    factoryLocks.delete(factory.prefix);
+    signatures.delete(factory.prefix);
+    bb.realtime.publish(BOARD_CHANGED, { prefix: factory.prefix });
+    return { prefix: factory.prefix, tasksDeleted, threadsArchived };
+  }
+
   // ----- Agents -----
 
   async function startLead(factory: Factory, goal: string | null): Promise<string> {
+    assertActive(factory);
     if (factory.leadThreadId !== null) {
       const existing = await bb.sdk.threads.get({ threadId: factory.leadThreadId }).catch(() => null);
       if (existing !== null && existing.archivedAt === null && existing.deletedAt === null) {
@@ -584,6 +661,7 @@ export default async function plugin(bb: BbPluginApi) {
   }): Promise<string> {
     const task = await getTaskByKey(args.taskKey);
     const factory = await factoryForTaskKey(task.key);
+    assertActive(factory);
     if (factory.leadThreadId === null) {
       throw new PluginCliError(`Factory ${factory.prefix} has no Lead yet.`, {
         code: "no_lead",
@@ -1424,6 +1502,7 @@ ${findings}`;
       while (!signal.aborted) {
         if ((await settings.get()).prReviews) {
           for (const factory of await listFactories()) {
+            if (factory.archivedAt !== null) continue;
             try {
               await watchPrs(factory.prefix);
             } catch (error) {
@@ -1452,6 +1531,12 @@ ${findings}`;
       projects: (await bb.sdk.projects.list()).map((project) => ({ id: project.id, name: project.name })),
     }),
     factory_create: async (input) => summarize(await createFactory(input)),
+    factory_archive: async ({ prefix }) => summarize(await setArchived(prefix, true)),
+    factory_restore: async ({ prefix }) => summarize(await setArchived(prefix, false)),
+    factory_delete: async (input, ctx) => {
+      if (ctx.experimental_caller?.kind !== "client") throw new Error("Only the Factory page can delete a factory.");
+      return deleteFactory(input);
+    },
     factory_board: async ({ prefix }) => {
       const factory = await findFactory(prefix);
       const tasks = await listTasks(factory);
@@ -1505,6 +1590,7 @@ ${findings}`;
       while (!signal.aborted) {
         try {
           for (const factory of await listFactories()) {
+            if (factory.archivedAt !== null) continue;
             const tasks = await listTasks(factory);
             const signature = tasks
               .map((task) => `${task.id}:${task.status}:${task.updatedAt}:${task.labelIds.join(",")}`)
@@ -1560,9 +1646,26 @@ ${findings}`;
               return { exitCode: 0, stdout: "No factories. Create one with `bb factory create`." };
             }
             const lines = factories.map(
-              (f) => `${f.prefix}  ${f.name}  (project ${f.bbProjectName}, lead ${f.leadThreadId ?? "not started"})`,
+              (f) =>
+                `${f.prefix}  ${f.name}  (project ${f.bbProjectName}, lead ${f.leadThreadId ?? "not started"})${f.archivedAt === null ? "" : "  [archived]"}`,
             );
             return { exitCode: 0, stdout: lines.join("\n") };
+          },
+        }),
+        archive: cliCommand({
+          summary: "Archive a factory: hide it from the Factory page and stop its PR reviews; restore brings it back",
+          positionals: [{ name: "factory", description: "Factory prefix", required: true }],
+          async run(input) {
+            const factory = await setArchived(input.positionals.factory, true);
+            return { exitCode: 0, stdout: `Archived factory ${factory.prefix}. Bring it back with \`bb factory restore ${factory.prefix}\`.` };
+          },
+        }),
+        restore: cliCommand({
+          summary: "Restore an archived factory",
+          positionals: [{ name: "factory", description: "Factory prefix", required: true }],
+          async run(input) {
+            const factory = await setArchived(input.positionals.factory, false);
+            return { exitCode: 0, stdout: `Restored factory ${factory.prefix}.` };
           },
         }),
         create: cliCommand({
@@ -1836,7 +1939,7 @@ ${findings}`;
             if (input.positionals.factory !== undefined) {
               factory = await findFactory(input.positionals.factory);
             } else {
-              const all = await listFactories();
+              const all = (await listFactories()).filter((candidate) => candidate.archivedAt === null);
               if (all.length !== 1 || all[0] === undefined) {
                 throw new PluginCliError("Name the factory.", {
                   code: "factory_required",

@@ -20,6 +20,14 @@ import type { PluginSidebarThread } from "@get-bb/plugin-sdk/app";
 import type { Agent, BoardTask, Column, FactorySummary, PrSummary, TaskComment, rpcContract } from "./server";
 import { ROLES, WORKER_ROLE_IDS, type AssignableRoleId } from "./roles";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
+import {
+  ContextMenu,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuSeparator,
+  ContextMenuTrigger,
+} from "@/components/ui/context-menu";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Icon } from "@/components/ui/icon";
 import { Input } from "@/components/ui/input";
@@ -203,11 +211,53 @@ function useBoard(prefix: string) {
 
 function FactoryPage({ subPath }: { subPath: string }) {
   const navigate = useBbNavigate();
-  const { factories, error } = useFactories();
+  const rpc = useRpc<typeof rpcContract>();
+  const { factories: all, error, refetch } = useFactories();
   const [creating, setCreating] = useState(false);
+  const [showArchived, setShowArchived] = useState(false);
+  const [deleting, setDeleting] = useState<FactorySummary | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const factories = useMemo(() => all?.filter((factory) => factory.archivedAt === null) ?? null, [all]);
+  const archived = useMemo(() => all?.filter((factory) => factory.archivedAt !== null) ?? [], [all]);
   const selected = subPath.split("/")[0]?.toUpperCase() ?? "";
   const first = factories?.[0]?.prefix ?? null;
   const known = factories?.some((factory) => factory.prefix === selected) ?? false;
+
+  const setArchived = (factory: FactorySummary, archive: boolean) => {
+    setActionError(null);
+    rpc.call(archive ? "factory_archive" : "factory_restore", { prefix: factory.prefix }).then(
+      () => {
+        refetch();
+        if (!archive) {
+          setShowArchived(false);
+          navigate.toPluginPanel(PANEL_PATH, { subPath: factory.prefix });
+        }
+      },
+      (cause) => setActionError(errorText(cause)),
+    );
+  };
+  const dialogs = (
+    <>
+      <ArchivedDialog
+        open={showArchived}
+        factories={archived}
+        onClose={() => setShowArchived(false)}
+        onRestore={(factory) => setArchived(factory, false)}
+        onDelete={(factory) => {
+          setShowArchived(false);
+          setDeleting(factory);
+        }}
+      />
+      <DeleteFactoryDialog factory={deleting} onClose={() => setDeleting(null)} onDeleted={refetch} />
+    </>
+  );
+  const archivedButton =
+    archived.length === 0 ? null : (
+      <Button variant="ghost" size="sm" className="text-muted-foreground" onClick={() => setShowArchived(true)}>
+        <Icon name="Archive" fallback="Folder" className="size-4" />
+        Archived ({archived.length})
+      </Button>
+    );
 
   useEffect(() => {
     if (first !== null && !known) navigate.toPluginPanel(PANEL_PATH, { subPath: first, replace: true });
@@ -237,6 +287,9 @@ function FactoryPage({ subPath }: { subPath: string }) {
           }}
           onCancel={factories.length === 0 ? null : () => setCreating(false)}
         />
+        {factories.length === 0 ? archivedButton : null}
+        {actionError === null ? null : <Alert>{actionError}</Alert>}
+        {dialogs}
       </Frame>
     );
   }
@@ -244,24 +297,185 @@ function FactoryPage({ subPath }: { subPath: string }) {
     <div className="flex h-full min-h-0 flex-1 flex-col">
       <div className="flex items-center gap-1 overflow-x-auto border-b border-border px-4 py-2 md:px-5">
         {factories.map((factory) => (
-          <Button
-            key={factory.prefix}
-            variant="ghost"
-            size="sm"
-            aria-pressed={factory.prefix === selected}
-            onClick={() => navigate.toPluginPanel(PANEL_PATH, { subPath: factory.prefix })}
-          >
-            {factory.name}
-            <span className="font-mono text-[10px] text-muted-foreground">{factory.prefix}</span>
-          </Button>
+          <ContextMenu key={factory.prefix}>
+            <ContextMenuTrigger asChild>
+              <Button
+                variant="ghost"
+                size="sm"
+                aria-pressed={factory.prefix === selected}
+                onClick={() => navigate.toPluginPanel(PANEL_PATH, { subPath: factory.prefix })}
+              >
+                {factory.name}
+                <span className="font-mono text-[10px] text-muted-foreground">{factory.prefix}</span>
+              </Button>
+            </ContextMenuTrigger>
+            <ContextMenuContent>
+              <ContextMenuItem onSelect={() => setArchived(factory, true)}>
+                <Icon name="Archive" fallback="Folder" />
+                Archive factory
+              </ContextMenuItem>
+              <ContextMenuSeparator />
+              <ContextMenuItem
+                className="text-destructive focus:text-destructive"
+                onSelect={() => setDeleting(factory)}
+              >
+                <Icon name="Trash2" fallback="X" />
+                Delete factory…
+              </ContextMenuItem>
+            </ContextMenuContent>
+          </ContextMenu>
         ))}
         <Button variant="ghost" size="sm" className="text-muted-foreground" onClick={() => setCreating(true)}>
           <Icon name="Plus" className="size-4" />
           New factory
         </Button>
+        <span className="ml-auto" />
+        {archivedButton}
       </div>
+      {actionError === null ? null : (
+        <div className="px-4 pt-2 md:px-5">
+          <Alert>{actionError}</Alert>
+        </div>
+      )}
       {known ? <FactoryView key={selected} prefix={selected} /> : null}
+      {dialogs}
     </div>
+  );
+}
+
+function ArchivedDialog({
+  open,
+  factories,
+  onClose,
+  onRestore,
+  onDelete,
+}: {
+  open: boolean;
+  factories: FactorySummary[];
+  onClose: () => void;
+  onRestore: (factory: FactorySummary) => void;
+  onDelete: (factory: FactorySummary) => void;
+}) {
+  return (
+    <Dialog open={open} onOpenChange={(next) => (next ? undefined : onClose())}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>Archived factories</DialogTitle>
+          <DialogDescription>
+            Archived factories keep their tasks and agents but take no new work and get no automatic PR reviews.
+          </DialogDescription>
+        </DialogHeader>
+        {factories.length === 0 ? (
+          <EmptyState>No archived factories.</EmptyState>
+        ) : (
+          <ul className="divide-y divide-border rounded-md border border-border">
+            {factories.map((factory) => (
+              <li key={factory.prefix} className="flex items-center gap-2 px-3 py-2 text-sm">
+                <span className="font-medium">{factory.name}</span>
+                <span className="font-mono text-[10px] text-muted-foreground">{factory.prefix}</span>
+                <span className="truncate text-xs text-muted-foreground">
+                  {factory.archivedAt === null ? "" : `archived ${new Date(factory.archivedAt).toLocaleDateString()}`}
+                </span>
+                <span className="ml-auto flex shrink-0 gap-1">
+                  <Button size="sm" variant="outline" onClick={() => onRestore(factory)}>
+                    Restore
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="text-destructive hover:text-destructive"
+                    onClick={() => onDelete(factory)}
+                  >
+                    Delete…
+                  </Button>
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function DeleteFactoryDialog({
+  factory,
+  onClose,
+  onDeleted,
+}: {
+  factory: FactorySummary | null;
+  onClose: () => void;
+  onDeleted: () => void;
+}) {
+  const rpc = useRpc<typeof rpcContract>();
+  const [deleteTasks, setDeleteTasks] = useState(true);
+  const [archiveThreads, setArchiveThreads] = useState(false);
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const prefix = factory?.prefix ?? null;
+
+  useEffect(() => {
+    setDeleteTasks(true);
+    setArchiveThreads(false);
+    setError(null);
+  }, [prefix]);
+
+  const remove = async () => {
+    if (factory === null) return;
+    setPending(true);
+    setError(null);
+    try {
+      await rpc.call("factory_delete", { prefix: factory.prefix, deleteTasks, archiveThreads });
+      onDeleted();
+      onClose();
+    } catch (cause) {
+      setError(errorText(cause));
+    } finally {
+      setPending(false);
+    }
+  };
+
+  return (
+    <Dialog open={factory !== null} onOpenChange={(open) => (open || pending ? undefined : onClose())}>
+      <DialogContent className="sm:max-w-md">
+        {factory === null ? null : (
+          <>
+            <DialogHeader>
+              <DialogTitle>Delete {factory.name}?</DialogTitle>
+              <DialogDescription>
+                This removes the factory {factory.prefix} for good; it can't be restored. To keep it for later, archive
+                it instead. The bb project {factory.bbProjectName} and its files are not touched.
+              </DialogDescription>
+            </DialogHeader>
+            <label className="flex items-start gap-2 text-sm">
+              <Checkbox checked={deleteTasks} onCheckedChange={(value) => setDeleteTasks(value === true)} />
+              <span>
+                Also delete its task board
+                <span className="block text-xs text-muted-foreground">
+                  The {factory.prefix} tracker in Tasks, with every task and comment.
+                </span>
+              </span>
+            </label>
+            <label className="flex items-start gap-2 text-sm">
+              <Checkbox checked={archiveThreads} onCheckedChange={(value) => setArchiveThreads(value === true)} />
+              <span>
+                Also archive its agent threads
+                <span className="block text-xs text-muted-foreground">The Lead and specialists still in the sidebar.</span>
+              </span>
+            </label>
+            {error === null ? null : <Alert>{error}</Alert>}
+            <div className="flex justify-end gap-2">
+              <Button variant="ghost" onClick={onClose} disabled={pending}>
+                Cancel
+              </Button>
+              <Button variant="destructive" onClick={() => void remove()} disabled={pending}>
+                {pending ? "Deleting…" : `Delete ${factory.prefix}`}
+              </Button>
+            </div>
+          </>
+        )}
+      </DialogContent>
+    </Dialog>
   );
 }
 
