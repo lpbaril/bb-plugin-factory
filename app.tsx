@@ -18,7 +18,7 @@ import {
 } from "@get-bb/plugin-sdk/app";
 import type { PluginSidebarThread } from "@get-bb/plugin-sdk/app";
 import type { Agent, BoardTask, Column, FactorySummary, PrSummary, TaskComment, rpcContract } from "./server";
-import { ROLES, WORKER_ROLE_IDS, type WorkerRoleId } from "./roles";
+import { ROLES, WORKER_ROLE_IDS, type AssignableRoleId } from "./roles";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Icon } from "@/components/ui/icon";
@@ -632,7 +632,7 @@ function TaskDialog({
   const navigate = useBbNavigate();
   const [detail, setDetail] = useState<{ description: string; comments: TaskComment[] } | null>(null);
   const [instructions, setInstructions] = useState("");
-  const [pending, setPending] = useState<WorkerRoleId | null>(null);
+  const [pending, setPending] = useState<AssignableRoleId | null>(null);
   const [error, setError] = useState<string | null>(null);
   const taskId = task?.id ?? null;
   const updatedAt = task?.updatedAt ?? null;
@@ -658,7 +658,7 @@ function TaskDialog({
     };
   }, [rpc, taskId, updatedAt]);
 
-  const assign = async (role: WorkerRoleId) => {
+  const assign = async (role: AssignableRoleId) => {
     if (task === null) return;
     setPending(role);
     setError(null);
