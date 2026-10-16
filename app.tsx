@@ -184,8 +184,11 @@ function useBoard(prefix: string) {
       (cause) => setError(errorText(cause)),
     );
   }, [rpc, prefix]);
+  // Clear the board only when switching factories; a new rpc client must not blank the page.
   useEffect(() => {
     setBoard(null);
+  }, [prefix]);
+  useEffect(() => {
     refetch();
   }, [refetch]);
   useRealtime("board-changed", (payload) => {

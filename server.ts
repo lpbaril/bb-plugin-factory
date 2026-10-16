@@ -1173,8 +1173,15 @@ ${sections.join("\n\n---\n\n")}`;
     await gh(hostId, ["pr", "ready", String(pr.number), "--repo", repo]);
     await mutateFactory(factory.prefix, (current) => {
       const target = current.prs.find((candidate) => candidate.number === pr.number);
-      if (target !== undefined) target.readyRequested = true;
+      if (target !== undefined) {
+        target.readyRequested = true;
+        // Show "ready" now rather than after the next poll.
+        target.isDraft = false;
+      }
     });
+    if ((await rafterKey()) !== null && !pr.scans.some((scan) => scan.phase === "ready" && scan.sha === pr.headSha)) {
+      await startScan(factory.prefix, repo, pr.number, "ready");
+    }
     const labels = roles.map((role) => `${ROLES[role].label} ✓`).join(", ");
     await prComment(hostId, repo, pr.number, `**Factory:** every reviewer approves (${labels}). Marked ready for review${(await rafterKey()) !== null ? "; a final Rafter scan is running" : ""}. Merging is up to you.`);
     const task = await getTaskByKey(pr.taskKey);
