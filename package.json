@@ -10,7 +10,10 @@
     "name": "Factory",
     "description": "Run a software factory: a Lead agent that delegates tasks to builder, QA, designer and reviewer agents, with a live board of their work.",
     "branding": {
-      "icon": "Factory"
+      "icon": "./assets/factory.svg",
+      "experimental_icons": {
+        "factory": "./assets/factory.svg"
+      }
     },
     "server": "./server.ts",
     "app": "./app.tsx",

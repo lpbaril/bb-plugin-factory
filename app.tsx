@@ -10,6 +10,7 @@ import {
   definePluginApp,
   experimental_ProviderIcon as ProviderIcon,
   experimental_ThreadStatusGlyph as ThreadStatusGlyph,
+  experimental_useProviders,
   experimental_useSidebarThreads,
   useBbNavigate,
   useRealtime,
@@ -297,12 +298,7 @@ const AgentCard = memo(function AgentCard({ entry }: { entry: LiveAgent }) {
       )}
     >
       <div className="flex items-center gap-2">
-        <ProviderIcon
-          providerKind="agent"
-          provider={{ id: agent.providerId }}
-          className="size-4"
-          aria-hidden
-        />
+        <AgentProviderIcon providerId={agent.providerId} />
         <span className="text-sm font-medium">{ROLES[agent.role].label}</span>
         {agent.taskKey === null ? null : (
           <span className="font-mono text-[11px] text-muted-foreground">{agent.taskKey}</span>
@@ -316,6 +312,19 @@ const AgentCard = memo(function AgentCard({ entry }: { entry: LiveAgent }) {
     </button>
   );
 });
+
+function AgentProviderIcon({ providerId }: { providerId: string }) {
+  const { providers } = experimental_useProviders();
+  const provider = providers.find((candidate) => candidate.id === providerId);
+  return (
+    <ProviderIcon
+      providerKind="agent"
+      provider={provider === undefined ? { id: providerId } : { id: provider.id, logoUrl: provider.logoUrl, icon: provider.icon ?? null, strings: provider.strings ?? null }}
+      className="size-4"
+      aria-label={provider?.displayName ?? providerId}
+    />
+  );
+}
 
 function StartLead({ factory, onStarted }: { factory: FactorySummary; onStarted: () => void }) {
   const rpc = useRpc<typeof rpcContract>();
@@ -889,7 +898,7 @@ export default definePluginApp((app) => {
   app.slots.navPanel({
     id: "factory",
     title: "Factory",
-    icon: "Factory",
+    icon: "factory/factory",
     path: PANEL_PATH,
     component: FactoryPage,
   });
