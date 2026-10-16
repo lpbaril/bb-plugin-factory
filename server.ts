@@ -1345,6 +1345,31 @@ export default async function plugin(bb: BbPluginApi) {
             return { exitCode: 0, stdout: `Rafter key works. GitHub token for Rafter: ${tokenSet ? "set" : "not set"}.\nUsage: ${text}` };
           },
         }),
+        "rafter report": cliCommand({
+          summary: "Save the full report of the latest finished Rafter scan of a task's PR, and print its path",
+          positionals: [{ name: "task", description: "Task key, such as APP-12", required: true }],
+          async run(input) {
+            const task = await getTaskByKey(input.positionals.task);
+            const factory = await factoryForTaskKey(task.key);
+            const scan = factory.prs
+              .filter((pr) => pr.taskKey === task.key)
+              .flatMap((pr) => pr.scans)
+              .filter((candidate) => candidate.status === "completed" && candidate.scanId !== null)
+              .at(-1);
+            if (scan === undefined || scan.scanId === null) {
+              throw new PluginCliError(`${task.key} has no finished Rafter scan.`, { code: "no_scan", hint: `Run \`bb factory rafter scan ${task.key}\` first.` });
+            }
+            const result = await rafterPoll(scan.scanId);
+            if (result.status !== "completed") throw new PluginCliError(`Rafter scan ${scan.scanId} is ${result.status}.`, { code: "scan_unavailable" });
+            const { hostId } = await projectHost(factory);
+            const saved = await host.call(
+              "save_report",
+              { name: `rafter-${scan.scanId.replace(/[^A-Za-z0-9._-]/g, "_")}.json`, content: JSON.stringify(result.data, null, 1) },
+              { hostId, timeoutMs: 60_000 },
+            );
+            return { exitCode: 0, stdout: saved.path };
+          },
+        }),
         "rafter scan": cliCommand({
           summary: "Run a Rafter scan of a task's open PR now and hand the results to its Security reviewer",
           positionals: [{ name: "task", description: "Task key, such as APP-12", required: true }],
