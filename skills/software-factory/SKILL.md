@@ -32,7 +32,9 @@ In review, Done and Blocked; cards show their pull request and its verdicts.
 
 | Command | Effect |
 | --- | --- |
-| `bb factory list` | List factories with their prefix, project and Lead. |
+| `bb factory list` | List factories with their prefix, project and Lead; archived ones are marked `[archived]`. |
+| `bb factory archive APP` | Archive a factory: it leaves the Factory page tabs, takes no new agents, and gets no automatic PR reviews. |
+| `bb factory restore APP` | Restore an archived factory. Deleting a factory is only possible from the Factory page. |
 | `bb factory create --prefix APP [--project proj_...] [--name "..."]` | Create a factory and its Tasks tracker (or reuse a tracker with that prefix). The project defaults to the current thread's. |
 | `bb factory start APP [--goal "..."]` | Start the Lead thread. |
 | `bb factory assign APP-12 --role build\|qa\|design\|review1\|review2\|security [--instructions "..."]` | Spawn a specialist for the task as the Lead's child. Builder and Designer get a new worktree; the others reuse the task's builder worktree. PR reviewers are normally started automatically instead. |
