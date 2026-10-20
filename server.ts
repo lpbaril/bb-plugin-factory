@@ -1947,7 +1947,17 @@ ${findings}`;
             reasoning: { type: "enum", values: ["default", ...REASONING_LEVELS], description: "Reasoning level, or default" },
             "custom-model": { type: "string", description: "Shadow only: a model id sent as-is, for models the list doesn't show; none clears it" },
           },
-          async run(input) {
+          async run(input, ctx) {
+            // Agents read untrusted PR content; a prompt-injected agent must not move the Security
+            // reviewer or the shadow onto another model. Same rule as the page's agent_set RPC.
+            // ctx.threadId comes from the caller's environment, so this stops accidents and
+            // injected instructions, not a deliberate bypass.
+            if (ctx.threadId !== undefined) {
+              throw new PluginCliError("Only the person can change which model an agent runs on.", {
+                code: "person_only",
+                hint: "Use Settings → Plugins → Factory → Agents, or run this from your own terminal.",
+              });
+            }
             const key = input.positionals.agent as AgentKey;
             if (!(AGENT_KEYS as readonly string[]).includes(key)) {
               throw new PluginCliError(`Unknown agent "${input.positionals.agent}".`, { code: "unknown_agent", hint: `Use one of: ${AGENT_KEYS.join(", ")}.` });
