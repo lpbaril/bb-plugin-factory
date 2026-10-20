@@ -33,6 +33,7 @@ In review, Done and Blocked; cards show their pull request and its verdicts.
 | Command | Effect |
 | --- | --- |
 | `bb factory list` | List factories with their prefix, project and Lead; archived ones are marked `[archived]`. |
+| `bb factory agents` | Show the provider, model and reasoning level each agent runs on. Leave changes to the person unless they ask. |
 | `bb factory archive APP` | Archive a factory: it leaves the Factory page tabs, takes no new agents, and gets no automatic PR reviews. |
 | `bb factory restore APP` | Restore an archived factory. Deleting a factory is only possible from the Factory page. |
 | `bb factory create --prefix APP [--project proj_...] [--name "..."]` | Create a factory and its Tasks tracker (or reuse a tracker with that prefix). The project defaults to the current thread's. |
@@ -57,10 +58,12 @@ Tasks themselves are managed with `bb tasks` (`create`, `show`, `update
 
 ## Settings
 
-`bb plugin config factory` shows them: the provider for each role, agent
-permissions, automatic PR reviews on or off, the changed-line threshold for
+`bb factory agents` shows the provider, model and reasoning level each agent
+runs on (every role plus the reviewer-trial comparison); the person changes them
+in the Agents section of the plugin settings, or with `bb factory agents set`.
+`bb plugin config factory` shows the rest: agent permissions, automatic PR reviews on or off, the changed-line threshold for
 Reviewer 2, the secret Rafter API key and optional GitHub token for Rafter, and
-the shadow security reviewer (provider, model, and when it runs: off, the next N
+the shadow security reviewer (when it runs: off, the next N
 PRs, or every sensitive PR, judged by changed paths and the PR title). The shadow
 reviewer posts only task comments, and a comparison thread scores it against the
 incumbent. With **Shadow REQUEST CHANGES blocks the ready gate** on, its REQUEST

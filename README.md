@@ -23,10 +23,19 @@ a project and a task prefix, and start the Lead.
 
 ## Settings
 
-`bb plugin config factory`, or Settings → Plugins → Factory:
+Settings → Plugins → Factory, or `bb plugin config factory`:
 
-- The provider for each role (Claude Code, Codex or Cursor), and a model for
-  the shadow reviewer.
+- **Agents**: one line per agent (Lead, Builder, QA, Designer, Reviewer 1,
+  Reviewer 2, Security, Shadow security, and the reviewer-trial comparison),
+  each with bb's provider, model and reasoning picker. Until you pick, an agent
+  uses the provider's catalog defaults, exactly as shown (never the level a
+  project used last); **Use defaults** goes back to them. The shadow
+  reviewer also takes a **custom model id**, sent as-is, for a model the picker
+  doesn't list, such as Codex's `gpt-daybreak-blue-latest`. From the command
+  line: `bb factory agents` shows them, and `bb factory agents set <agent>
+  --provider … --model … --reasoning …` changes one (`--custom-model` for the
+  shadow). Upgrading from 0.1.2 copies the old per-role provider settings and
+  the shadow model into Agents once.
 - **Agent permissions**: `auto` (default) asks you before commands outside the
   sandbox. `full` removes all approvals.
 - **Review factory pull requests automatically**, and the changed-line threshold

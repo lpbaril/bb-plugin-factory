@@ -9,6 +9,7 @@ import {
   Markdown,
   definePluginApp,
   experimental_ProviderIcon as ProviderIcon,
+  experimental_ProviderModelPicker as ProviderModelPicker,
   experimental_ThreadStatusGlyph as ThreadStatusGlyph,
   experimental_useProviders,
   experimental_useSidebarThreads,
@@ -16,8 +17,8 @@ import {
   useRealtime,
   useRpc,
 } from "@get-bb/plugin-sdk/app";
-import type { PluginSidebarThread } from "@get-bb/plugin-sdk/app";
-import type { Agent, BoardTask, Column, FactorySummary, PrSummary, TaskComment, rpcContract } from "./server";
+import type { ExperimentalProviderModelPickerValue, PluginSidebarThread } from "@get-bb/plugin-sdk/app";
+import type { Agent, AgentExec, AgentsView, BoardTask, Column, FactorySummary, PrSummary, TaskComment, rpcContract } from "./server";
 import { ROLES, WORKER_ROLE_IDS, type AssignableRoleId } from "./roles";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -1196,6 +1197,141 @@ function CreateFactory({
   );
 }
 
+// ---------- Settings: the Agents section ----------
+
+type AgentRow = AgentsView["agents"][number];
+
+/** Plugin settings section: one line per agent with bb's provider, model and reasoning picker. */
+function AgentsSettings() {
+  const rpc = useRpc<typeof rpcContract>();
+  const [view, setView] = useState<AgentsView | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const refetch = useCallback(() => {
+    rpc.call("agents_get", null).then(setView, (cause) => setError(errorText(cause)));
+  }, [rpc]);
+  useEffect(refetch, [refetch]);
+  useRealtime("agents-changed", refetch);
+
+  const save = useCallback(
+    async (input: Parameters<typeof rpc.call<"agent_set">>[1]) => {
+      setError(null);
+      try {
+        setView(await rpc.call("agent_set", input));
+      } catch (cause) {
+        setError(errorText(cause));
+        refetch();
+      }
+    },
+    [rpc, refetch],
+  );
+
+  if (view === null) {
+    return error === null ? <p className="text-sm text-muted-foreground">Loading agents…</p> : <Alert>{error}</Alert>;
+  }
+  return (
+    <div className="space-y-3">
+      <div className="divide-y divide-border">
+        {view.agents.map((row) => (
+          <AgentSettingRow
+            key={row.key}
+            row={row}
+            customModel={row.key === "shadow" ? view.shadowCustomModel : null}
+            onExec={(exec) => save({ kind: "exec", key: row.key, exec })}
+            onCustomModel={(model) => save({ kind: "shadowCustomModel", model })}
+          />
+        ))}
+      </div>
+      {error === null ? null : <Alert>{error}</Alert>}
+    </div>
+  );
+}
+
+function AgentSettingRow({
+  row,
+  customModel,
+  onExec,
+  onCustomModel,
+}: {
+  row: AgentRow;
+  customModel: string | null;
+  onExec: (exec: AgentExec) => void;
+  onCustomModel: (model: string | null) => void;
+}) {
+  const { exec, defaultModel, defaultReasoning } = row;
+  const usesDefaults = exec.model === null && exec.reasoningLevel === null;
+  const value: ExperimentalProviderModelPickerValue = {
+    providerId: exec.providerId,
+    model: exec.model ?? defaultModel ?? "",
+    reasoningLevel: exec.reasoningLevel ?? defaultReasoning ?? "medium",
+  };
+  const onChange = (next: ExperimentalProviderModelPickerValue) => {
+    const sameProvider = next.providerId === exec.providerId;
+    // Keep "provider default" for a part the person didn't change.
+    const changed: AgentExec = {
+      providerId: next.providerId,
+      model: sameProvider && exec.model === null && next.model === value.model ? null : next.model,
+      reasoningLevel: sameProvider && exec.reasoningLevel === null && next.reasoningLevel === value.reasoningLevel ? null : next.reasoningLevel,
+    };
+    // The picker can re-emit the value it was given; only a real change is saved.
+    if (changed.providerId === exec.providerId && changed.model === exec.model && changed.reasoningLevel === exec.reasoningLevel) return;
+    onExec(changed);
+  };
+  return (
+    <div className="py-2.5">
+      <div className="flex items-center justify-between gap-4">
+        <div className="min-w-0">
+          <div className="text-sm font-medium">{row.label}</div>
+          <div className="text-xs text-muted-foreground">
+            {customModel !== null ? `Custom model ${customModel}` : usesDefaults ? "Provider defaults" : null}
+          </div>
+        </div>
+        <div className="flex shrink-0 items-center gap-1">
+          <ProviderModelPicker value={value} onChange={onChange} align="end" />
+          {usesDefaults ? null : (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="text-muted-foreground"
+              onClick={() => onExec({ providerId: exec.providerId, model: null, reasoningLevel: null })}
+            >
+              Use defaults
+            </Button>
+          )}
+        </div>
+      </div>
+      {row.key === "shadow" ? <CustomModelField value={customModel} onSave={onCustomModel} /> : null}
+    </div>
+  );
+}
+
+/** The shadow's model id sent as-is, for models the picker can't list (such as Codex's gpt-daybreak-blue-latest). */
+function CustomModelField({ value, onSave }: { value: string | null; onSave: (model: string | null) => void }) {
+  const [draft, setDraft] = useState(value ?? "");
+  useEffect(() => setDraft(value ?? ""), [value]);
+  const commit = () => {
+    const next = draft.trim() === "" ? null : draft.trim();
+    if (next !== value) onSave(next);
+  };
+  return (
+    <div className="mt-2 flex items-center justify-between gap-4">
+      <p className="min-w-0 text-xs text-muted-foreground">
+        Custom model id: sent as-is and overrides the picker's model, for a model the picker doesn't list. Leave empty to use the picker.
+      </p>
+      <Input
+        className="h-8 w-64 shrink-0 text-sm"
+        value={draft}
+        placeholder="e.g. gpt-daybreak-blue-latest"
+        aria-label="Shadow security reviewer custom model id"
+        onChange={(event) => setDraft(event.target.value)}
+        onBlur={commit}
+        onKeyDown={(event) => {
+          if (event.key === "Enter") event.currentTarget.blur();
+        }}
+      />
+    </div>
+  );
+}
+
 // ---------- Shared bits ----------
 
 function Frame({ children }: { children: ReactNode }) {
@@ -1226,6 +1362,12 @@ function Alert({ children }: { children: ReactNode }) {
 }
 
 export default definePluginApp((app) => {
+  app.slots.settingsSection({
+    id: "agents",
+    title: "Agents",
+    description: "The provider, model and reasoning level each factory agent runs on.",
+    component: AgentsSettings,
+  });
   app.slots.navPanel({
     id: "factory",
     title: "Factory",
