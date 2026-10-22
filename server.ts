@@ -14,6 +14,7 @@ import {
   defineRpcContract,
   type BbPluginApi,
   type PluginSettingDescriptor,
+  type PluginTurnFailedEvent,
 } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { hostContract } from "./host-contract";
@@ -22,9 +23,11 @@ import {
   ROLES,
   ROLE_IDS,
   WORKER_ROLE_IDS,
+  leadCharter,
   leadPrompt,
   reReviewMessage,
   workerPrompt,
+  workerReminder,
   type PrReviewRole,
   type RoleId,
   type WorkerRoleId,
@@ -318,6 +321,32 @@ export const rpcContract = defineRpcContract({
 const BOARD_CHANGED = "board-changed";
 const POLL_MS = 4000;
 
+/** Failures the provider-retry plugin schedules itself. */
+const PROVIDER_RETRY_CATEGORIES: readonly string[] = ["overloaded", "rate-limit"];
+/** Failures another attempt won't fix. */
+const PERMANENT_CATEGORIES: readonly string[] = [
+  "unauthorized",
+  "billing",
+  "policy",
+  "budget-exceeded",
+  "bad-request",
+  "context-window-exceeded",
+];
+/**
+ * What the supervisor does about a failed turn. Core counts attempts per turn
+ * (1 on the first failure, 2 on its retry's), so one retry needs no state here.
+ */
+export function supervisorAction(
+  event: Pick<PluginTurnFailedEvent, "errorInfo" | "attemptNumber">,
+): "leave" | "retry" | "escalate" {
+  const category = event.errorInfo?.category ?? null;
+  if (event.errorInfo?.httpStatusCode === 429 || (category !== null && PROVIDER_RETRY_CATEGORIES.includes(category))) {
+    return "leave";
+  }
+  if (category !== null && PERMANENT_CATEGORIES.includes(category)) return "escalate";
+  return event.attemptNumber <= 1 ? "retry" : "escalate";
+}
+
 const AGENTS_KV = "agents";
 /** Set once the old per-role settings have been copied into AGENTS_KV. */
 const AGENTS_MIGRATED_KV = "agents-migrated";
@@ -364,6 +393,13 @@ export default async function plugin(bb: BbPluginApi) {
       description:
         "When the Lead opens a PR for a task, start Reviewer 1 (and Reviewer 2 for large or sensitive diffs) plus the Security reviewer. Each posts its verdict as a PR comment.",
       default: true,
+    },
+    superviseAgents: {
+      type: "boolean",
+      label: "Retry a failed agent once",
+      description:
+        "When a factory agent's turn fails or is cut off by a daemon restart, a lost connection or a stalled provider, retry it once. If it fails again, mark its task Blocked and tell the Lead. Overloads and rate limits stay with Provider retry.",
+      default: false,
     },
     deepReviewLines: {
       type: "number",
@@ -678,8 +714,29 @@ export default async function plugin(bb: BbPluginApi) {
   }
   async function saveFactory(factory: Factory): Promise<void> {
     await bb.storage.kv.set(KEY_PREFIX + factory.prefix, factory);
+    indexFactory(factory.prefix, factory);
     bb.realtime.publish(BOARD_CHANGED, { prefix: factory.prefix });
   }
+  /** Every factory agent by thread id, for the synchronous instruction callback and the supervisor. */
+  const agentsByThread = new Map<string, { factory: Factory; agent: Agent }>();
+  function indexFactory(prefix: string, factory: Factory | null): void {
+    for (const [threadId, entry] of agentsByThread) {
+      if (entry.factory.prefix === prefix) agentsByThread.delete(threadId);
+    }
+    for (const agent of factory?.agents ?? []) agentsByThread.set(agent.threadId, { factory: factory!, agent });
+  }
+  for (const factory of await listFactories()) indexFactory(factory.prefix, factory);
+
+  // Re-supply each agent's standing rules on every turn: its role prompt is only
+  // its first message, which compaction can summarize away.
+  bb.agents.contributeInstructions(({ threadId }) => {
+    const entry = agentsByThread.get(threadId);
+    if (entry === undefined || entry.factory.archivedAt !== null) return null;
+    const { factory, agent } = entry;
+    if (agent.role === "lead") return leadCharter({ factoryName: factory.name, prefix: factory.prefix });
+    if (agent.taskKey === null) return null;
+    return workerReminder({ role: agent.role, factoryName: factory.name, taskKey: agent.taskKey });
+  });
   /** Serializes read-modify-write of one factory record; keep `change` free of slow I/O. */
   const factoryLocks = new Map<string, Promise<unknown>>();
   function mutateFactory<T>(prefix: string, change: (factory: Factory) => T): Promise<T> {
@@ -804,6 +861,7 @@ export default async function plugin(bb: BbPluginApi) {
     const previous = factoryLocks.get(factory.prefix) ?? Promise.resolve();
     await previous;
     await bb.storage.kv.delete(KEY_PREFIX + factory.prefix);
+    indexFactory(factory.prefix, null);
     factoryLocks.delete(factory.prefix);
     signatures.delete(factory.prefix);
     bb.realtime.publish(BOARD_CHANGED, { prefix: factory.prefix });
@@ -1775,6 +1833,59 @@ ${findings}`;
         });
       }
     },
+  });
+
+  // ----- Supervisor: one automatic retry for a failed agent turn -----
+
+  // Core puts a thread in error and fires turn.failed both for a failed turn and
+  // for one cut off by a daemon restart, a lost connection or a stalled provider.
+  // A manual stop leaves the thread idle, so it never reaches this handler.
+  bb.events.on("turn.failed", async (event) => {
+    const entry = agentsByThread.get(event.threadId);
+    if (entry === undefined || entry.factory.archivedAt !== null) return;
+    if (!(await settings.get()).superviseAgents) return;
+    const action = supervisorAction(event);
+    if (action === "leave") return;
+    const { factory, agent } = entry;
+    const who = `${ROLES[agent.role].label}${agent.taskKey === null ? "" : ` for ${agent.taskKey}`} (\`${event.threadId}\`)`;
+    const why =
+      event.errorInfo === null
+        ? "no error details; often a daemon restart, a lost connection or a stalled provider turn"
+        : `${event.errorInfo.category}${event.errorInfo.httpStatusCode === null ? "" : ` (HTTP ${event.errorInfo.httpStatusCode})`}`;
+    if (action === "retry") {
+      try {
+        await bb.sdk.threads.retry({
+          threadId: event.threadId,
+          turnRequestId: event.requestId,
+          reason: "Factory: retrying once after a failure",
+        });
+      } catch (error) {
+        // Already retried by someone else, or the thread moved on.
+        bb.log.warn(`supervisor could not retry ${event.threadId}: ${String(error)}`);
+        return;
+      }
+      bb.log.info(`supervisor retried ${event.threadId} (${why})`);
+      if (agent.role !== "lead" && agent.role !== "shadow") {
+        await tellLead(factory, `[factory] ${who} stopped: ${why}. The factory retried it once; wait for its result before reassigning the task.`);
+      }
+      return;
+    }
+    // The Lead in error already reaches the person through core and push
+    // notifications; the shadow reports to nobody.
+    if (agent.role === "lead" || agent.role === "shadow" || agent.taskKey === null) {
+      bb.log.warn(`supervisor: ${who} failed and was not retried (${why})`);
+      return;
+    }
+    const again = event.attemptNumber > 1 ? " again after a retry" : "";
+    try {
+      await setBlocked(agent.taskKey, true, `${who} failed${again}: ${why}.`);
+    } catch (error) {
+      bb.log.warn(`supervisor could not block ${agent.taskKey}: ${String(error)}`);
+    }
+    await tellLead(
+      factory,
+      `[factory] ${who} failed${again}: ${why}. ${agent.taskKey} is marked Blocked. Retry it with \`bb thread retry ${event.threadId}\`, reassign it, or ask the person.`,
+    );
   });
 
   // ----- RPC for the Factory page -----

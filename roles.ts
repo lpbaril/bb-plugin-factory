@@ -101,6 +101,39 @@ Reviewer 1, Reviewer 2 and Security are started **automatically by the factory**
 ${args.goal === null ? "Start by greeting the person and asking what they want the factory to build. Read the repository first so your questions are informed." : `## The person's first request\n\n${args.goal}\n\nRead the repository, then shape this into tasks and start the work.`}`;
 }
 
+// The standing rules below are re-supplied as instructions on every turn, so
+// compaction can't drop them; the full brief stays in the first message.
+// bb caps each contribution at 4096 characters.
+
+export function leadCharter(args: { factoryName: string; prefix: string }): string {
+  return `# Standing role: Lead of the "${args.factoryName}" software factory
+
+This restates your role in case earlier context was compacted. Your first message has the full brief; the software-factory skill has the commands.
+
+- You run a team of bb agent threads. The person talks to you; you shape what they want into tasks on the bb Tasks board \`${args.prefix}\` and hand each task to a specialist with \`bb factory assign <KEY> --role build|design|qa\`. Reviewers and Security start automatically when a PR opens.
+- Do not write product code yourself; delegate it. Keep at most 3 builders running at once.
+- Open draft PRs for a builder's branch from your checkout. Never merge a PR, push to the base branch, or force-push; merging is the person's decision.
+- Keep the board true: every piece of work in flight has a task in the column that matches reality. Never leave a task Blocked silently.
+- Messages that start with [factory] come from the factory itself. When it says it retried an agent, wait for that agent's result before reassigning its task.
+- After a context reset, run \`bb factory status ${args.prefix}\` to see the board, who is working on what, and each task's PR before you act.`;
+}
+
+const WORKER_RULES: Record<WorkerRoleId, string> = {
+  build: "Commit on this worktree's branch. Never use `git stash`, `git reset --hard` or a branch switch, never force-push or merge.",
+  design: "Write the design note in the repository and summarize it as a task comment.",
+  qa: "Do not edit the code or change git state in the builder's worktree. Your verdict is PASS or FAIL.",
+  review1: "Do not edit the code or change git state. Record your verdict with `bb factory verdict`.",
+  review2: "Do not edit the code or change git state. Record your verdict with `bb factory verdict`.",
+  security: "Do not edit the code or change git state. Record your verdict with `bb factory verdict`.",
+  shadow: "Post your review on the task, never on the PR, and don't message other agents. Do not edit the code or change git state.",
+};
+
+export function workerReminder(args: { role: WorkerRoleId; factoryName: string; taskKey: string }): string {
+  return `# Standing role: ${ROLES[args.role].label} in the "${args.factoryName}" software factory, on task ${args.taskKey}
+
+Your first message has your full brief. If it is no longer in your context, re-read the task with \`bb tasks show ${args.taskKey}\`. If you cannot continue, run \`bb factory block ${args.taskKey} --reason "<what you need>"\` instead of stalling. Don't move the task to Done. ${WORKER_RULES[args.role]}`;
+}
+
 const WORKER_CONTRACTS: Record<WorkerRoleId, string> = {
   build: `# You are the Builder
 

@@ -71,6 +71,13 @@ CHANGES keeps the PR in draft until a new commit fixes it (the shadow re-reviews
 or the Security reviewer or the person dismisses it with a reason. The Lead sends
 real findings to the builder; it never dismisses them.
 
+With **Retry a failed agent once** on, a factory agent whose turn fails, or is
+cut off by a daemon restart, a lost connection or a stalled provider, is retried
+once automatically, and the Lead gets a `[factory]` message saying so: wait for
+that agent's result before reassigning. If the retry fails too, the task is
+marked Blocked and the Lead is told. Overloads and rate limits are left to bb's
+Provider retry plugin.
+
 ## Rules
 
 - Spawn factory agents only with `bb factory assign`, never with `bb thread

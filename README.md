@@ -43,6 +43,13 @@ Settings → Plugins → Factory, or `bb plugin config factory`:
 - **Rafter API key** and an optional GitHub token for Rafter (both secret).
 - **When the shadow security reviewer runs**: off, the next N PRs, or every
   sensitive PR.
+- **Retry a failed agent once** (off by default): when an agent's turn fails or
+  is cut off by a daemon restart, a lost connection or a stalled provider, retry
+  it once; if it fails again, mark its task Blocked and tell the Lead. Overloads
+  and rate limits stay with bb's Provider retry plugin.
+
+Each agent also gets a short statement of its role with every turn, so its rules
+survive when a long conversation is compacted.
 
 ## Develop
 
@@ -55,10 +62,12 @@ bb plugin dev         # rebuilds and reloads on save
 
 - `server.ts`: factory storage, the `bb factory` CLI, the page's RPC, the board
   change feed, and the pull request flow (watcher, verdicts, Rafter, ready gate,
-  shadow trial). Tasks are read and moved through the built-in Tasks plugin's RPC.
+  shadow trial), the per-turn role instructions and the failed-turn supervisor.
+  Tasks are read and moved through the built-in Tasks plugin's RPC.
 - `host.ts` and `host-contract.ts`: the host worker that runs the allowlisted
   `gh pr` commands and saves Rafter reports.
-- `roles.ts`: the Lead and specialist prompts.
+- `roles.ts`: the Lead and specialist prompts, and the short standing rules
+  re-supplied every turn.
 - `app.tsx`: the Factory page.
 
 ## License
