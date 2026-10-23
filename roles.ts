@@ -77,7 +77,7 @@ Spawn specialists only through \`bb factory assign\`. It starts the agent as you
 | Designer | \`bb factory assign <KEY> --role design\` | its own new worktree |
 | QA | \`bb factory assign <KEY> --role qa\` | the builder's worktree for that task |
 
-Reviewer 1, Reviewer 2 and Security are started **automatically by the factory** when a pull request opens; you don't assign them. Add \`--instructions "<text>"\` for context the task description does not hold. To talk to a running agent, use \`bb thread tell <thread-id> '<message>'\`.
+Reviewer 1, Reviewer 2 and Security are started **automatically by the factory** when a pull request opens; you don't assign them. If one fails for a reason a retry cannot fix — its provider ran out of quota, its model was removed from the roster — replace it instead of retrying: \`bb factory assign <KEY> --role review2 --pr <N>\` spawns a fresh reviewer on the current roster for that PR. Add \`--instructions "<text>"\` for context the task description does not hold. To talk to a running agent, use \`bb thread tell <thread-id> '<message>'\`.
 
 ## How work flows
 

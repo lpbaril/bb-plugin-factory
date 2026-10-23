@@ -58,6 +58,7 @@ skip docs-only changes. PRs stay drafts until every reviewer approves, so
 | `bb factory create --prefix APP [--project proj_...] [--name "..."]` | Create a factory and its Tasks tracker (or reuse a tracker with that prefix). The project defaults to the current thread's. |
 | `bb factory start APP [--goal "..."]` | Start the Lead thread. |
 | `bb factory assign APP-12 --role build\|qa\|design\|review1\|review2\|security [--instructions "..."]` | Spawn a specialist for the task as the Lead's child. Builder and Designer get a new worktree; the others reuse the task's builder worktree. PR reviewers are normally started automatically instead. |
+| `bb factory assign APP-12 --role review1\|review2\|security --pr N` | Replace a reviewer that failed (dead provider, removed model) with a fresh one on the current roster, reviewing that PR. Retrying the old thread keeps the model it was spawned with, so it cannot recover from a provider that ran out. |
 | `bb factory verdict APP-12 --role review1\|review2\|security\|shadow --verdict approve\|changes [--pr N]` | Record a reviewer's verdict on the task's PR, after posting it (as a PR comment; the shadow reviewer posts a task comment). Only the reviewer thread the factory started can record it. |
 | `bb factory dismiss APP-12 --reason "..."` | Dismiss the shadow Security reviewer's REQUEST CHANGES. Only the task's Security reviewer can run this; the person can also dismiss from the task on the Factory page. |
 | `bb factory rafter check` | Check the Rafter API key and show the scan quota (never prints the key). |
@@ -80,6 +81,9 @@ Tasks themselves are managed with `bb tasks` (`create`, `show`, `update
 `bb factory agents` shows the provider, model and reasoning level each agent
 runs on (every role plus the reviewer-trial comparison); the person changes them
 in the Agents section of the plugin settings, or with `bb factory agents set`.
+An unset level follows the model's default. A level the model's catalog doesn't
+list is still sent as the person set it — provider capabilities lag behind what
+a provider accepts — with a warning in the plugin log.
 `bb plugin config factory` shows the rest: agent permissions, automatic PR reviews on or off, the changed-line threshold for
 Reviewer 2, the secret Rafter API key and optional GitHub token for Rafter, and
 the shadow security reviewer (when it runs: off, the next N

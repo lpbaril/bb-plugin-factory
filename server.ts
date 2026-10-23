@@ -517,8 +517,10 @@ export default async function plugin(bb: BbPluginApi) {
   /**
    * Spawn options for an agent, always naming the model and level the Agents section shows: an
    * unset model or level resolves to the provider's catalog default here, because leaving it unset
-   * would let bb fall back to whatever that project used last. A level the model doesn't list is
-   * dropped; a model the catalog doesn't list (such as an alias) is sent with the level as set.
+   * would let bb fall back to whatever that project used last. A model or level the catalog doesn't
+   * list is still sent as set, with a warning: the person chose it, and provider capabilities lag
+   * behind what a provider accepts (Synthetic lists its reasoning levels only after a probe
+   * refresh, for example). Silently running at the default would undo a deliberate choice.
    */
   async function executionFor(key: AgentKey): Promise<{ providerId: string; model?: string; reasoningLevel?: ReasoningLevel }> {
     const agents = await readAgents();
@@ -532,8 +534,10 @@ export default async function plugin(bb: BbPluginApi) {
         model ??= entry.id;
         if (level === null) level = entry.defaultReasoningEffort;
         else if (!entry.supportedReasoningEfforts.some((e) => e.reasoningEffort === level)) {
-          bb.log.warn(`${providerId}/${entry.id} doesn't offer reasoning level ${level}; the ${key} agent runs at ${entry.defaultReasoningEffort}`);
-          level = entry.defaultReasoningEffort;
+          const offered = entry.supportedReasoningEfforts.map((e) => e.reasoningEffort).join(", ") || "none";
+          bb.log.warn(
+            `${providerId}/${entry.id} doesn't advertise reasoning level ${level}; the ${key} agent sends it anyway because the person set it. It advertises: ${offered}.`,
+          );
         }
       }
     } catch (error) {
@@ -1178,10 +1182,16 @@ export default async function plugin(bb: BbPluginApi) {
 
   const SENSITIVE_PATH = /(auth|login|session|token|secret|crypt|password|permission|rbac|rls|payment|billing|stripe|migration|alembic|\.sql$|terraform|docker|k8s|helm|\.github\/workflows|infra)/i;
 
-  async function startPrReviewer(prefix: string, prNumber: number, role: PrReviewRole, findings: string | null, instructions: string | null) {
+  async function startPrReviewer(
+    prefix: string,
+    prNumber: number,
+    role: PrReviewRole,
+    findings: string | null,
+    instructions: string | null,
+  ): Promise<string | null> {
     const factory = await findFactory(prefix);
     const pr = factory.prs.find((candidate) => candidate.number === prNumber);
-    if (pr === undefined) return;
+    if (pr === undefined) return null;
     const firstSecurity = role === "security" && reviewFor(pr, "security") === null;
     const threadId = await assign({ taskKey: pr.taskKey, role, instructions, pr: { number: pr.number, url: pr.url }, findings });
     await mutateFactory(prefix, (current) => {
@@ -1189,6 +1199,7 @@ export default async function plugin(bb: BbPluginApi) {
       target?.reviews.push({ role, threadId, sha: target.headSha, verdict: "pending", at: new Date().toISOString() });
     });
     if (firstSecurity) await maybeStartShadow(prefix, pr, threadId, findings, instructions);
+    return threadId;
   }
 
   // ----- Shadow reviewer trial -----
@@ -1951,10 +1962,14 @@ ${findings}`;
     } catch (error) {
       bb.log.warn(`supervisor could not block ${agent.taskKey}: ${String(error)}`);
     }
-    await tellLead(
-      factory,
-      `[factory] ${who} failed${again}: ${why}. ${agent.taskKey} is marked Blocked. Retry it with \`bb thread retry ${event.threadId}\`, reassign it, or ask the person.`,
-    );
+    // A reviewer that died (its provider ran out of quota, its model went away) can't be retried into
+    // a working state: retrying reuses the model it was spawned with. A replacement reviewer reads the
+    // PR with the current roster instead.
+    const reviewer = agent.pr !== null && (PR_REVIEW_ROLES as readonly string[]).includes(agent.role);
+    const next = reviewer
+      ? `Replace it with \`bb factory assign ${agent.taskKey} --role ${agent.role} --pr ${agent.pr}\`, or ask the person`
+      : `Retry it with \`bb thread retry ${event.threadId}\`, reassign the task, or ask the person`;
+    await tellLead(factory, `[factory] ${who} failed${again}: ${why}. ${agent.taskKey} is marked Blocked. ${next}.`);
   });
 
   // ----- RPC for the Factory page -----
@@ -2236,20 +2251,56 @@ ${findings}`;
           },
         }),
         assign: cliCommand({
-          summary: "Assign a task to a specialist agent, spawned as the Lead's child thread",
+          summary: "Assign a task to a specialist agent, spawned as the Lead's child thread (or replace a failed PR reviewer with --pr)",
           positionals: [{ name: "task", description: "Task key, such as APP-12", required: true }],
           options: {
             role: {
               type: "enum",
               values: WORKER_ROLE_IDS,
               required: true,
-              description: "build, qa, design, review1 or review2",
+              description: WORKER_ROLE_IDS.join(", "),
             },
             instructions: { type: "string", description: "Extra context for the agent" },
+            pr: {
+              type: "integer",
+              min: 1,
+              max: 10_000_000,
+              description: "Reviewer roles only: the PR to review, to replace a reviewer that failed",
+            },
             json,
           },
           async run(input) {
             const role = input.options.role as WorkerRoleId;
+            const prNumber = input.options.pr ?? null;
+            if (prNumber !== null) {
+              if (!(PR_REVIEW_ROLES as readonly string[]).includes(role)) {
+                throw new PluginCliError("--pr only applies to review1, review2 or security.", {
+                  code: "pr_not_reviewer",
+                  hint: "Omit --pr to assign a build, qa or design task.",
+                });
+              }
+              const task = await getTaskByKey(input.positionals.task);
+              const factory = await factoryForTaskKey(task.key);
+              assertActive(factory);
+              const tracked = factory.prs.find((candidate) => candidate.number === prNumber);
+              if (tracked === undefined) {
+                throw new PluginCliError(`Factory ${factory.prefix} isn't tracking PR #${prNumber}.`, {
+                  code: "unknown_pr",
+                  hint: `Open PRs: ${factory.prs.filter((candidate) => candidate.state === "open").map((candidate) => `#${candidate.number}`).join(", ") || "none"}.`,
+                });
+              }
+              if (tracked.taskKey !== task.key) {
+                throw new PluginCliError(`PR #${prNumber} is for ${tracked.taskKey}, not ${task.key}.`, { code: "pr_task_mismatch" });
+              }
+              const threadId = await startPrReviewer(factory.prefix, prNumber, role as PrReviewRole, null, input.options.instructions ?? null);
+              if (threadId === null) throw new PluginCliError(`Could not start a reviewer for PR #${prNumber}.`, { code: "reviewer_not_started" });
+              return {
+                exitCode: 0,
+                stdout: input.options.json
+                  ? JSON.stringify({ threadId })
+                  : `Assigned ${task.key.toUpperCase()} to ${ROLES[role].label} on PR #${prNumber}: ${threadId}`,
+              };
+            }
             const threadId = await assign({
               taskKey: input.positionals.task,
               role,
