@@ -14,8 +14,9 @@ In review, Done and Blocked; cards show their pull request and its verdicts.
 
 ## Pull request flow
 
-1. When a builder is done (and QA passed, if assigned), the Lead pushes the
-   builder's branch and opens a **draft** PR for it with `gh pr create --draft`.
+1. When a builder is done (and QA passed, if assigned), it has run the full
+   local suite and pushed its branch; the Lead opens a **draft** PR for it with
+   `gh pr create --draft`.
 2. Within about two minutes the factory sees the PR (it matches the PR's head
    branch to the task's builder worktree) and starts **Reviewer 1** and the
    **Security** reviewer, plus **Reviewer 2** when the diff is large or touches
@@ -23,10 +24,28 @@ In review, Done and Blocked; cards show their pull request and its verdicts.
    scan of the PR branch and gives its results to the Security reviewer.
 3. Each reviewer posts one PR comment starting with APPROVE or REQUEST CHANGES,
    then records it with `bb factory verdict`.
-4. New commits on the PR re-run only the reviewers who requested changes.
+4. When the round is complete, the factory tells the Lead once, and the Lead
+   sends every finding to the builder in one message, so fixes land in a
+   single push. New commits re-review only the delta, and only by the
+   reviewers who requested changes.
 5. When every required verdict is APPROVE, the factory marks the PR ready for
-   review (which also runs full CI) and, with Rafter, runs a final scan. The
-   person merges; the factory then moves the task to Done.
+   review (which also runs full CI) and, with Rafter, runs a final scan. If
+   the PR touches files another open factory PR also touches, the Lead gets a
+   merge-train note so it can suggest an order. The person merges; the factory
+   then moves the task to Done.
+
+## Keeping CI costs down
+
+Every push to a PR branch re-runs the repo's CI and the re-reviewers, so the
+factory is built to minimize pushes and rounds: batched findings per round,
+delta-scoped re-reviews, builders that push only a locally green branch, and
+reviewers that never re-run CI jobs to probe flakes (they reproduce locally).
+
+On the repo side, keep expensive workflows for when they matter: fast Linux
+checks on `pull_request`, macOS/Windows matrices on `main`, nightly, a label
+such as `ci-full`, or platform-sensitive paths only; cancel superseded runs;
+skip docs-only changes. PRs stay drafts until every reviewer approves, so
+"ready for review" can gate the heavy jobs.
 
 ## Commands
 

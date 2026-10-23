@@ -125,6 +125,8 @@ const prSchema = z.object({
   shadow: z.boolean().default(false),
   /** When the factory reported a shadow review that ended without a verdict. */
   shadowStallNotifiedAt: z.string().nullable().default(null),
+  /** The head whose completed review round was reported to the Lead (batched findings). */
+  roundNotifiedSha: z.string().nullable().default(null),
 });
 type Pr = z.infer<typeof prSchema>;
 
@@ -1444,6 +1446,7 @@ ${sections.join("\n\n---\n\n")}`;
         openedAt: new Date().toISOString(),
         shadow: wantsShadow(files, gp.title).length > 0,
         shadowStallNotifiedAt: null,
+        roundNotifiedSha: null,
       });
     });
     const task = await getTaskByKey(taskKey);
@@ -1468,7 +1471,7 @@ ${sections.join("\n\n---\n\n")}`;
     }
     await tellLead(
       factory,
-      `[factory] PR #${gp.number} for ${taskKey} is picked up: Reviewer 1${deep ? ", Reviewer 2" : ""} and Security are reviewing it.${securityNote} You'll get each reviewer's result; send REQUEST CHANGES findings to the builder.`,
+      `[factory] PR #${gp.number} for ${taskKey} is picked up: Reviewer 1${deep ? ", Reviewer 2" : ""} and Security are reviewing it.${securityNote} You'll get each reviewer's result, then a round-complete message; hold the findings until then and send them to the builder in one message.`,
     );
   }
 
@@ -1590,6 +1593,41 @@ ${sections.join("\n\n---\n\n")}`;
     await tellLead(factory, `[factory] PR #${pr.number} (${pr.taskKey}) is approved but held: the shadow Security reviewer (\`${shadow.threadId}\`) stopped without a verdict. Ask the person to check its task comment and dismiss it on the Factory page, or ask the shadow to finish with \`bb thread tell\`.`);
   }
 
+  /**
+   * Merge-train note: when a freshly approved PR touches files another open
+   * factory PR also touches, merging either first likely conflicts the other
+   * (a merge-from-main push, a full CI run and a re-review round). Warn once,
+   * when the PR becomes ready, so the Lead can suggest an order.
+   */
+  async function warnMergeOverlap(factory: Factory, hostId: string, repo: string, pr: Pr): Promise<void> {
+    const others = factory.prs.filter((candidate) => candidate.state === "open" && candidate.number !== pr.number);
+    if (others.length === 0) return;
+    const filesOf = async (number: number): Promise<Set<string>> => {
+      try {
+        const view = JSON.parse(await gh(hostId, ["pr", "view", String(number), "--repo", repo, "--json", "files"])) as { files?: { path: string }[] };
+        return new Set((view.files ?? []).map((file) => file.path));
+      } catch (error) {
+        bb.log.warn(`could not list files of PR #${number}: ${String(error)}`);
+        return new Set();
+      }
+    };
+    const mine = await filesOf(pr.number);
+    if (mine.size === 0) return;
+    const overlaps: { number: number; taskKey: string; files: string[] }[] = [];
+    for (const other of others) {
+      const shared = [...(await filesOf(other.number))].filter((path) => mine.has(path)).sort();
+      if (shared.length > 0) overlaps.push({ number: other.number, taskKey: other.taskKey, files: shared });
+    }
+    if (overlaps.length === 0) return;
+    const details = overlaps
+      .map(({ number, taskKey, files }) => `PR #${number} (${taskKey}) shares ${files.slice(0, 3).join(", ")}${files.length > 3 ? ` and ${files.length - 3} more` : ""}`)
+      .join("; ");
+    await tellLead(
+      factory,
+      `[factory] Merge-train note for PR #${pr.number} (${pr.taskKey}): ${details}. Merging either PR first likely conflicts the other; suggest an order to the person, and after each merge have the other builder merge the base branch into its branch and re-check.`,
+    );
+  }
+
   async function maybeMarkReady(factory: Factory, hostId: string, repo: string, pr: Pr): Promise<void> {
     if (!pr.isDraft || pr.readyRequested || pr.state !== "open") return;
     if (pr.scans.some((scan) => scan.status === "running")) return;
@@ -1620,6 +1658,7 @@ ${sections.join("\n\n---\n\n")}`;
     const task = await getTaskByKey(pr.taskKey);
     await comment(task.id, `[PR #${pr.number}](${pr.url}) approved by ${labels} and marked ready for review.`);
     await tellLead(factory, `[factory] PR #${pr.number} (${pr.taskKey}) has every approval and is marked ready for review. Tell the person it's ready for them to merge.`);
+    await warnMergeOverlap(factory, hostId, repo, pr);
   }
 
   async function onPrClosed(factory: Factory, hostId: string, repo: string, pr: Pr): Promise<void> {
@@ -1706,6 +1745,35 @@ ${sections.join("\n\n---\n\n")}`;
     for (const pr of factory.prs) await maybeMarkReady(factory, hostId, repo, pr);
   }
 
+  /**
+   * When every required reviewer holds a verdict (the latest per role, like the
+   * ready gate), tell the Lead once per round, so findings reach the builder in
+   * one batched message. Relaying each review as it lands used to cause one fix
+   * push per reviewer, and every push re-runs CI and the re-reviewers.
+   */
+  async function maybeReportRound(factory: Factory, prNumber: number): Promise<void> {
+    const round = await mutateFactory(factory.prefix, (current) => {
+      const target = current.prs.find((candidate) => candidate.number === prNumber);
+      if (target === undefined || target.state !== "open") return null;
+      if (target.roundNotifiedSha === target.headSha) return null;
+      const verdicts = requiredRoles(target).map((role) => ({ role, review: reviewFor(target, role) }));
+      if (!verdicts.every(({ review }) => review !== null && (review.verdict === "approve" || review.verdict === "changes"))) return null;
+      // All approvals are announced by the ready gate instead.
+      if (verdicts.every(({ review }) => review!.verdict === "approve")) return null;
+      target.roundNotifiedSha = target.headSha;
+      return {
+        headSha: target.headSha,
+        taskKey: target.taskKey,
+        labels: verdicts.map(({ role, review }) => `${ROLES[role].label} ${review!.verdict === "approve" ? "APPROVE" : "REQUEST CHANGES"}`).join(", "),
+      };
+    });
+    if (round === null) return;
+    await tellLead(
+      factory,
+      `[factory] Review round complete on PR #${prNumber} (${round.taskKey}) at \`${round.headSha.slice(0, 7)}\`: ${round.labels}. Send every REQUEST CHANGES finding to the builder in one message, so its fixes land in a single push; each push re-runs CI and the reviewers who asked for changes.`,
+    );
+  }
+
   async function recordVerdict(args: { taskKey: string; role: PrReviewRole; verdict: Exclude<Verdict, "pending">; pr: number | null; threadId: string | null }) {
     const task = await getTaskByKey(args.taskKey);
     const factory = await factoryForTaskKey(task.key);
@@ -1732,6 +1800,7 @@ ${sections.join("\n\n---\n\n")}`;
     if (args.role === "shadow" && args.verdict === "changes" && (await settings.get()).shadowBlocks) {
       await onShadowBlock(factory, pr, args.threadId);
     }
+    await maybeReportRound(factory, pr.number);
     wakePrWatch();
     return pr;
   }

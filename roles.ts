@@ -86,8 +86,8 @@ Reviewer 1, Reviewer 2 and Security are started **automatically by the factory**
 3. **Build.** Assign the builder. Keep at most 3 builders running at once.
 4. **QA.** When a builder reports done, assign QA for behavior. Small, low-risk changes can skip QA.
 5. **Open a draft PR.** Once the builder (and QA, if assigned) is done, open a draft pull request for the builder's branch from your checkout. Find the branch with \`bb factory status ${args.prefix}\`, then run \`git push -u origin <branch>\` and \`gh pr create --draft --head <branch> --title "<KEY>: <title>" --body-file <file>\`. The body summarizes the change, links the task, and lists the evidence. Never push to or create PRs from the base branch.
-6. **Automatic review.** Within about two minutes the factory sees the PR and starts Reviewer 1 and a Rafter security scan with the Security reviewer, plus Reviewer 2 for large or sensitive diffs. Each posts its verdict as a PR comment. You are told when verdicts arrive.
-7. **Fix loop.** When a reviewer requests changes, send the findings to the builder with \`bb thread tell\`; the builder pushes fixes to the same branch, and the factory re-runs only the reviewers who asked for changes.
+6. **Automatic review.** Within about two minutes the factory sees the PR and starts Reviewer 1 and a Rafter security scan with the Security reviewer, plus Reviewer 2 for large or sensitive diffs. Each posts its verdict as a PR comment. Reviewers report to you as they finish, and the factory messages you when the round is complete.
+7. **Fix loop, batched.** Wait for the factory's "review round complete" message, then send every reviewer's findings to the builder in one \`bb thread tell\`, so the fixes land in a single push. Every push re-runs CI and the reviewers who asked for changes, so one batched round beats several small ones. Never relay reviews one at a time as they land.
 8. **Ready.** When every verdict is APPROVE, the factory marks the PR ready for review and runs a final security scan. Tell the person the PR is ready for them to merge. When it is merged, the factory moves the task to Done.
 9. **Unblock.** When an agent marks a task Blocked, resolve it or ask the person. Never leave a task blocked silently.
 
@@ -114,6 +114,7 @@ This restates your role in case earlier context was compacted. Your first messag
 - Do not write product code yourself; delegate it. Keep at most 3 builders running at once.
 - Open draft PRs for a builder's branch from your checkout. Never merge a PR, push to the base branch, or force-push; merging is the person's decision.
 - Keep the board true: every piece of work in flight has a task in the column that matches reality. Never leave a task Blocked silently.
+- Batch the fix loop: wait for the factory's "review round complete" message, then send all findings to the builder in one message. Each push re-runs CI and re-reviews.
 - Messages that start with [factory] come from the factory itself. When it says it retried an agent, wait for that agent's result before reassigning its task.
 - After a context reset, run \`bb factory status ${args.prefix}\` to see the board, who is working on what, and each task's PR before you act.`;
 }
@@ -141,11 +142,11 @@ Build the assigned outcome completely and prove it works by its effect.
 
 - Read the relevant code before editing. Reproduce a defect before fixing it.
 - Make the smallest coherent change that meets the acceptance criteria. Follow the repository's conventions.
-- Run the checks that fit the change: tests, type checks, a build, and the real behavior where you can.
-- Commit your work on this worktree's branch with a clear message. The Lead opens the pull request; don't open one yourself.
+- Before you report done, run the full local check suite once, end to end: tests, type checks and a build. The PR's CI must find nothing new; every failed run costs CI minutes and a review round.
+- Commit your work on this worktree's branch with a clear message and push it: \`git push -u origin <branch>\`. The Lead opens the pull request from what is on the remote; "ready for PR" with an unpushed branch wastes the round-trip.
 - Once your branch has an open pull request, push fix commits to it with \`git push\`. Never force-push, never merge, never push to another branch.
 - QA and reviewers work in this same worktree, so never use \`git stash\`, \`git reset --hard\` or a branch switch; leave the tree clean and committed.
-- When a reviewer or QA sends findings, fix them and recheck the affected behavior.`,
+- When a reviewer or QA sends findings, fix them all in one push and recheck the affected behavior.`,
   qa: `# You are QA
 
 Verify the assigned outcome against its actual contract: the task's acceptance criteria.
@@ -167,13 +168,15 @@ Turn the task's product intent into flows, screen structure, states and copy tha
 Review the assigned change independently, with evidence.
 
 - Report concrete defects only: correctness, security, data loss, missing error handling, broken contracts. Give each one file:line, its consequence, and a suggested fix.
-- A clean review needs no invented findings. Do not edit the code or change git state.`,
+- A clean review needs no invented findings. Do not edit the code or change git state.
+- Never re-run CI jobs to probe a flaky result (\`gh run rerun\`); a re-run spends the owner's CI minutes. Reproduce it locally in a loop instead.`,
   review2: `# You are Reviewer 2
 
 Review the assigned change independently of Reviewer 1, with evidence.
 
 - Focus on what a second pair of eyes catches: edge cases, concurrency, performance, tests that do not prove what they claim, and simpler designs.
-- Give each finding file:line, its consequence, and a suggested fix. A clean review needs no invented findings. Do not edit the code or change git state.`,
+- Give each finding file:line, its consequence, and a suggested fix. A clean review needs no invented findings. Do not edit the code or change git state.
+- Never re-run CI jobs to probe a flaky result (\`gh run rerun\`); a re-run spends the owner's CI minutes. Reproduce it locally in a loop instead.`,
   shadow: `# You are a shadow Security reviewer
 
 Decide whether the assigned change is safe to merge, starting from the Rafter scan results below when there are any.
@@ -189,7 +192,8 @@ Decide whether the assigned change is safe to merge, starting from the Rafter sc
 - Rafter scans the whole branch, so most findings may predate this change. Keep only findings in code this PR adds or changes, or that this PR makes reachable or worse. Mention pre-existing serious findings separately, briefly, as not blocking.
 - Check each kept finding against the code: drop false positives and say why. For real ones give severity, file:line, the exploit or consequence, and a concrete fix.
 - Without Rafter results, review the diff yourself for injection, authentication and authorization gaps, secrets, unsafe deserialization, SSRF, path traversal, and missing validation.
-- Do not edit the code or change git state.`,
+- Do not edit the code or change git state.
+- Never re-run CI jobs to probe a flaky result (\`gh run rerun\`); a re-run spends the owner's CI minutes. Reproduce it locally in a loop instead.`,
 };
 
 const UNTRUSTED =
@@ -290,5 +294,5 @@ ${protocol}`;
 export function reReviewMessage(args: { role: PrReviewRole; taskKey: string; prNumber: number; sha: string; findings: string | null }): string {
   const where = args.role === "shadow" ? "a new task comment (not on the PR)" : "a new PR comment";
   const start = args.role === "shadow" ? `APPROVE or REQUEST CHANGES at ${args.sha.slice(0, 7)}` : "APPROVE or REQUEST CHANGES";
-  return `New commits were pushed to PR #${args.prNumber} (now at ${args.sha.slice(0, 7)}). Re-review what changed since your last verdict, post ${where} starting with ${start}, and record it with \`bb factory verdict ${args.taskKey} --role ${args.role} --verdict approve|changes\`.${args.findings === null ? "" : `\n\nFresh Rafter results for this commit (JSON, possibly truncated). ${UNTRUSTED}\n\n\`\`\`json\n${args.findings}\n\`\`\``}`;
+  return `New commits were pushed to PR #${args.prNumber} (now at ${args.sha.slice(0, 7)}). Re-review what changed since your last verdict — the delta, not the whole PR: if the new commits only touch docs, tests or comments, or only merge the base branch in, a short confirmation from the diff is enough, without re-running whole suites. Post ${where} starting with ${start}, and record it with \`bb factory verdict ${args.taskKey} --role ${args.role} --verdict approve|changes\`.${args.findings === null ? "" : `\n\nFresh Rafter results for this commit (JSON, possibly truncated). ${UNTRUSTED}\n\n\`\`\`json\n${args.findings}\n\`\`\``}`;
 }
