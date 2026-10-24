@@ -1,7 +1,7 @@
 # Software Factory for bb
 
 Run a team of AI agents on your repository inside [bb](https://getbb.app). You
-talk to a Lead, which turns your requests into tasks and starts specialists.
+talk to a Lead coordinator, which routes complex requests to a Planner and starts specialists.
 Every pull request is reviewed by independent agents before you merge, and a
 board in bb's left navigation rail shows who is working on what.
 
@@ -25,7 +25,7 @@ a project and a task prefix, and start the Lead.
 
 Settings → Plugins → Factory, or `bb plugin config factory`:
 
-- **Agents**: one line per agent (Lead, Builder, QA, Designer, Reviewer 1,
+- **Agents**: one line per agent (Lead, Planner, Builder, QA, Designer, Reviewer 1,
   Reviewer 2, Security, Shadow security, and the reviewer-trial comparison),
   each with bb's provider, model and reasoning picker. Until you pick, an agent
   uses the provider's catalog defaults, exactly as shown (never the level a
@@ -55,6 +55,32 @@ retain their current notification settings.
 
 Each agent also gets a short statement of its role with every turn, so its rules
 survive when a long conversation is compacted.
+
+## Planning and coordination
+
+The Lead coordinates assignments and reports decisions. For a new feature,
+ambiguous requirements, migrations or cross-cutting work, it first records the
+original request on a task and assigns `bb factory assign APP-12 --role plan`.
+Small, explicit fixes can go directly to a Builder.
+
+The Planner defaults to Claude Opus 5.5 at high effort; it has its own model
+picker. Existing Lead and specialist choices are preserved. It reads the project
+checkout without editing code or git state and saves the PRD, acceptance criteria,
+implementation steps, dependencies and open questions as a durable task comment.
+Only that task's current Planner may mark its complete comment ready with
+`bb factory plan-ready APP-12 --comment <comment-id>`.
+
+Once planning is assigned, Factory rejects new Builder assignments for that task
+until the plan is ready. Reassigning a Planner invalidates the old sign-off.
+Builders receive the canonical comment reference, accessible from their worktree.
+This gate does not stop an already-running Builder; the Lead must pause or steer
+it when replanning. Child tasks need explicit references to their parent plan.
+
+The Lead escalates technical disputes and substantive replanning to the Planner,
+and product decisions to you. It cannot waive review gates. New PR reviewers
+send parent notifications only when stuck; Factory reports the complete review
+round and alerts when a reviewer finishes without recording a verdict. Existing
+reviewer threads retain their notification settings.
 
 ## Develop
 

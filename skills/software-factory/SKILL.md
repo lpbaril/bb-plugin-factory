@@ -1,16 +1,50 @@
 ---
 name: software-factory
-description: Run or work in a bb software factory with the `bb factory` CLI. Use when the user asks to create a factory, start its Lead, assign a task to a builder, QA, designer, reviewer or security agent, record a PR review verdict, mark a task blocked, or see the factory board; or when your own prompt says you are the Lead or a specialist of a factory.
+description: Run or work in a bb software factory with the `bb factory` CLI. Use when the user asks to create a factory, start its Lead, assign a task to a planner, builder, QA, designer, reviewer or security agent, record a PR review verdict, mark a task blocked, or see the factory board; or when your own prompt says you are the Lead or a specialist of a factory.
 ---
 
 # Software factory
 
 A factory ties one bb project to one Tasks tracker project. Its **Lead** thread
-shapes work into tasks and assigns them to **specialists** (Builder, QA,
-Designer). Each specialist runs as the Lead's child thread, so the Lead is
-notified when it finishes. The **Factory** page in the left navigation rail
+coordinates ready tasks and assigns **specialists** (Planner, Builder, QA,
+Designer). The Planner owns PRDs, architecture, acceptance criteria and task breakdown. Each specialist runs as the Lead's child thread, so the Lead is
+notified when it finishes. PR reviewers use stuck-only parent notifications;
+Factory reports their combined review round. The **Factory** page in the left navigation rail
 shows the agents and a board with the columns Backlog, To do, In progress,
 In review, Done and Blocked; cards show their pull request and its verdicts.
+
+## On-demand planning
+
+Preserve the original request verbatim, its source message references and constraints
+in a task before summarizing it. For new features, unclear acceptance criteria,
+migrations, cross-cutting changes or a technical dispute, assign
+`bb factory assign APP-12 --role plan`. A small, well-specified fix can skip planning.
+The Planner defaults to Opus 5.5/high. Keep existing Lead settings unless the person
+asks to change them.
+
+The Planner reads the project checkout without editing code or git state. It saves
+a complete Markdown PRD and plan as an agent task comment (scratch files belong
+in thread storage). A ready comment starts with `Factory plan: READY` and includes
+`## Problem and scope`, `## Acceptance criteria`, `## Implementation plan`,
+`## Dependencies`, and `## Open questions`. Product questions go to the person
+through the Lead; unresolved plans stay DRAFT and the task is blocked.
+
+After posting, the current Planner runs
+`bb factory plan-ready APP-12 --comment <comment-id>`. Factory checks its identity,
+comment authorship and required sections. This is a readiness declaration, not
+an automated assessment of the plan's quality. New Builder assignments on that
+task are refused until it is ready; assigning another Planner resets readiness.
+Builders receive the canonical comment reference and read it directly.
+
+The Lead routes work; it must not rewrite requirements, waive security findings,
+or resolve architectural disputes itself. Reuse the Planner for substantive
+changes (a new Planner assignment invalidates readiness); ask the person about
+product intent. Stop or steer any running Builder before replanning: the gate
+controls new assignments, not running threads. When splitting into child tasks,
+carry the parent plan reference and applicable acceptance criteria into each.
+
+Keep handoffs concise: status, task/plan references, evidence links and decisions
+needed. Do not paste full plans or logs into the Lead thread, or poll active workers.
 
 ## Pull request flow
 
@@ -25,7 +59,8 @@ In review, Done and Blocked; cards show their pull request and its verdicts.
 3. Each reviewer posts one PR comment starting with APPROVE or REQUEST CHANGES,
    then records it with `bb factory verdict`.
 4. When the round is complete, the factory tells the Lead once, and the Lead
-   sends every finding to the builder in one message, so fixes land in a
+   sends the builder PR/comment and reviewer-thread references in one handoff;
+   the builder reads and addresses every finding directly, so fixes land in a
    single push. New commits re-review only the delta, and only by the
    reviewers who requested changes.
 5. When every required verdict is APPROVE, the factory marks the PR ready for
@@ -57,8 +92,9 @@ skip docs-only changes. PRs stay drafts until every reviewer approves, so
 | `bb factory restore APP` | Restore an archived factory. Deleting a factory is only possible from the Factory page. |
 | `bb factory create --prefix APP [--project proj_...] [--name "..."]` | Create a factory and its Tasks tracker (or reuse a tracker with that prefix). The project defaults to the current thread's. |
 | `bb factory start APP [--goal "..."]` | Start the Lead thread. |
-| `bb factory assign APP-12 --role build\|qa\|design\|review1\|review2\|security [--instructions "..."]` | Spawn a specialist for the task as the Lead's child. Builder and Designer get a new worktree; the others reuse the task's builder worktree. PR reviewers are normally started automatically instead. |
+| `bb factory assign APP-12 --role plan\|build\|qa\|design\|review1\|review2\|security [--instructions "..."]` | Spawn a specialist for the task as the Lead's child. Planner uses the project checkout; Builder and Designer get a new worktree; QA and reviewers reuse the task's builder worktree. PR reviewers are normally started automatically instead. |
 | `bb factory assign APP-12 --role review1\|review2\|security --pr N` | Replace a reviewer that failed (dead provider, removed model) with a fresh one on the current roster, reviewing that PR. Retrying the old thread keeps the model it was spawned with, so it cannot recover from a provider that ran out. |
+| `bb factory plan-ready APP-12 --comment <id>` | Current Planner only: validate its READY planning comment and allow Builder assignments. |
 | `bb factory verdict APP-12 --role review1\|review2\|security\|shadow --verdict approve\|changes [--pr N]` | Record a reviewer's verdict on the task's PR, after posting it (as a PR comment; the shadow reviewer posts a task comment). Only the reviewer thread the factory started can record it. |
 | `bb factory dismiss APP-12 --reason "..."` | Dismiss the shadow Security reviewer's REQUEST CHANGES. Only the task's Security reviewer can run this; the person can also dismiss from the task on the Factory page. |
 | `bb factory rafter check` | Check the Rafter API key and show the scan quota (never prints the key). |
@@ -98,8 +134,8 @@ With **Retry a failed agent once** on, a factory agent whose turn fails, or is
 cut off by a daemon restart, a lost connection or a stalled provider, is retried
 once automatically, and the Lead gets a `[factory]` message saying so: wait for
 that agent's result before reassigning. If the retry fails too, the task is
-marked Blocked and the Lead is told. Overloads and rate limits are left to bb's
-Provider retry plugin.
+marked Blocked and the Lead is told. Overloads, rate limits, server errors and connection failures are left to bb's
+Provider retry plugin, even when its retry budget is exhausted or it is disabled.
 
 ## Rules
 

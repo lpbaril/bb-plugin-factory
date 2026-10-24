@@ -143,6 +143,7 @@ const factorySchema = z.object({
   /** GitHub owner/name, from the project's remote. */
   repo: z.string().nullable().default(null),
   prs: z.array(prSchema).default([]),
+  plans: z.array(z.object({ taskKey: z.string(), threadId: z.string(), commentId: z.string().nullable() })).default([]),
   /** Archived factories leave the Factory page tabs, take no new agents, and are not watched. */
   archivedAt: z.string().nullable().default(null),
 });
@@ -211,6 +212,7 @@ const agentsConfigSchema = z.object({
 export type AgentsConfig = { roles: Record<AgentKey, AgentExec>; shadowCustomModel: string | null };
 const DEFAULT_PROVIDERS: Record<AgentKey, string> = {
   lead: "claude-code",
+  plan: "claude-code",
   build: "claude-code",
   qa: "codex",
   design: "claude-code",
@@ -471,6 +473,7 @@ export default async function plugin(bb: BbPluginApi) {
     const roles = Object.fromEntries(
       AGENT_KEYS.map((key) => [key, { providerId: DEFAULT_PROVIDERS[key], model: null, reasoningLevel: null }]),
     ) as Record<AgentKey, AgentExec>;
+    roles.plan = { providerId: "claude-code", model: "claude-opus-5-5", reasoningLevel: "high" };
     // Up to 0.1.2 the shadow sent this model id as-is; Cursor's model list doesn't show it.
     return { roles, shadowCustomModel: "gemini-4-argon-high" };
   }
@@ -822,6 +825,7 @@ export default async function plugin(bb: BbPluginApi) {
       createdAt: new Date().toISOString(),
       repo: null,
       prs: [],
+      plans: [],
       archivedAt: null,
     };
     await saveFactory(factory);
@@ -938,7 +942,41 @@ export default async function plugin(bb: BbPluginApi) {
     return null;
   }
 
-  async function assign(args: {
+  // Serialize assignments and planning sign-offs per task, including RPC/CLI races.
+  const assignmentLocks = new Map<string, Promise<unknown>>();
+  async function withTaskLock<T>(taskKey: string, work: () => Promise<T>): Promise<T> {
+    const key = taskKey.trim().toUpperCase();
+    const previous = assignmentLocks.get(key) ?? Promise.resolve();
+    const pending = previous.catch(() => undefined).then(work);
+    assignmentLocks.set(key, pending);
+    try { return await pending; }
+    finally { if (assignmentLocks.get(key) === pending) assignmentLocks.delete(key); }
+  }
+  function assign(args: Parameters<typeof assignUnlocked>[0]): Promise<string> {
+    return withTaskLock(args.taskKey, () => assignUnlocked(args));
+  }
+  async function markPlanReady(taskKey: string, commentId: string, threadId: string | null): Promise<void> {
+    await withTaskLock(taskKey, async () => {
+      const task = await getTaskByKey(taskKey);
+      const factory = await factoryForTaskKey(task.key);
+      assertActive(factory);
+      const plan = factory.plans.find((entry) => entry.taskKey === task.key);
+      if (threadId === null || plan?.threadId !== threadId) {
+        throw new PluginCliError("Only this task's current Planner can mark its plan ready.", { code: "not_the_planner" });
+      }
+      const { comments } = await tasksRpc("listComments", { taskId: task.id }, z.object({ comments: z.array(commentSchema) }));
+      const document = comments.find((entry) => entry.id === commentId && entry.kind === "agent" && entry.threadId === threadId);
+      const headings = ["## Problem and scope", "## Acceptance criteria", "## Implementation plan", "## Dependencies", "## Open questions"];
+      if (document === undefined || !document.body.startsWith("Factory plan: READY") || !headings.every((heading) => document.body.includes(heading))) {
+        throw new PluginCliError("Post a complete READY planning comment from this Planner first (scope, acceptance criteria, implementation plan, dependencies and open questions).", { code: "plan_incomplete" });
+      }
+      await mutateFactory(factory.prefix, (current) => {
+        current.plans.find((entry) => entry.taskKey === task.key)!.commentId = document.id;
+      });
+    });
+  }
+
+  async function assignUnlocked(args: {
     taskKey: string;
     role: WorkerRoleId;
     instructions: string | null;
@@ -952,6 +990,12 @@ export default async function plugin(bb: BbPluginApi) {
       throw new PluginCliError(`Factory ${factory.prefix} has no Lead yet.`, {
         code: "no_lead",
         hint: `Run \`bb factory start ${factory.prefix}\` first.`,
+      });
+    }
+    const plan = factory.plans.find((entry) => entry.taskKey === task.key);
+    if (args.role === "build" && plan !== undefined && plan.commentId === null) {
+      throw new PluginCliError(`${task.key} is waiting for its Planner to mark the plan ready.`, {
+        code: "plan_not_ready", hint: "Resolve the Planner's questions; it must run bb factory plan-ready with its READY task comment.",
       });
     }
     const role = ROLES[args.role];
@@ -973,7 +1017,7 @@ export default async function plugin(bb: BbPluginApi) {
       // The shadow reports to nobody: its findings must not reach the Lead or the gate.
       ...(isShadow ? { parentNotifications: "off" as const } : {
         parentThreadId: factory.leadThreadId,
-        parentNotifications: "auto" as const,
+        parentNotifications: pr !== null && (PR_REVIEW_ROLES as readonly string[]).includes(args.role) ? "stuck" as const : "auto" as const,
       }),
       title: `${task.key} · ${role.label}${pr === null ? "" : ` · PR #${pr.number}`}: ${task.title}`.slice(0, 200),
       prompt: workerPrompt({
@@ -981,7 +1025,10 @@ export default async function plugin(bb: BbPluginApi) {
         factoryName: factory.name,
         prefix: factory.prefix,
         task,
-        instructions: args.instructions,
+        instructions: [
+          args.instructions,
+          plan?.commentId == null ? null : `Canonical plan for ${task.key}: task comment ${plan.commentId}. Read it directly with bb tasks show ${task.key} (including comments); preserve its acceptance criteria.`,
+        ].filter((part) => part != null).join("\n\n") || null,
         builderThreadId: builder?.threadId ?? null,
         pr,
         findings: args.findings ?? null,
@@ -989,7 +1036,9 @@ export default async function plugin(bb: BbPluginApi) {
       pluginMetadata: { factory: factory.prefix, role: args.role, taskKey: task.key, ...(pr === null ? {} : { pr: pr.number }) },
     };
     let thread;
-    if (builder !== null) {
+    if (role.environment === "project") {
+      thread = await bb.sdk.threads.spawn({ ...base, environment: { type: "project-default" } });
+    } else if (builder !== null) {
       thread = await bb.sdk.threads.spawn({
         ...base,
         environment: { type: "reuse", environmentId: builder.environmentId },
@@ -1011,6 +1060,10 @@ export default async function plugin(bb: BbPluginApi) {
       }
     }
     await mutateFactory(factory.prefix, (current) => {
+      if (args.role === "plan") {
+        current.plans = current.plans.filter((entry) => entry.taskKey !== task.key);
+        current.plans.push({ taskKey: task.key, threadId: thread.id, commentId: null });
+      }
       current.agents.push({
         threadId: thread.id,
         role: args.role,
@@ -1788,13 +1841,13 @@ ${sections.join("\n\n---\n\n")}`;
       return {
         headSha: target.headSha,
         taskKey: target.taskKey,
-        labels: verdicts.map(({ role, review }) => `${ROLES[role].label} ${review!.verdict === "approve" ? "APPROVE" : "REQUEST CHANGES"}`).join(", "),
+        labels: verdicts.map(({ role, review }) => `${ROLES[role].label} ${review!.verdict === "approve" ? "APPROVE" : `REQUEST CHANGES (thread ${review!.threadId})`}`).join(", "),
       };
     });
     if (round === null) return;
     await tellLead(
       factory,
-      `[factory] Review round complete on PR #${prNumber} (${round.taskKey}) at \`${round.headSha.slice(0, 7)}\`: ${round.labels}. Send every REQUEST CHANGES finding to the builder in one message, so its fixes land in a single push; each push re-runs CI and the reviewers who asked for changes.`,
+      `[factory] Review round complete on PR #${prNumber} (${round.taskKey}) at \`${round.headSha.slice(0, 7)}\`: ${round.labels}. Send the builder one handoff referencing this PR's REQUEST CHANGES comments and reviewer threads. It must read and address every finding directly, in one push; consult the Planner if findings conflict; each push re-runs CI and the reviewers who asked for changes.`,
     );
   }
 
@@ -1926,6 +1979,22 @@ ${findings}`;
         });
       }
     },
+  });
+
+  // Suppressing routine review replies must not hide a reviewer that forgot its verdict.
+  bb.events.on("thread.idle", async ({ thread }) => {
+    const entry = agentsByThread.get(thread.id);
+    if (entry === undefined || entry.factory.archivedAt !== null || entry.agent.pr === null || entry.agent.role === "shadow") return;
+    if (!(PR_REVIEW_ROLES as readonly string[]).includes(entry.agent.role)) return;
+    const factory = await findFactory(entry.factory.prefix);
+    const pr = factory.prs.find((candidate) => candidate.number === entry.agent.pr && candidate.state === "open");
+    if (pr === undefined) return;
+    const review = reviewFor(pr, entry.agent.role as PrReviewRole);
+    if (review?.threadId !== thread.id || review.verdict !== "pending") return;
+    const key = `review-stall:${thread.id}`;
+    if ((await bb.storage.kv.get(key)) === pr.headSha) return;
+    await tellLead(factory, `[factory] ${ROLES[entry.agent.role].label} for ${pr.taskKey} stopped without recording a verdict on PR #${pr.number}. The review gate remains closed. Ask thread ${thread.id} to finish its review and record its verdict, or replace it if it cannot continue.`);
+    await bb.storage.kv.set(key, pr.headSha);
   });
 
   // ----- Supervisor: one automatic retry for a failed agent turn -----
@@ -2327,6 +2396,15 @@ ${findings}`;
             };
           },
         }),
+        "plan-ready": cliCommand({
+          summary: "Mark a task's planning comment ready (current Planner only)",
+          positionals: [{ name: "task", description: "Task key", required: true }],
+          options: { comment: { type: "string", required: true, description: "ID of the Planner's READY task comment" } },
+          async run(input, ctx) {
+            await markPlanReady(input.positionals.task, input.options.comment, ctx.threadId ?? null);
+            return { exitCode: 0, stdout: `Plan ready for ${input.positionals.task.toUpperCase()}; builders will receive comment ${input.options.comment}.` };
+          },
+        }),
         verdict: cliCommand({
           summary: "Record a reviewer's verdict on the task's pull request (after posting it as a PR comment)",
           positionals: [{ name: "task", description: "Task key, such as APP-12", required: true }],
@@ -2545,6 +2623,8 @@ ${findings}`;
                   .filter((agent) => agent.taskKey === task.key)
                   .map((agent) => `${ROLES[agent.role].label} ${agent.threadId}`);
                 lines.push(`  ${task.key}  ${task.title}${agents.length > 0 ? `  [${agents.join(", ")}]` : ""}`);
+                const plan = factory.plans.find((entry) => entry.taskKey === task.key);
+                if (plan !== undefined) lines.push(`      Plan ${plan.commentId === null ? "pending" : `ready · comment ${plan.commentId}`} · Planner ${plan.threadId}`);
                 const builderBranch = factory.agents.find((agent) => agent.role === "build" && agent.taskKey === task.key);
                 if (task.pr !== null) {
                   const checks = task.pr.checks.map((check) => `${check.label} ${check.verdict}`).join(", ");
