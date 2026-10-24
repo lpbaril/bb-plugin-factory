@@ -43,10 +43,15 @@ Settings → Plugins → Factory, or `bb plugin config factory`:
 - **Rafter API key** and an optional GitHub token for Rafter (both secret).
 - **When the shadow security reviewer runs**: off, the next N PRs, or every
   sensitive PR.
-- **Retry a failed agent once** (off by default): when an agent's turn fails or
-  is cut off by a daemon restart, a lost connection or a stalled provider, retry
-  it once; if it fails again, mark its task Blocked and tell the Lead. Overloads
-  and rate limits stay with bb's Provider retry plugin.
+- **Retry a failed agent once** (off by default): retry an interrupted agent
+  once for failures outside bb's Provider retry policy; if it fails again,
+  mark its task Blocked and tell the Lead. Overloads, rate limits, server errors
+  and connection failures belong exclusively to bb's Provider retry plugin,
+  including when its retry budget is exhausted or that plugin is disabled.
+
+Requires bb 0.47 or newer. New workers explicitly report their outcomes to the
+Lead; shadow reviewers have parent notifications turned off. Existing threads
+retain their current notification settings.
 
 Each agent also gets a short statement of its role with every turn, so its rules
 survive when a long conversation is compacted.

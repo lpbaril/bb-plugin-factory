@@ -189,7 +189,8 @@ const deleteResultSchema = z.object({
 
 /** Reasoning levels bb understands; each model lists the ones it offers. */
 const REASONING_LEVELS = ["none", "low", "medium", "high", "xhigh", "max", "ultra", "ultracode"] as const;
-type ReasoningLevel = (typeof REASONING_LEVELS)[number];
+// BB 0.47 allows provider-defined reasoning identifiers.
+type ReasoningLevel = string;
 
 /** Agents whose provider, model and reasoning level the person picks: every role plus the trial comparison. */
 const AGENT_KEYS = [...ROLE_IDS, "comparison"] as const;
@@ -199,7 +200,7 @@ const agentExecSchema = z.object({
   /** null: the provider's default model. */
   model: z.string().trim().min(1).max(200).nullable(),
   /** null: the provider's default level for the model. */
-  reasoningLevel: z.enum(REASONING_LEVELS).nullable(),
+  reasoningLevel: z.string().trim().min(1).max(100).nullable(),
 });
 export type AgentExec = z.infer<typeof agentExecSchema>;
 const agentsConfigSchema = z.object({
@@ -234,7 +235,7 @@ const agentsViewSchema = z.object({
       /** The provider's default model, shown while `exec.model` is null. */
       defaultModel: z.string().nullable(),
       /** The model's default reasoning level, shown while `exec.reasoningLevel` is null. */
-      defaultReasoning: z.enum(REASONING_LEVELS).nullable(),
+      defaultReasoning: z.string().nullable(),
     }),
   ),
   shadowCustomModel: z.string().nullable(),
@@ -323,8 +324,14 @@ export const rpcContract = defineRpcContract({
 const BOARD_CHANGED = "board-changed";
 const POLL_MS = 4000;
 
-/** Failures the provider-retry plugin schedules itself. */
-const PROVIDER_RETRY_CATEGORIES: readonly string[] = ["overloaded", "rate-limit"];
+/** Failures owned by BB's provider-retry plugin, including its delayed retries.
+ * Leave these alone even on later attempts: Factory must not block a task while
+ * BB is backing off, or take over after BB exhausts its retry budget.
+ */
+const PROVIDER_RETRY_CATEGORIES: readonly string[] = [
+  "overloaded", "rate-limit", "connection-failed", "internal", "stream-disconnected",
+];
+const PROVIDER_RETRY_HTTP_STATUSES: readonly number[] = [429, 500, 502, 503, 504];
 /** Failures another attempt won't fix. */
 const PERMANENT_CATEGORIES: readonly string[] = [
   "unauthorized",
@@ -342,7 +349,10 @@ export function supervisorAction(
   event: Pick<PluginTurnFailedEvent, "errorInfo" | "attemptNumber">,
 ): "leave" | "retry" | "escalate" {
   const category = event.errorInfo?.category ?? null;
-  if (event.errorInfo?.httpStatusCode === 429 || (category !== null && PROVIDER_RETRY_CATEGORIES.includes(category))) {
+  if (
+    (event.errorInfo?.httpStatusCode != null && PROVIDER_RETRY_HTTP_STATUSES.includes(event.errorInfo.httpStatusCode)) ||
+    (category !== null && PROVIDER_RETRY_CATEGORIES.includes(category))
+  ) {
     return "leave";
   }
   if (category !== null && PERMANENT_CATEGORIES.includes(category)) return "escalate";
@@ -400,7 +410,7 @@ export default async function plugin(bb: BbPluginApi) {
       type: "boolean",
       label: "Retry a failed agent once",
       description:
-        "When a factory agent's turn fails or is cut off by a daemon restart, a lost connection or a stalled provider, retry it once. If it fails again, mark its task Blocked and tell the Lead. Overloads and rate limits stay with Provider retry.",
+        "Retry an interrupted agent once when BB's Provider retry does not own the failure. If it fails again, mark its task Blocked and tell the Lead. Overloads, rate limits, server errors and connection failures stay with Provider retry.",
       default: false,
     },
     deepReviewLines: {
@@ -961,7 +971,10 @@ export default async function plugin(bb: BbPluginApi) {
       ...execution,
       permissionMode: await permissionModeFor(providerId),
       // The shadow reports to nobody: its findings must not reach the Lead or the gate.
-      ...(isShadow ? {} : { parentThreadId: factory.leadThreadId }),
+      ...(isShadow ? { parentNotifications: "off" as const } : {
+        parentThreadId: factory.leadThreadId,
+        parentNotifications: "auto" as const,
+      }),
       title: `${task.key} · ${role.label}${pr === null ? "" : ` · PR #${pr.number}`}: ${task.title}`.slice(0, 200),
       prompt: workerPrompt({
         role: args.role,
