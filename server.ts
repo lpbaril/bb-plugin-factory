@@ -6,7 +6,7 @@
 // thread. The Factory page shows the agents and the tracker as a kanban board.
 //
 // Tasks are owned by the built-in Tasks plugin; this plugin reads and moves
-// them through its RPC. Factories and their agent roster live in kv.
+// them through its RPC. Factory history lives in the plugin database; KV holds locators.
 import {
   PluginCliError,
   cliCommand,
@@ -18,6 +18,7 @@ import {
 } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { hostContract } from "./host-contract";
+import { createFactoryStorage } from "./factory-storage";
 import {
   PR_REVIEW_ROLES,
   ROLES,
@@ -147,7 +148,7 @@ const factorySchema = z.object({
   /** Archived factories leave the Factory page tabs, take no new agents, and are not watched. */
   archivedAt: z.string().nullable().default(null),
 });
-type Factory = z.infer<typeof factorySchema>;
+export type Factory = z.infer<typeof factorySchema>;
 
 const prSummarySchema = z.object({
   number: z.number(),
@@ -709,30 +710,32 @@ export default async function plugin(bb: BbPluginApi) {
   // ----- Factory storage -----
 
   const KEY_PREFIX = "factory:";
+  const factoryStorage = createFactoryStorage(bb.storage, (value) => factorySchema.parse(value));
   async function listFactories(): Promise<Factory[]> {
     const factories: Factory[] = [];
-    for (const key of await bb.storage.kv.list(KEY_PREFIX)) {
-      const parsed = factorySchema.safeParse(await bb.storage.kv.get(key));
-      if (parsed.success) factories.push(parsed.data);
+    const prefixes = new Set([...(await bb.storage.kv.list(KEY_PREFIX)).map(key => key.slice(KEY_PREFIX.length)), ...factoryStorage.prefixes()]);
+    for (const prefix of prefixes) {
+      const factory = await factoryStorage.read(prefix);
+      if (factory !== undefined) factories.push(factory);
     }
     return factories.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   }
   async function findFactory(ref: string): Promise<Factory> {
     const prefix = ref.trim().toUpperCase();
-    const parsed = factorySchema.safeParse(await bb.storage.kv.get(KEY_PREFIX + prefix));
-    if (!parsed.success) {
+    const factory = await factoryStorage.read(prefix);
+    if (factory === undefined) {
       throw new PluginCliError(`No factory ${prefix}.`, {
         code: "factory_not_found",
         hint: "Run `bb factory list` to see factories.",
       });
     }
-    return parsed.data;
+    return factory;
   }
   function factoryForTaskKey(taskKey: string): Promise<Factory> {
     return findFactory(taskKey.split("-")[0] ?? "");
   }
   async function saveFactory(factory: Factory): Promise<void> {
-    await bb.storage.kv.set(KEY_PREFIX + factory.prefix, factory);
+    await factoryStorage.write(factory);
     indexFactory(factory.prefix, factory);
     bb.realtime.publish(BOARD_CHANGED, { prefix: factory.prefix });
   }
@@ -781,7 +784,7 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   async function createFactory(args: { bbProjectId: string; prefix: string; name: string }): Promise<Factory> {
-    if ((await bb.storage.kv.get(KEY_PREFIX + args.prefix)) !== undefined) {
+    if ((await factoryStorage.read(args.prefix)) !== undefined) {
       throw new PluginCliError(`Factory ${args.prefix} already exists.`, { code: "factory_exists" });
     }
     await bb.sdk.projects.get({ projectId: args.bbProjectId });
@@ -880,7 +883,7 @@ export default async function plugin(bb: BbPluginApi) {
     }
     const previous = factoryLocks.get(factory.prefix) ?? Promise.resolve();
     await previous;
-    await bb.storage.kv.delete(KEY_PREFIX + factory.prefix);
+    await factoryStorage.remove(factory.prefix);
     indexFactory(factory.prefix, null);
     factoryLocks.delete(factory.prefix);
     signatures.delete(factory.prefix);
@@ -1072,6 +1075,12 @@ export default async function plugin(bb: BbPluginApi) {
         createdAt: new Date().toISOString(),
         pr: pr?.number ?? null,
       });
+      // Persist the reviewer assignment and its pending review together. A later
+      // task-comment failure must not leave a spawned reviewer outside the gate.
+      if (pr !== null && (PR_REVIEW_ROLES as readonly string[]).includes(args.role)) {
+        const target = current.prs.find((candidate) => candidate.number === pr.number);
+        target?.reviews.push({ role: args.role as PrReviewRole, threadId: thread.id, sha: target.headSha, verdict: "pending", at: new Date().toISOString() });
+      }
     });
 
     const order: TaskStatus[] = ["backlog", "todo", "in_progress", "in_review"];
@@ -1260,10 +1269,6 @@ export default async function plugin(bb: BbPluginApi) {
     if (pr === undefined) return null;
     const firstSecurity = role === "security" && reviewFor(pr, "security") === null;
     const threadId = await assign({ taskKey: pr.taskKey, role, instructions, pr: { number: pr.number, url: pr.url }, findings });
-    await mutateFactory(prefix, (current) => {
-      const target = current.prs.find((candidate) => candidate.number === prNumber);
-      target?.reviews.push({ role, threadId, sha: target.headSha, verdict: "pending", at: new Date().toISOString() });
-    });
     if (firstSecurity) await maybeStartShadow(prefix, pr, threadId, findings, instructions);
     return threadId;
   }
@@ -1307,7 +1312,7 @@ export default async function plugin(bb: BbPluginApi) {
   });
   type Trial = z.infer<typeof trialSchema>;
   async function readTrial(): Promise<Trial & { comparedRuns: number }> {
-    const parsed = trialSchema.safeParse(await bb.storage.kv.get("shadow-trial"));
+    const parsed = trialSchema.safeParse(await factoryStorage.readTrial());
     const trial = parsed.success ? parsed.data : { runs: [], comparisonThreadId: null };
     // Older records: a comparison covered every run it had.
     const comparedRuns = trial.comparedRuns ?? (trial.comparisonThreadId !== null ? trial.runs.length : 0);
@@ -1318,7 +1323,7 @@ export default async function plugin(bb: BbPluginApi) {
     const next = trialLock.then(async () => {
       const trial = await readTrial();
       const result = change(trial);
-      await bb.storage.kv.set("shadow-trial", trial);
+      await factoryStorage.writeTrial(trial);
       return result;
     });
     trialLock = next.catch(() => undefined);
@@ -1326,25 +1331,20 @@ export default async function plugin(bb: BbPluginApi) {
   }
   /**
    * Record a shadow run. A run on a different shadow model starts a new trial, so a comparison
-   * never mixes two models' records; the old trial is kept under "shadow-trial-history".
+   * never mixes two models' records; the database retains every retired trial.
    */
   async function addTrialRun(run: Trial["runs"][number]): Promise<void> {
-    let retired = null as Trial | null;
-    await mutateTrial((trial) => {
+    const next = trialLock.then(async () => {
+      const trial = await readTrial();
       const current = trial.runs[0]?.shadowModel;
-      if (current !== undefined && current !== run.shadowModel) {
-        retired = { runs: [...trial.runs], comparisonThreadId: trial.comparisonThreadId, comparedRuns: trial.comparedRuns };
-        trial.runs = [];
-        trial.comparisonThreadId = null;
-        trial.comparedRuns = 0;
-      }
-      trial.runs.push(run);
+      const retired = current !== undefined && current !== run.shadowModel ? trial : null;
+      const updated = retired === null ? trial : { runs: [], comparisonThreadId: null, comparedRuns: 0 };
+      updated.runs.push(run);
+      await factoryStorage.writeTrial(updated, retired);
+      if (retired !== null) bb.log.info(`shadow model changed to ${run.shadowModel}; started a new reviewer trial`);
     });
-    if (retired !== null) {
-      const history = z.array(trialSchema).catch([]).parse(await bb.storage.kv.get("shadow-trial-history"));
-      await bb.storage.kv.set("shadow-trial-history", [...history, retired]);
-      bb.log.info(`shadow model changed to ${run.shadowModel}; started a new reviewer trial`);
-    }
+    trialLock = next.catch(() => undefined);
+    await next;
   }
 
   async function maybeStartShadow(prefix: string, pr: Pr, securityThreadId: string, findings: string | null, instructions: string | null) {
@@ -1495,7 +1495,9 @@ ${sections.join("\n\n---\n\n")}`;
 
   type GhPr = { number: number; url: string; title: string; headRefName: string; headRefOid: string; isDraft: boolean; additions: number; deletions: number };
 
-  async function onPrOpened(factory: Factory, hostId: string, repo: string, gp: GhPr, taskKey: string): Promise<void> {
+  /** Track locally without spawning agents or writing to GitHub. Also used to
+   * recover PRs that the watcher could not persist while legacy KV was full. */
+  async function trackPr(factory: Factory, hostId: string, repo: string, gp: GhPr, taskKey: string): Promise<{ deep: boolean; sensitive: string[] }> {
     const { deepReviewLines } = await settings.get();
     let files: string[] = [];
     try {
@@ -1526,6 +1528,31 @@ ${sections.join("\n\n---\n\n")}`;
         roundNotifiedSha: null,
       });
     });
+    return { deep, sensitive };
+  }
+
+  async function trackRequestedPr(factory: Factory, taskKey: string, number: number): Promise<Pr> {
+    const existing = factory.prs.find((pr) => pr.number === number);
+    if (existing !== undefined) return existing;
+    const { hostId, repo } = await projectHost(factory);
+    if (repo === null) throw new PluginCliError("This factory has no GitHub repository.", { code: "no_repo" });
+    const gp = z.object({
+      number: z.number(), url: z.string(), title: z.string(), headRefName: z.string(), headRefOid: z.string(),
+      isDraft: z.boolean(), additions: z.number(), deletions: z.number(), isCrossRepository: z.boolean(), state: z.string(),
+    }).parse(JSON.parse(await gh(hostId, ["pr", "view", String(number), "--repo", repo, "--json", "number,url,title,headRefName,headRefOid,isDraft,additions,deletions,isCrossRepository,state"])));
+    if (gp.isCrossRepository || gp.state !== "OPEN") throw new PluginCliError("Only open PRs from this repository can be tracked for review.", { code: "invalid_pr" });
+    // A caller cannot attach an unrelated branch or fork to a trusted builder.
+    const threads = await bb.sdk.threads.list({ projectId: factory.bbProjectId, originPluginId: "factory", includeHidden: true, limit: 500 });
+    const builders = new Set(factory.agents.filter((agent) => agent.role === "build" && agent.taskKey === taskKey).map((agent) => agent.threadId));
+    if (!threads.some((thread) => builders.has(thread.id) && thread.environmentBranchName === gp.headRefName)) {
+      throw new PluginCliError(`PR #${number} does not match a tracked builder branch for ${taskKey}.`, { code: "pr_task_mismatch" });
+    }
+    await trackPr(factory, hostId, repo, gp, taskKey);
+    return (await findFactory(factory.prefix)).prs.find((pr) => pr.number === number)!;
+  }
+
+  async function onPrOpened(factory: Factory, hostId: string, repo: string, gp: GhPr, taskKey: string): Promise<void> {
+    const { deep, sensitive } = await trackPr(factory, hostId, repo, gp, taskKey);
     const task = await getTaskByKey(taskKey);
     const why = deep
       ? ` Reviewer 2 added: ${gp.additions + gp.deletions} changed lines${sensitive.length > 0 ? `, sensitive paths (${sensitive.slice(0, 5).join(", ")})` : ""}.`
@@ -1819,7 +1846,18 @@ ${sections.join("\n\n---\n\n")}`;
       }
     }
     factory = await findFactory(prefix);
-    for (const pr of factory.prs) await maybeMarkReady(factory, hostId, repo, pr);
+    for (const pr of factory.prs) {
+      if (pr.state === "open") {
+        // Tracking commits before spawning. Resume any reviewers that never
+        // started (a failed write/spawn or a deliberate --track-only recovery).
+        for (const role of requiredRoles(pr)) {
+          if (reviewFor(pr, role) !== null) continue;
+          if (role === "security" && pr.scans.some(scan => scan.status === "running")) continue;
+          await startPrReviewer(prefix, pr.number, role, null, null);
+        }
+      }
+      await maybeMarkReady(factory, hostId, repo, pr);
+    }
   }
 
   /**
@@ -1959,6 +1997,7 @@ ${findings}`;
         if ((await settings.get()).prReviews) {
           for (const factory of await listFactories()) {
             if (factory.archivedAt !== null) continue;
+            if ((await bb.storage.kv.get(`pr-watch-paused:${factory.prefix}`)) === true) continue;
             try {
               await watchPrs(factory.prefix);
             } catch (error) {
@@ -2349,11 +2388,13 @@ ${findings}`;
               max: 10_000_000,
               description: "Reviewer roles only: the PR to review, to replace a reviewer that failed",
             },
+            "track-only": { type: "boolean", description: "With --pr: track and validate the PR locally without starting a reviewer or writing to GitHub" },
             json,
           },
           async run(input) {
             const role = input.options.role as WorkerRoleId;
             const prNumber = input.options.pr ?? null;
+            if (input.options["track-only"] && prNumber === null) throw new PluginCliError("--track-only requires --pr.", { code: "missing_pr" });
             if (prNumber !== null) {
               if (!(PR_REVIEW_ROLES as readonly string[]).includes(role)) {
                 throw new PluginCliError("--pr only applies to review1, review2 or security.", {
@@ -2364,15 +2405,14 @@ ${findings}`;
               const task = await getTaskByKey(input.positionals.task);
               const factory = await factoryForTaskKey(task.key);
               assertActive(factory);
-              const tracked = factory.prs.find((candidate) => candidate.number === prNumber);
-              if (tracked === undefined) {
-                throw new PluginCliError(`Factory ${factory.prefix} isn't tracking PR #${prNumber}.`, {
-                  code: "unknown_pr",
-                  hint: `Open PRs: ${factory.prs.filter((candidate) => candidate.state === "open").map((candidate) => `#${candidate.number}`).join(", ") || "none"}.`,
-                });
-              }
+              const tracked = await trackRequestedPr(factory, task.key, prNumber);
               if (tracked.taskKey !== task.key) {
                 throw new PluginCliError(`PR #${prNumber} is for ${tracked.taskKey}, not ${task.key}.`, { code: "pr_task_mismatch" });
+              }
+              if (input.options["track-only"]) {
+                const builder = await builderEnvironment(factory, task.key);
+                if (builder === null) throw new PluginCliError(`${task.key} has no builder worktree.`, { code: "no_builder" });
+                return { exitCode: 0, stdout: input.options.json ? JSON.stringify({ pr: tracked.number, taskKey: task.key, builderThreadId: builder.threadId, tracked: true, reviewerStarted: false }) : `Tracking PR #${tracked.number} for ${task.key}; builder ${builder.threadId}; no reviewer started.` };
               }
               const threadId = await startPrReviewer(factory.prefix, prNumber, role as PrReviewRole, null, input.options.instructions ?? null);
               if (threadId === null) throw new PluginCliError(`Could not start a reviewer for PR #${prNumber}.`, { code: "reviewer_not_started" });
@@ -2394,6 +2434,43 @@ ${findings}`;
                 ? JSON.stringify({ threadId })
                 : `Assigned ${input.positionals.task.toUpperCase()} to ${ROLES[role].label}: ${threadId}`,
             };
+          },
+        }),
+        "recover-agent": cliCommand({
+          summary: "Reattach an existing Factory thread after an assignment save failed; never starts or messages a thread",
+          positionals: [{ name: "task", description: "Task key", required: true }],
+          options: { thread: { type: "string", required: true, description: "Existing Factory thread ID" } },
+          async run(input) {
+            const task = await getTaskByKey(input.positionals.task);
+            const factory = await factoryForTaskKey(task.key);
+            const thread = await bb.sdk.threads.get({ threadId: input.options.thread });
+            const meta = z.object({ factory: z.string(), role: z.enum(WORKER_ROLE_IDS), taskKey: z.string(), pr: z.number().optional() }).parse(await bb.sdk.threads.getPluginMetadata({ threadId: thread.id }));
+            if (thread.projectId !== factory.bbProjectId || thread.originPluginId !== bb.pluginId || meta.factory !== factory.prefix || meta.taskKey !== task.key) {
+              throw new PluginCliError("Thread does not belong to this Factory task.", { code: "wrong_factory_thread" });
+            }
+            await mutateFactory(factory.prefix, current => {
+              if (!current.agents.some(agent => agent.threadId === thread.id)) current.agents.push({ threadId: thread.id, role: meta.role, taskKey: task.key, providerId: thread.providerId, createdAt: new Date(thread.createdAt).toISOString(), pr: meta.pr ?? null });
+            });
+            return { exitCode: 0, stdout: `Recovered ${thread.id} for ${task.key}; no thread started or messaged.` };
+          },
+        }),
+        "reviews pause": cliCommand({
+          summary: "Pause a factory's automatic PR actions without archiving it or stopping verdict recording",
+          positionals: [{ name: "factory", description: "Factory prefix", required: true }],
+          async run(input) {
+            const factory = await findFactory(input.positionals.factory);
+            await bb.storage.kv.set(`pr-watch-paused:${factory.prefix}`, true);
+            return { exitCode: 0, stdout: `Automatic PR actions paused for ${factory.prefix}; assignments and verdict recording remain available.` };
+          },
+        }),
+        "reviews resume": cliCommand({
+          summary: "Resume a factory's automatic PR actions, including starting reviewers and marking approved PRs ready",
+          positionals: [{ name: "factory", description: "Factory prefix", required: true }],
+          async run(input) {
+            const factory = await findFactory(input.positionals.factory);
+            await bb.storage.kv.delete(`pr-watch-paused:${factory.prefix}`);
+            wakePrWatch();
+            return { exitCode: 0, stdout: `Automatic PR actions resumed for ${factory.prefix}.` };
           },
         }),
         "plan-ready": cliCommand({

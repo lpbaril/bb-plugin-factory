@@ -114,6 +114,21 @@ Tasks themselves are managed with `bb tasks` (`create`, `show`, `update
 
 ## Settings
 
+Factory history is stored in the plugin database; `factory:<PREFIX>` KV entries
+are fixed-size locators. The first upgraded load backs up and migrates legacy
+state automatically without pruning Done tasks or review history.
+
+Recovery commands:
+- `bb factory recover-agent APP-12 --thread <id>` reattaches an existing Factory
+  thread after an assignment save failed; it validates ownership and never spawns.
+- `bb factory assign APP-12 --role review1 --pr N --track-only` tracks and validates
+  a matching open PR without starting reviewers or writing GitHub. Without
+  `--track-only`, assignment also starts the reviewer. Forks and unrelated builder
+  branches are rejected.
+- `bb factory reviews pause APP` pauses automatic PR actions for that factory
+  during local recovery; `bb factory reviews resume APP` starts them again.
+  Verdict recording and manual assignments remain available while paused.
+
 `bb factory agents` shows the provider, model and reasoning level each agent
 runs on (every role plus the reviewer-trial comparison); the person changes them
 in the Agents section of the plugin settings, or with `bb factory agents set`.

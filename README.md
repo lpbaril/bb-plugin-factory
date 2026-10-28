@@ -82,6 +82,35 @@ send parent notifications only when stuck; Factory reports the complete review
 round and alerts when a reviewer finishes without recording a verdict. Existing
 reviewer threads retain their notification settings.
 
+## Storage and recovery
+
+Factory keeps only a fixed-size locator in each `factory:<PREFIX>` KV entry.
+The plugin database stores metadata plus individual rows for each task's agent
+assignments, PRs, reviews, scans and planning comment references. Current and
+retired shadow trial runs are database rows too. Task statuses and comments
+remain owned by Tasks.
+
+On the first load after upgrading, Factory backs up the original KV JSON in
+`factory_legacy_backups`, writes all records in a database transaction, then
+replaces KV with the locator. Restarting after an interrupted cutover resumes
+from the database. No history is pruned, including Done and merged tasks.
+Back up both the plugin database and KV when moving or restoring an installation;
+older plugin versions cannot read the new locator format.
+
+If an older assignment spawned a thread but failed to save it, reattach that
+existing thread with `bb factory recover-agent APP-12 --thread <id>`. Factory
+checks its project, plugin ownership and task metadata; it never starts or
+messages another thread.
+
+`bb factory assign APP-12 --role review1 --pr 81` can now discover an untracked
+open PR whose branch matches that task's builder. Add `--track-only` to save and
+validate the link without starting a reviewer or writing to GitHub. The watcher
+resumes missing reviewers when automatic reviews are enabled.
+
+For local recovery without automatic GitHub actions, run
+`bb factory reviews pause APP`. Assignments and verdict recording stay available;
+`bb factory reviews resume APP` resumes automatic reviewers, scans and ready gates.
+
 ## Develop
 
 ```sh
@@ -91,7 +120,8 @@ bb plugin install .   # registers this directory in place
 bb plugin dev         # rebuilds and reloads on save
 ```
 
-- `server.ts`: factory storage, the `bb factory` CLI, the page's RPC, the board
+- `factory-storage.ts`: transactional database storage and legacy KV migration.
+- `server.ts`: the `bb factory` CLI, the page's RPC, the board
   change feed, and the pull request flow (watcher, verdicts, Rafter, ready gate,
   shadow trial), the per-turn role instructions and the failed-turn supervisor.
   Tasks are read and moved through the built-in Tasks plugin's RPC.
