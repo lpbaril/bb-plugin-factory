@@ -45,7 +45,7 @@ async function fixture(t, fallback = false, initial = {}, overrides = {}) {
     pluginId: 'factory', settings: { superviseAgents: true },
     experimental_callHostRpc: overrides.hostRpc,
     sdk: {
-      projects: { get: async () => ({ name: 'Test', gitRemoteUrl: 'https://github.com/owner/repo.git', sources: [{ hostId: 'host_test', isDefault: true }] }) },
+      projects: { get: async () => ({ name: 'Test', gitRemoteUrl: 'https://github.com/owner/repo.git', sources: [{ hostId: 'host_test', isDefault: true, path: overrides.projectPath ?? null }] }) },
       providers: { models: async () => ({ models: [] }) },
       threads: {
         get: async () => makeThreadResponse({ id: 'thr_builder', environmentId: 'env_builder' }),
@@ -59,6 +59,10 @@ async function fixture(t, fallback = false, initial = {}, overrides = {}) {
         ...overrides.threads,
       },
       plugins: { callRpc: async ({ method, input }) => {
+        if (overrides.tasksRpc) {
+          const custom = await overrides.tasksRpc({ method, input });
+          if (custom !== undefined) return custom;
+        }
         if (method === 'listComments') return { comments };
         if (method === 'getTaskByKey') return { task };
         if (method === 'createComment') return { comment: { id: 'comment', kind: 'system', authorName: 'Factory', threadId: null, body: input.body, createdAt: '' } };
@@ -291,5 +295,134 @@ test('standing role instructions preserve the split after compaction', async () 
   assert.ok(charter.length < 4096);
   assert.match(charter, /Planner owns PRDs/);
   assert.match(charter, /Never change acceptance criteria or waive review gates/);
+  assert.match(charter, /constitution\.md/);
   assert.match(workerReminder({ role: 'plan', factoryName: 'Test', taskKey: 'TEST-1' }), /plan-ready/);
+  assert.match(workerReminder({ role: 'review1', factoryName: 'Test', taskKey: 'TEST-1' }), /constitution\.md/);
+});
+
+test('doctor detects brownfield mode, missing alignment files, merged PR tasks, and idle in-progress tasks; reconcile heals and notifies Lead', async t => {
+  const tasks = [
+    { id: 't1', key: 'TEST-1', projectId: 'tracker', title: 'Merged task still in progress', description: '', status: 'in_progress', priority: 'high', position: 0, labelIds: [], createdAt: '', updatedAt: '' },
+    { id: 't2', key: 'TEST-2', projectId: 'tracker', title: 'Archived designer task', description: '', status: 'in_progress', priority: 'medium', position: 1, labelIds: [], createdAt: '', updatedAt: '' },
+    { id: 't3', key: 'TEST-3', projectId: 'tracker', title: 'Plan ready task', description: '', status: 'in_progress', priority: 'medium', position: 2, labelIds: [], createdAt: '', updatedAt: '' },
+  ];
+  const { harness, messages } = await fixture(
+    t,
+    false,
+    {
+      prs: [{ ...trackedPr, number: 51, taskKey: 'TEST-1', state: 'merged', isDraft: false }],
+      plans: [{ taskKey: 'TEST-3', threadId: 'thr_planner', commentId: 'comment_ready_1' }],
+      agents: [
+        { threadId: 'thr_builder', role: 'build', taskKey: 'TEST-1', providerId: 'codex', createdAt: '', pr: null },
+        { threadId: 'thr_designer_archived', role: 'design', taskKey: 'TEST-2', providerId: 'claude-code', createdAt: '', pr: null },
+        { threadId: 'thr_planner', role: 'plan', taskKey: 'TEST-3', providerId: 'claude-code', createdAt: '', pr: null },
+      ],
+    },
+    {
+      projectPath: '/repo/test',
+      threads: {
+        get: async ({ threadId }) =>
+          makeThreadResponse({
+            id: threadId,
+            status: 'idle',
+            archivedAt: threadId === 'thr_designer_archived' ? Date.now() : null,
+          }),
+      },
+      hostRpc: async ({ method }) => {
+        if (method === 'inspect_repo') {
+          return {
+            exists: true,
+            isGitRepo: true,
+            commitCount: 120,
+            sourceDirs: ['crates', 'engine'],
+            detectedMode: 'brownfield',
+            files: { agentsMd: null, constitution: null, specs: 'docs/architecture.md', roadmap: 'docs/roadmap.md' },
+            existingDocs: ['docs/architecture.md', 'docs/roadmap.md'],
+          };
+        }
+        if (method === 'scaffold_specs') {
+          return {
+            created: ['AGENTS.md', '.specify/memory/constitution.md'],
+            existing: ['docs/architecture.md', 'docs/roadmap.md'],
+          };
+        }
+        throw new Error(`Unexpected host call: ${method}`);
+      },
+      tasksRpc: async ({ method, input }) => {
+        if (method === 'listTasks') return { tasks };
+        if (method === 'getTask') return { task: tasks.find(x => x.id === input.taskId) ?? null };
+        if (method === 'boardMove') {
+          const found = tasks.find(x => x.id === input.taskId);
+          if (found) found.status = input.status;
+          return { ok: true, task: found };
+        }
+        return undefined;
+      },
+    },
+  );
+
+  const docRes = await harness.behavior.runCli(['doctor', 'TEST', '--json']);
+  assert.equal(docRes.exitCode, 0, JSON.stringify(docRes));
+  const report = JSON.parse(docRes.stdout);
+  assert.equal(report.effectiveMode, 'brownfield');
+  assert.equal(report.boardHealth.mergedPrsStillOpenTasks.length, 1);
+  assert.equal(report.boardHealth.mergedPrsStillOpenTasks[0].taskKey, 'TEST-1');
+  assert.equal(report.boardHealth.inProgressWithoutLiveWorker.length, 2);
+  assert.equal(report.boardHealth.readyPlansAwaitingBuilder.length, 1);
+  assert.equal(report.boardHealth.readyPlansAwaitingBuilder[0].taskKey, 'TEST-3');
+
+  const initRes = await harness.behavior.runCli(['init-specs', 'TEST', '--json']);
+  assert.equal(initRes.exitCode, 0, JSON.stringify(initRes));
+  assert.deepEqual(JSON.parse(initRes.stdout).created, ['AGENTS.md', '.specify/memory/constitution.md']);
+
+  const recRes = await harness.behavior.runCli(['reconcile', 'TEST', '--notify-lead', '--json']);
+  assert.equal(recRes.exitCode, 0, JSON.stringify(recRes));
+  const rec = JSON.parse(recRes.stdout);
+  assert.deepEqual(rec.reconciledMoveToDone, ['TEST-1']);
+  assert.equal(rec.leadNotified, true);
+  assert.equal(tasks[0].status, 'done');
+  assert.equal(messages.length, 1);
+  assert.match(messages[0].input[0].text, /Auto-moved merged PR task\(s\) to Done: TEST-1/);
+});
+
+test('startLead injects Greenfield or Brownfield playbook and optional spec scaffolding', async t => {
+  const scaffoldCalls = [];
+  const { harness, spawns } = await fixture(
+    t,
+    false,
+    { leadThreadId: null, agents: [] },
+    {
+      projectPath: '/repo/green',
+      hostRpc: async ({ method, input }) => {
+        if (method === 'scaffold_specs') {
+          scaffoldCalls.push(input);
+          return { created: ['AGENTS.md', '.specify/memory/constitution.md'], existing: [] };
+        }
+        if (method === 'inspect_repo') {
+          return {
+            exists: true,
+            isGitRepo: true,
+            commitCount: 1,
+            sourceDirs: [],
+            detectedMode: 'greenfield',
+            files: {
+              agentsMd: 'AGENTS.md',
+              constitution: '.specify/memory/constitution.md',
+              specs: 'docs/architecture.md',
+              roadmap: 'docs/roadmap.md',
+            },
+            existingDocs: ['AGENTS.md', '.specify/memory/constitution.md'],
+          };
+        }
+        throw new Error(`Unexpected host call: ${method}`);
+      },
+    },
+  );
+  const started = await harness.behavior.runCli(['start', 'TEST', '--mode', 'greenfield', '--init-specs']);
+  assert.equal(started.exitCode, 0, JSON.stringify(started));
+  assert.equal(scaffoldCalls.length, 1);
+  assert.equal(scaffoldCalls[0].mode, 'greenfield');
+  assert.equal(spawns.length, 1);
+  assert.match(spawns[0].prompt, /Greenfield Onboarding Playbook/);
+  assert.match(spawns[0].prompt, /constitution\.md/);
 });

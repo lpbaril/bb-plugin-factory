@@ -17,9 +17,10 @@ import {
   type PluginTurnFailedEvent,
 } from "@get-bb/plugin-sdk";
 import { z } from "zod";
-import { hostContract } from "./host-contract";
+import { hostContract, repoInspectionSchema, type RepoInspection } from "./host-contract";
 import { createFactoryStorage } from "./factory-storage";
 import {
+  PROJECT_MODES,
   PR_REVIEW_ROLES,
   ROLES,
   ROLE_IDS,
@@ -29,7 +30,9 @@ import {
   reReviewMessage,
   workerPrompt,
   workerReminder,
+  type AlignmentContext,
   type PrReviewRole,
+  type ProjectMode,
   type RoleId,
   type WorkerRoleId,
 } from "./roles";
@@ -147,6 +150,8 @@ const factorySchema = z.object({
   plans: z.array(z.object({ taskKey: z.string(), threadId: z.string(), commentId: z.string().nullable() })).default([]),
   /** Archived factories leave the Factory page tabs, take no new agents, and are not watched. */
   archivedAt: z.string().nullable().default(null),
+  /** Project mode override ("auto" detects Greenfield vs. Brownfield from the repository). */
+  projectMode: z.enum(PROJECT_MODES).default("auto"),
 });
 export type Factory = z.infer<typeof factorySchema>;
 
@@ -176,6 +181,45 @@ const factorySummarySchema = factorySchema.omit({ agents: true, prs: true }).ext
   bbProjectName: z.string(),
 });
 export type FactorySummary = z.infer<typeof factorySummarySchema>;
+
+export const factoryDoctorSchema = z.object({
+  prefix: z.string(),
+  factoryName: z.string(),
+  configuredMode: z.enum(PROJECT_MODES),
+  detectedMode: z.enum(["greenfield", "brownfield"]),
+  effectiveMode: z.enum(["greenfield", "brownfield"]),
+  projectPath: z.string().nullable(),
+  commitCount: z.number(),
+  sourceDirs: z.array(z.string()),
+  files: z.object({
+    agentsMd: z.string().nullable(),
+    constitution: z.string().nullable(),
+    specs: z.string().nullable(),
+    roadmap: z.string().nullable(),
+  }),
+  existingDocs: z.array(z.string()),
+  boardHealth: z.object({
+    mergedPrsStillOpenTasks: z.array(z.object({ taskKey: z.string(), title: z.string(), pr: z.number() })),
+    inProgressWithoutLiveWorker: z.array(
+      z.object({ taskKey: z.string(), title: z.string(), lastRoles: z.array(z.string()) }),
+    ),
+    readyPlansAwaitingBuilder: z.array(z.object({ taskKey: z.string(), title: z.string(), commentId: z.string() })),
+    openPrsAwaitingAction: z.array(
+      z.object({ taskKey: z.string(), title: z.string(), pr: z.number(), isDraft: z.boolean(), summary: z.string() }),
+    ),
+    blockedTasks: z.array(z.object({ taskKey: z.string(), title: z.string() })),
+  }),
+  recommendedActions: z.array(
+    z.object({
+      id: z.string(),
+      title: z.string(),
+      detail: z.string(),
+      command: z.string().nullable(),
+      tone: z.enum(["info", "warn", "good"]),
+    }),
+  ),
+});
+export type FactoryDoctorReport = z.infer<typeof factoryDoctorSchema>;
 
 const prefixSchema = z
   .string()
@@ -254,11 +298,17 @@ export const rpcContract = defineRpcContract({
     input: z.null(),
     output: z.object({ projects: z.array(z.object({ id: z.string(), name: z.string() })) }),
   },
+  project_inspect: {
+    input: z.object({ bbProjectId: z.string().startsWith("proj_") }),
+    output: repoInspectionSchema.extend({ projectPath: z.string().nullable() }),
+  },
   factory_create: {
     input: z.object({
       bbProjectId: z.string().startsWith("proj_"),
       prefix: prefixSchema,
       name: z.string().trim().min(1).max(80),
+      projectMode: z.enum(PROJECT_MODES).optional(),
+      initSpecs: z.boolean().optional(),
     }),
     output: factorySummarySchema,
   },
@@ -282,8 +332,43 @@ export const rpcContract = defineRpcContract({
       tasks: z.array(boardTaskSchema),
     }),
   },
+  factory_doctor: {
+    input: z.object({ prefix: z.string() }),
+    output: factoryDoctorSchema,
+  },
+  factory_set_mode: {
+    input: z.object({ prefix: z.string(), projectMode: z.enum(PROJECT_MODES) }),
+    output: factoryDoctorSchema,
+  },
+  factory_init_specs: {
+    input: z.object({
+      prefix: z.string(),
+      mode: z.enum(["greenfield", "brownfield"]).optional(),
+    }),
+    output: z.object({
+      created: z.array(z.string()),
+      existing: z.array(z.string()),
+      doctor: factoryDoctorSchema,
+    }),
+  },
+  factory_reconcile: {
+    input: z.object({
+      prefix: z.string(),
+      notifyLead: z.boolean().optional(),
+    }),
+    output: z.object({
+      reconciledMoveToDone: z.array(z.string()),
+      leadNotified: z.boolean(),
+      doctor: factoryDoctorSchema,
+    }),
+  },
   lead_start: {
-    input: z.object({ prefix: z.string(), goal: z.string().trim().max(4000).nullable() }),
+    input: z.object({
+      prefix: z.string(),
+      goal: z.string().trim().max(4000).nullable(),
+      projectMode: z.enum(PROJECT_MODES).optional(),
+      initSpecs: z.boolean().optional(),
+    }),
     output: z.object({ threadId: z.string() }),
   },
   task_create: {
@@ -608,24 +693,74 @@ export default async function plugin(bb: BbPluginApi) {
     return { agents: rows, shadowCustomModel: agents.shadowCustomModel };
   }
 
-  // ----- gh on the project's machine -----
+  // ----- gh and repository alignment on the project's machine -----
 
   const host = bb.hosts.experimental_client({ contract: hostContract });
-  async function projectHost(factory: Factory): Promise<{ hostId: string; repo: string | null }> {
-    const project = (await bb.sdk.projects.get({ projectId: factory.bbProjectId })) as {
+  async function projectSourceById(bbProjectId: string): Promise<{
+    hostId: string;
+    repo: string | null;
+    projectPath: string | null;
+  }> {
+    const project = (await bb.sdk.projects.get({ projectId: bbProjectId })) as {
       gitRemoteUrl?: string | null;
-      sources?: { hostId?: string; isDefault?: boolean }[];
+      sources?: { hostId?: string; path?: string | null; isDefault?: boolean }[];
     };
     const source = project.sources?.find((candidate) => candidate.isDefault) ?? project.sources?.[0];
     const hostId = source?.hostId ?? (await bb.sdk.system.config()).primaryHostId;
-    if (hostId == null) throw new Error(`No machine found for project ${factory.bbProjectId}.`);
+    if (hostId == null) throw new Error(`No machine found for project ${bbProjectId}.`);
     const match = /github\.com[/:]([^/]+)\/([^/]+?)(?:\.git)?\/?$/.exec(project.gitRemoteUrl ?? "");
-    return { hostId, repo: match === null ? null : `${match[1]}/${match[2]}` };
+    const projectPath = typeof source?.path === "string" && source.path.trim() !== "" ? source.path.trim() : null;
+    return { hostId, repo: match === null ? null : `${match[1]}/${match[2]}`, projectPath };
+  }
+  async function projectHost(factory: Factory): Promise<{ hostId: string; repo: string | null; projectPath: string | null }> {
+    return projectSourceById(factory.bbProjectId);
   }
   async function gh(hostId: string, args: string[], stdin: string | null = null) {
     const result = await host.call("gh", { args, stdin }, { hostId, timeoutMs: 150_000 });
     if (result.code !== 0) throw new Error(`gh ${args.slice(0, 2).join(" ")} failed: ${result.stderr.trim().slice(0, 500)}`);
     return result.stdout;
+  }
+  const EMPTY_REPO_INSPECTION: RepoInspection = {
+    exists: false,
+    isGitRepo: false,
+    commitCount: 0,
+    sourceDirs: [],
+    detectedMode: "greenfield",
+    files: { agentsMd: null, constitution: null, specs: null, roadmap: null },
+    existingDocs: [],
+  };
+  async function inspectProjectById(bbProjectId: string): Promise<RepoInspection & { projectPath: string | null }> {
+    try {
+      const { hostId, projectPath } = await projectSourceById(bbProjectId);
+      if (projectPath === null) return { ...EMPTY_REPO_INSPECTION, projectPath: null };
+      const inspected = await host.call("inspect_repo", { projectPath }, { hostId, timeoutMs: 30_000 });
+      return { ...inspected, projectPath };
+    } catch (error) {
+      bb.log.warn(`could not inspect project ${bbProjectId}: ${String(error)}`);
+      return { ...EMPTY_REPO_INSPECTION, projectPath: null };
+    }
+  }
+  async function inspectProjectRepo(factory: Factory): Promise<RepoInspection & { projectPath: string | null }> {
+    return inspectProjectById(factory.bbProjectId);
+  }
+  async function scaffoldProjectSpecs(
+    factory: Factory,
+    modeOverride?: "greenfield" | "brownfield",
+  ): Promise<{ created: string[]; existing: string[] }> {
+    const { hostId, projectPath } = await projectHost(factory);
+    if (projectPath === null) {
+      throw new PluginCliError(`Project ${factory.bbProjectId} has no local checkout path to scaffold.`, {
+        code: "no_project_path",
+      });
+    }
+    const inspected = await inspectProjectRepo(factory);
+    const effectiveMode =
+      modeOverride ?? (factory.projectMode === "auto" ? inspected.detectedMode : factory.projectMode);
+    return host.call(
+      "scaffold_specs",
+      { projectPath, factoryName: factory.name, prefix: factory.prefix, mode: effectiveMode },
+      { hostId, timeoutMs: 30_000 },
+    );
   }
 
   // ----- Tasks plugin access -----
@@ -783,7 +918,13 @@ export default async function plugin(bb: BbPluginApi) {
     return { ...rest, bbProjectName };
   }
 
-  async function createFactory(args: { bbProjectId: string; prefix: string; name: string }): Promise<Factory> {
+  async function createFactory(args: {
+    bbProjectId: string;
+    prefix: string;
+    name: string;
+    projectMode?: ProjectMode;
+    initSpecs?: boolean;
+  }): Promise<Factory> {
     if ((await factoryStorage.read(args.prefix)) !== undefined) {
       throw new PluginCliError(`Factory ${args.prefix} already exists.`, { code: "factory_exists" });
     }
@@ -830,8 +971,14 @@ export default async function plugin(bb: BbPluginApi) {
       prs: [],
       plans: [],
       archivedAt: null,
+      projectMode: args.projectMode ?? "auto",
     };
     await saveFactory(factory);
+    if (args.initSpecs) {
+      await scaffoldProjectSpecs(factory).catch((error) =>
+        bb.log.warn(`could not scaffold initial specs for ${factory.prefix}: ${String(error)}`),
+      );
+    }
     return factory;
   }
 
@@ -891,9 +1038,250 @@ export default async function plugin(bb: BbPluginApi) {
     return { prefix: factory.prefix, tasksDeleted, threadsArchived };
   }
 
+  // ----- Project Alignment & Factory Doctor -----
+
+  async function computeDoctorReport(factory: Factory, preloadedTasks?: Task[]): Promise<FactoryDoctorReport> {
+    const inspected = await inspectProjectRepo(factory);
+    const allTasks = (preloadedTasks ?? (await listTasks(factory))).filter((task) => task.status !== "canceled");
+    const hasHistory = allTasks.length > 5 || factory.prs.length > 0;
+    const detectedMode: "greenfield" | "brownfield" =
+      inspected.detectedMode === "brownfield" || hasHistory ? "brownfield" : "greenfield";
+    const effectiveMode: "greenfield" | "brownfield" =
+      factory.projectMode === "auto" ? detectedMode : factory.projectMode;
+
+    const mergedPrsStillOpenTasks: FactoryDoctorReport["boardHealth"]["mergedPrsStillOpenTasks"] = [];
+    const inProgressWithoutLiveWorker: FactoryDoctorReport["boardHealth"]["inProgressWithoutLiveWorker"] = [];
+    const readyPlansAwaitingBuilder: FactoryDoctorReport["boardHealth"]["readyPlansAwaitingBuilder"] = [];
+    const openPrsAwaitingAction: FactoryDoctorReport["boardHealth"]["openPrsAwaitingAction"] = [];
+    const blockedTasks: FactoryDoctorReport["boardHealth"]["blockedTasks"] = [];
+
+    for (const task of allTasks) {
+      const isBlocked = task.labelIds.includes(factory.blockedLabelId) && task.status !== "done";
+      if (isBlocked) {
+        blockedTasks.push({ taskKey: task.key, title: task.title });
+      }
+      const pr = latestPr(factory, task.key);
+      if (task.status !== "done" && pr !== null && pr.state === "merged") {
+        mergedPrsStillOpenTasks.push({ taskKey: task.key, title: task.title, pr: pr.number });
+        continue;
+      }
+      if (pr !== null && pr.state === "open") {
+        const roles = requiredRoles(pr);
+        const changes = roles.filter((r) => reviewFor(pr, r)?.verdict === "changes").map((r) => ROLES[r].label);
+        const pending = roles.filter((r) => {
+          const v = reviewFor(pr, r)?.verdict;
+          return v === undefined || v === "pending";
+        }).map((r) => ROLES[r].label);
+        const summary =
+          changes.length > 0
+            ? `Changes requested by ${changes.join(", ")}`
+            : pending.length > 0
+            ? `Waiting on ${pending.join(", ")}`
+            : pr.isDraft
+            ? "All required reviews approved (marking ready)"
+            : "Ready for human merge";
+        openPrsAwaitingAction.push({
+          taskKey: task.key,
+          title: task.title,
+          pr: pr.number,
+          isDraft: pr.isDraft,
+          summary,
+        });
+      }
+      const plan = factory.plans.find((entry) => entry.taskKey === task.key);
+      const hasBuilder = factory.agents.some((agent) => agent.taskKey === task.key && agent.role === "build");
+      if (task.status !== "done" && plan?.commentId != null && !hasBuilder) {
+        readyPlansAwaitingBuilder.push({
+          taskKey: task.key,
+          title: task.title,
+          commentId: plan.commentId,
+        });
+      }
+      if (task.status === "in_progress" && !isBlocked) {
+        const taskAgents = factory.agents.filter((agent) => agent.taskKey === task.key && agent.role !== "lead");
+        let anyActive = false;
+        for (const agent of taskAgents) {
+          const thread = await bb.sdk.threads.get({ threadId: agent.threadId }).catch(() => null);
+          if (
+            thread !== null &&
+            thread.archivedAt === null &&
+            thread.deletedAt === null &&
+            (thread.status === "active" || thread.status === "starting" || thread.status === "pending")
+          ) {
+            anyActive = true;
+            break;
+          }
+        }
+        if (!anyActive && (pr === null || pr.state !== "open")) {
+          const lastRoles = [...new Set(taskAgents.map((agent) => ROLES[agent.role].label))];
+          inProgressWithoutLiveWorker.push({ taskKey: task.key, title: task.title, lastRoles });
+        }
+      }
+    }
+
+    const recommendedActions: FactoryDoctorReport["recommendedActions"] = [];
+    const missingFiles: string[] = [];
+    if (inspected.files.agentsMd === null) missingFiles.push("AGENTS.md");
+    if (inspected.files.constitution === null) missingFiles.push(".specify/memory/constitution.md");
+    if (inspected.files.specs === null) missingFiles.push("docs/architecture.md");
+    if (inspected.files.roadmap === null) missingFiles.push("docs/roadmap.md");
+
+    if (missingFiles.length > 0 && inspected.projectPath !== null) {
+      recommendedActions.push({
+        id: "init-specs",
+        title: `Scaffold missing Spec-Driven alignment files (${missingFiles.join(", ")})`,
+        detail:
+          effectiveMode === "brownfield"
+            ? "This Brownfield project is missing canonical repo-level agent alignment files. Scaffolding them gives Lead, Planner, Builders, and Reviewers one shared Constitution and architecture router."
+            : "Start this Greenfield project with a clear Constitution (.specify/memory/constitution.md), AGENTS.md router, architecture blueprint, and milestone roadmap.",
+        command: `bb factory init-specs ${factory.prefix}`,
+        tone: "warn",
+      });
+    }
+
+    if (mergedPrsStillOpenTasks.length > 0) {
+      recommendedActions.push({
+        id: "reconcile-merged",
+        title: `Move ${mergedPrsStillOpenTasks.length} task(s) with already-merged PRs to Done (${mergedPrsStillOpenTasks.map((t) => t.taskKey).join(", ")})`,
+        detail: "These tasks have merged pull requests on GitHub but are still sitting in In progress / In review on the board.",
+        command: `bb factory reconcile ${factory.prefix}`,
+        tone: "warn",
+      });
+    }
+
+    if (inProgressWithoutLiveWorker.length > 0) {
+      recommendedActions.push({
+        id: "triage-idle-in-progress",
+        title: `Triage ${inProgressWithoutLiveWorker.length} In-Progress task(s) with no active worker (${inProgressWithoutLiveWorker.slice(0, 5).map((t) => t.taskKey).join(", ")})`,
+        detail: "The assigned worker threads finished or were archived without the task moving to In review, Done, or Blocked. Reconcile and wake the Lead so it can advance or close them.",
+        command: `bb factory reconcile ${factory.prefix} --notify-lead`,
+        tone: "warn",
+      });
+    }
+
+    if (readyPlansAwaitingBuilder.length > 0) {
+      recommendedActions.push({
+        id: "ready-plans",
+        title: `${readyPlansAwaitingBuilder.length} task(s) have a READY plan awaiting Builder dispatch (${readyPlansAwaitingBuilder.map((t) => t.taskKey).join(", ")})`,
+        detail: "The Planner signed off on a READY plan comment, or finished a coordination plan, and the Lead can now dispatch Builders or close the planning task.",
+        command: `bb factory assign ${readyPlansAwaitingBuilder[0]!.taskKey} --role build`,
+        tone: "info",
+      });
+    }
+
+    if (recommendedActions.length === 0) {
+      recommendedActions.push({
+        id: "aligned",
+        title: `${effectiveMode === "greenfield" ? "Greenfield" : "Brownfield"} alignment and board health look clean`,
+        detail: "All four Spec-Driven alignment artifacts are present and no orphaned tasks were detected.",
+        command: null,
+        tone: "good",
+      });
+    }
+
+    return {
+      prefix: factory.prefix,
+      factoryName: factory.name,
+      configuredMode: factory.projectMode,
+      detectedMode,
+      effectiveMode,
+      projectPath: inspected.projectPath,
+      commitCount: inspected.commitCount,
+      sourceDirs: inspected.sourceDirs,
+      files: inspected.files,
+      existingDocs: inspected.existingDocs,
+      boardHealth: {
+        mergedPrsStillOpenTasks,
+        inProgressWithoutLiveWorker,
+        readyPlansAwaitingBuilder,
+        openPrsAwaitingAction,
+        blockedTasks,
+      },
+      recommendedActions,
+    };
+  }
+
+  function formatDoctorReport(report: FactoryDoctorReport): string {
+    const modeLabel =
+      report.configuredMode === "auto"
+        ? `${report.effectiveMode} (auto-detected · ${report.commitCount} commits)`
+        : `${report.effectiveMode} (configured · detected ${report.detectedMode}, ${report.commitCount} commits)`;
+    const lines = [
+      `Factory ${report.prefix} · ${report.factoryName}`,
+      `Project mode: ${modeLabel}`,
+      `Checkout path: ${report.projectPath ?? "unavailable"}`,
+      "",
+      "Spec-Driven Alignment Files:",
+      `  AGENTS.md router:         ${report.files.agentsMd ?? "MISSING"}`,
+      `  Project Constitution:     ${report.files.constitution ?? "MISSING (.specify/memory/constitution.md)"}`,
+      `  Living Architecture/Spec: ${report.files.specs ?? "MISSING (docs/architecture.md)"}`,
+      `  Milestone Roadmap:        ${report.files.roadmap ?? "MISSING (docs/roadmap.md)"}`,
+      "",
+      "Board & Agent Health:",
+      `  Merged PRs still open on board:    ${report.boardHealth.mergedPrsStillOpenTasks.length === 0 ? "0" : report.boardHealth.mergedPrsStillOpenTasks.map((t) => `${t.taskKey} (PR #${t.pr})`).join(", ")}`,
+      `  In-progress with no active worker: ${report.boardHealth.inProgressWithoutLiveWorker.length === 0 ? "0" : report.boardHealth.inProgressWithoutLiveWorker.map((t) => `${t.taskKey} (${t.lastRoles.join("/") || "no agent"})`).join(", ")}`,
+      `  READY plans awaiting Builder:      ${report.boardHealth.readyPlansAwaitingBuilder.length === 0 ? "0" : report.boardHealth.readyPlansAwaitingBuilder.map((t) => `${t.taskKey} (comment ${t.commentId})`).join(", ")}`,
+      `  Open PRs in flight:                ${report.boardHealth.openPrsAwaitingAction.length === 0 ? "0" : report.boardHealth.openPrsAwaitingAction.map((t) => `${t.taskKey} PR #${t.pr} (${t.summary})`).join("; ")}`,
+      `  Blocked tasks:                     ${report.boardHealth.blockedTasks.length === 0 ? "0" : report.boardHealth.blockedTasks.map((t) => t.taskKey).join(", ")}`,
+      "",
+      "Recommended Actions:",
+      ...report.recommendedActions.map(
+        (action, idx) =>
+          `  ${idx + 1}. [${action.tone.toUpperCase()}] ${action.title}\n     ${action.detail}${action.command ? `\n     Run: \`${action.command}\`` : ""}`,
+      ),
+    ];
+    return lines.join("\n");
+  }
+
+  async function reconcileFactory(
+    factory: Factory,
+    notifyLead = false,
+  ): Promise<{ reconciledMoveToDone: string[]; leadNotified: boolean; doctor: FactoryDoctorReport }> {
+    const tasks = await listTasks(factory);
+    const reconciledMoveToDone: string[] = [];
+    for (const task of tasks) {
+      if (task.status === "done" || task.status === "canceled") continue;
+      const pr = latestPr(factory, task.key);
+      if (pr !== null && pr.state === "merged") {
+        await moveTask(factory, task.id, "done");
+        await comment(task.id, `Reconciled by Factory: [PR #${pr.number}](${pr.url}) was already merged; moved task to Done.`);
+        reconciledMoveToDone.push(task.key);
+      }
+    }
+    if (reconciledMoveToDone.length > 0) {
+      bb.realtime.publish(BOARD_CHANGED, { prefix: factory.prefix });
+    }
+    const doctor = await computeDoctorReport(factory);
+    let leadNotified = false;
+    if (notifyLead && factory.leadThreadId !== null) {
+      const idleList = doctor.boardHealth.inProgressWithoutLiveWorker.map((t) => `${t.taskKey} (${t.title})`).join(", ");
+      const readyList = doctor.boardHealth.readyPlansAwaitingBuilder.map((t) => `${t.taskKey} (comment ${t.commentId})`).join(", ");
+      const prList = doctor.boardHealth.openPrsAwaitingAction.map((t) => `${t.taskKey} PR #${t.pr}: ${t.summary}`).join("; ");
+      const message = [
+        `[factory] Alignment & Board Reconciliation check for ${factory.prefix} (${doctor.effectiveMode} mode):`,
+        reconciledMoveToDone.length > 0
+          ? `- Auto-moved merged PR task(s) to Done: ${reconciledMoveToDone.join(", ")}.`
+          : null,
+        `- Alignment files in repo: AGENTS.md=${doctor.files.agentsMd ?? "missing"}, Constitution=${doctor.files.constitution ?? "missing"}, Specs=${doctor.files.specs ?? "missing"}, Roadmap=${doctor.files.roadmap ?? "missing"}.`,
+        idleList ? `- In-progress task(s) with no active worker thread: ${idleList}. Check their output/comments and move them to Done, To do, or Blocked, or assign the next specialist.` : null,
+        readyList ? `- Task(s) with a READY plan comment awaiting Builder or closure: ${readyList}.` : null,
+        prList ? `- Open PRs in flight: ${prList}.` : null,
+        `Please read \`AGENTS.md\` and \`.specify/memory/constitution.md\` (if present), resolve any stalled board items above, and give the person a concise status update: (1) where we are in the current milestone, (2) what was just reconciled or unblocked, and (3) the exact next step.`,
+      ]
+        .filter((line) => line !== null)
+        .join("\n");
+      leadNotified = await tellThread(factory.leadThreadId, message);
+    }
+    return { reconciledMoveToDone, leadNotified, doctor };
+  }
+
   // ----- Agents -----
 
-  async function startLead(factory: Factory, goal: string | null): Promise<string> {
+  async function startLead(
+    factory: Factory,
+    goal: string | null,
+    options?: { projectMode?: ProjectMode; initSpecs?: boolean },
+  ): Promise<string> {
     assertActive(factory);
     if (factory.leadThreadId !== null) {
       const existing = await bb.sdk.threads.get({ threadId: factory.leadThreadId }).catch(() => null);
@@ -904,19 +1292,58 @@ export default async function plugin(bb: BbPluginApi) {
         });
       }
     }
+    let currentFactory = factory;
+    if (options?.projectMode !== undefined && options.projectMode !== factory.projectMode) {
+      currentFactory = await mutateFactory(factory.prefix, (current) => {
+        current.projectMode = options.projectMode!;
+        return current;
+      });
+    }
+    if (options?.initSpecs) {
+      const modeOverride =
+        currentFactory.projectMode === "auto" ? undefined : currentFactory.projectMode;
+      await scaffoldProjectSpecs(currentFactory, modeOverride).catch((error) =>
+        bb.log.warn(`could not scaffold specs before starting Lead for ${currentFactory.prefix}: ${String(error)}`),
+      );
+    }
+    const inspected = await inspectProjectRepo(currentFactory);
+    const effectiveMode: "greenfield" | "brownfield" =
+      currentFactory.projectMode === "auto"
+        ? inspected.detectedMode === "brownfield" || currentFactory.prs.length > 0
+          ? "brownfield"
+          : "greenfield"
+        : currentFactory.projectMode;
+    const alignment: AlignmentContext | null = inspected.exists
+      ? {
+          effectiveMode,
+          detectedMode: inspected.detectedMode,
+          commitCount: inspected.commitCount,
+          files: inspected.files,
+          existingDocs: inspected.existingDocs,
+        }
+      : currentFactory.projectMode !== "auto"
+      ? {
+          effectiveMode,
+          detectedMode: effectiveMode,
+          commitCount: 0,
+          files: inspected.files,
+          existingDocs: inspected.existingDocs,
+        }
+      : null;
+
     const execution = await executionFor("lead");
     const { providerId } = execution;
     const thread = await bb.sdk.threads.spawn({
-      projectId: factory.bbProjectId,
+      projectId: currentFactory.bbProjectId,
       environment: { type: "project-default" },
       ...execution,
       permissionMode: await permissionModeFor(providerId),
-      title: `${factory.name} · Lead`,
+      title: `${currentFactory.name} · Lead`,
       pinned: true,
-      prompt: leadPrompt({ factoryName: factory.name, prefix: factory.prefix, goal }),
-      pluginMetadata: { factory: factory.prefix, role: "lead" },
+      prompt: leadPrompt({ factoryName: currentFactory.name, prefix: currentFactory.prefix, goal, alignment }),
+      pluginMetadata: { factory: currentFactory.prefix, role: "lead" },
     });
-    await mutateFactory(factory.prefix, (current) => {
+    await mutateFactory(currentFactory.prefix, (current) => {
       current.leadThreadId = thread.id;
       current.agents.push({
         threadId: thread.id,
@@ -1605,7 +2032,10 @@ ${sections.join("\n\n---\n\n")}`;
         }
         continue;
       }
-      if (review.verdict !== "changes") continue;
+      // Security also re-reviews after an approval, so the approval that counts for merging never
+      // stands on an older commit. Reviewers 1 and 2 re-review only after REQUEST CHANGES.
+      const securityApprovedOlder = role === "security" && review.verdict === "approve" && review.sha !== gp.headRefOid;
+      if (review.verdict !== "changes" && !securityApprovedOlder) continue;
       const message = reReviewMessage({ role, taskKey: pr.taskKey, prNumber: pr.number, sha: gp.headRefOid, findings: null });
       const delivered = review.threadId !== null && (await tellThread(review.threadId, message));
       if (delivered) {
@@ -1614,7 +2044,13 @@ ${sections.join("\n\n---\n\n")}`;
           target?.reviews.push({ role, threadId: review.threadId, sha: gp.headRefOid, verdict: "pending", at: new Date().toISOString() });
         });
       } else {
-        await startPrReviewer(factory.prefix, pr.number, role, null, `Re-review after new commits (now at ${gp.headRefOid.slice(0, 7)}); an earlier review requested changes.`);
+        await startPrReviewer(
+          factory.prefix,
+          pr.number,
+          role,
+          null,
+          `Re-review after new commits (now at ${gp.headRefOid.slice(0, 7)}); an earlier review ${review.verdict === "changes" ? "requested changes" : `approved ${review.sha.slice(0, 7)}`}.`,
+        );
       }
     }
   }
@@ -1885,7 +2321,7 @@ ${sections.join("\n\n---\n\n")}`;
     if (round === null) return;
     await tellLead(
       factory,
-      `[factory] Review round complete on PR #${prNumber} (${round.taskKey}) at \`${round.headSha.slice(0, 7)}\`: ${round.labels}. Send the builder one handoff referencing this PR's REQUEST CHANGES comments and reviewer threads. It must read and address every finding directly, in one push; consult the Planner if findings conflict; each push re-runs CI and the reviewers who asked for changes.`,
+      `[factory] Review round complete on PR #${prNumber} (${round.taskKey}) at \`${round.headSha.slice(0, 7)}\`: ${round.labels}. Send the builder one handoff referencing this PR's REQUEST CHANGES comments and reviewer threads. It must read and address every finding directly, in one push; consult the Planner if findings conflict; each push re-runs CI, the Security reviewer and the reviewers who asked for changes.`,
     );
   }
 
@@ -1920,10 +2356,26 @@ ${sections.join("\n\n---\n\n")}`;
     return pr;
   }
 
+  /**
+   * The shadow's written review: its newest task comment. The shadow records its verdict while its
+   * turn is still running, so its thread output at that moment is only a progress note.
+   */
+  async function shadowReview(taskKey: string, shadowThreadId: string): Promise<string> {
+    try {
+      const task = await getTaskByKey(taskKey);
+      const { comments } = await tasksRpc("listComments", { taskId: task.id }, z.object({ comments: z.array(commentSchema) }));
+      const own = comments.filter((c) => c.kind === "agent" && c.threadId === shadowThreadId).at(-1);
+      if (own !== undefined) return own.body;
+    } catch (error) {
+      bb.log.warn(`could not read the shadow review on ${taskKey}: ${String(error)}`);
+    }
+    return (await outputOf(shadowThreadId)) ?? "(no output)";
+  }
+
   /** A shadow REQUEST CHANGES holds the PR: tell the person on the PR, the Lead, and ask the incumbent to confirm or dismiss. */
   async function onShadowBlock(factory: Factory, pr: Pr, shadowThreadId: string): Promise<void> {
     const { hostId, repo } = await projectHost(factory);
-    const findings = ((await outputOf(shadowThreadId)) ?? "(no output)").slice(0, 12_000);
+    const findings = (await shadowReview(pr.taskKey, shadowThreadId)).slice(0, 12_000);
     if (repo !== null) {
       await prComment(
         hostId,
@@ -2100,6 +2552,7 @@ ${findings}`;
     projects_list: async () => ({
       projects: (await bb.sdk.projects.list()).map((project) => ({ id: project.id, name: project.name })),
     }),
+    project_inspect: async ({ bbProjectId }) => inspectProjectById(bbProjectId),
     factory_create: async (input) => summarize(await createFactory(input)),
     factory_archive: async ({ prefix }) => summarize(await setArchived(prefix, true)),
     factory_restore: async ({ prefix }) => summarize(await setArchived(prefix, false)),
@@ -2116,7 +2569,27 @@ ${findings}`;
         tasks: tasks.filter((task) => task.status !== "canceled").map((task) => toBoardTask(factory, task)),
       };
     },
-    lead_start: async ({ prefix, goal }) => ({ threadId: await startLead(await findFactory(prefix), goal) }),
+    factory_doctor: async ({ prefix }) => computeDoctorReport(await findFactory(prefix)),
+    factory_set_mode: async ({ prefix, projectMode }) => {
+      const updated = await mutateFactory(prefix, (factory) => {
+        factory.projectMode = projectMode;
+        return factory;
+      });
+      return computeDoctorReport(updated);
+    },
+    factory_init_specs: async ({ prefix, mode }) => {
+      const factory = await findFactory(prefix);
+      const { created, existing } = await scaffoldProjectSpecs(factory, mode);
+      const doctor = await computeDoctorReport(factory);
+      return { created, existing, doctor };
+    },
+    factory_reconcile: async ({ prefix, notifyLead }) => {
+      const factory = await findFactory(prefix);
+      return reconcileFactory(factory, notifyLead === true);
+    },
+    lead_start: async ({ prefix, goal, projectMode, initSpecs }) => ({
+      threadId: await startLead(await findFactory(prefix), goal, { projectMode, initSpecs }),
+    }),
     task_create: async ({ prefix, title }) => {
       const factory = await findFactory(prefix);
       const task = unwrap(
@@ -2330,6 +2803,15 @@ ${findings}`;
               description: "Task key prefix, such as APP (1-10 letters or digits)",
             },
             name: { type: "string", description: "Factory name; defaults to the project name" },
+            mode: {
+              type: "enum",
+              values: PROJECT_MODES,
+              description: "Project mode: auto (detect Greenfield vs. Brownfield), greenfield, or brownfield",
+            },
+            "init-specs": {
+              type: "boolean",
+              description: "Scaffold missing Spec-Driven alignment files (AGENTS.md, .specify/memory/constitution.md, docs/)",
+            },
             json,
           },
           async run(input, ctx) {
@@ -2347,24 +2829,42 @@ ${findings}`;
               });
             }
             const name = input.options.name ?? (await bb.sdk.projects.get({ projectId: bbProjectId })).name;
-            const factory = await createFactory({ bbProjectId, prefix: prefix.data, name });
+            const factory = await createFactory({
+              bbProjectId,
+              prefix: prefix.data,
+              name,
+              projectMode: input.options.mode as ProjectMode | undefined,
+              initSpecs: input.options["init-specs"] === true,
+            });
             if (input.options.json) return { exitCode: 0, stdout: JSON.stringify(await summarize(factory)) };
             return {
               exitCode: 0,
-              stdout: `Created factory ${factory.prefix} (${factory.name}). Start its Lead with \`bb factory start ${factory.prefix}\`.`,
+              stdout: `Created factory ${factory.prefix} (${factory.name}). Inspect alignment with \`bb factory doctor ${factory.prefix}\` or start its Lead with \`bb factory start ${factory.prefix}\`.`,
             };
           },
         }),
         start: cliCommand({
-          summary: "Start the factory's Lead agent",
+          summary: "Start the factory's Lead agent (detects Greenfield vs. Brownfield and guides setup)",
           positionals: [{ name: "factory", description: "Factory prefix", required: true }],
           options: {
             goal: { type: "string", description: "What the factory should build first" },
+            mode: {
+              type: "enum",
+              values: PROJECT_MODES,
+              description: "Project mode override: auto, greenfield, or brownfield",
+            },
+            "init-specs": {
+              type: "boolean",
+              description: "Scaffold missing Spec-Driven alignment files (AGENTS.md, .specify/memory/constitution.md, docs/) before starting the Lead",
+            },
             json,
           },
           async run(input) {
             const factory = await findFactory(input.positionals.factory);
-            const threadId = await startLead(factory, input.options.goal ?? null);
+            const threadId = await startLead(factory, input.options.goal ?? null, {
+              projectMode: input.options.mode as ProjectMode | undefined,
+              initSpecs: input.options["init-specs"] === true,
+            });
             return {
               exitCode: 0,
               stdout: input.options.json ? JSON.stringify({ threadId }) : `Started the Lead: ${threadId}`,
@@ -2711,6 +3211,126 @@ ${findings}`;
                 }
               }
             }
+            return { exitCode: 0, stdout: lines.join("\n") };
+          },
+        }),
+        doctor: cliCommand({
+          summary: "Inspect Greenfield/Brownfield mode, Spec-Driven alignment files, and board health",
+          positionals: [{ name: "factory", description: "Factory prefix; defaults to the only factory" }],
+          options: {
+            mode: {
+              type: "enum",
+              values: PROJECT_MODES,
+              description: "Set the factory's project mode (auto, greenfield, or brownfield) before inspecting",
+            },
+            json,
+          },
+          async run(input) {
+            let factory: Factory;
+            if (input.positionals.factory !== undefined) {
+              factory = await findFactory(input.positionals.factory);
+            } else {
+              const all = (await listFactories()).filter((candidate) => candidate.archivedAt === null);
+              if (all.length !== 1 || all[0] === undefined) {
+                throw new PluginCliError("Name the factory.", {
+                  code: "factory_required",
+                  hint: "Run `bb factory list`.",
+                });
+              }
+              factory = all[0];
+            }
+            if (input.options.mode !== undefined) {
+              factory = await mutateFactory(factory.prefix, (current) => {
+                current.projectMode = input.options.mode as ProjectMode;
+                return current;
+              });
+            }
+            const report = await computeDoctorReport(factory);
+            if (input.options.json) return { exitCode: 0, stdout: JSON.stringify(report) };
+            return { exitCode: 0, stdout: formatDoctorReport(report) };
+          },
+        }),
+        "init-specs": cliCommand({
+          summary: "Scaffold missing Spec-Driven alignment files (AGENTS.md, .specify/memory/constitution.md, docs/architecture.md, docs/roadmap.md) without overwriting existing files",
+          positionals: [{ name: "factory", description: "Factory prefix; defaults to the only factory" }],
+          options: {
+            mode: {
+              type: "enum",
+              values: ["greenfield", "brownfield"] as const,
+              description: "Template mode: greenfield or brownfield (defaults to the factory's detected mode)",
+            },
+            json,
+          },
+          async run(input) {
+            let factory: Factory;
+            if (input.positionals.factory !== undefined) {
+              factory = await findFactory(input.positionals.factory);
+            } else {
+              const all = (await listFactories()).filter((candidate) => candidate.archivedAt === null);
+              if (all.length !== 1 || all[0] === undefined) {
+                throw new PluginCliError("Name the factory.", {
+                  code: "factory_required",
+                  hint: "Run `bb factory list`.",
+                });
+              }
+              factory = all[0];
+            }
+            if (input.options.mode !== undefined) {
+              factory = await mutateFactory(factory.prefix, (current) => {
+                current.projectMode = input.options.mode as "greenfield" | "brownfield";
+                return current;
+              });
+            }
+            const { created, existing } = await scaffoldProjectSpecs(
+              factory,
+              input.options.mode as "greenfield" | "brownfield" | undefined,
+            );
+            const doctor = await computeDoctorReport(factory);
+            if (input.options.json) {
+              return { exitCode: 0, stdout: JSON.stringify({ created, existing, doctor }) };
+            }
+            const lines = [
+              `Spec-Driven alignment files for ${factory.prefix} (${doctor.effectiveMode} mode):`,
+              created.length > 0 ? `  Created:  ${created.join(", ")}` : "  Created:  none (all files already present)",
+              existing.length > 0 ? `  Preserved existing: ${existing.join(", ")}` : null,
+            ].filter((line) => line !== null);
+            return { exitCode: 0, stdout: lines.join("\n") };
+          },
+        }),
+        reconcile: cliCommand({
+          summary: "Move tasks with already-merged PRs to Done, audit stalled In-Progress tasks, and optionally brief the Lead",
+          positionals: [{ name: "factory", description: "Factory prefix; defaults to the only factory" }],
+          options: {
+            "notify-lead": {
+              type: "boolean",
+              description: "Send a reconciliation and alignment brief to the factory's Lead thread",
+            },
+            json,
+          },
+          async run(input) {
+            let factory: Factory;
+            if (input.positionals.factory !== undefined) {
+              factory = await findFactory(input.positionals.factory);
+            } else {
+              const all = (await listFactories()).filter((candidate) => candidate.archivedAt === null);
+              if (all.length !== 1 || all[0] === undefined) {
+                throw new PluginCliError("Name the factory.", {
+                  code: "factory_required",
+                  hint: "Run `bb factory list`.",
+                });
+              }
+              factory = all[0];
+            }
+            const result = await reconcileFactory(factory, input.options["notify-lead"] === true);
+            if (input.options.json) return { exitCode: 0, stdout: JSON.stringify(result) };
+            const lines = [
+              result.reconciledMoveToDone.length > 0
+                ? `Moved ${result.reconciledMoveToDone.length} merged-PR task(s) to Done: ${result.reconciledMoveToDone.join(", ")}.`
+                : "No open tasks had already-merged PRs.",
+              result.leadNotified ? `Notified the Lead thread (${factory.leadThreadId}).` : null,
+              "",
+              formatDoctorReport(result.doctor),
+            ].filter((line) => line !== null);
             return { exitCode: 0, stdout: lines.join("\n") };
           },
         }),

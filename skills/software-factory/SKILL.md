@@ -13,6 +13,15 @@ Factory reports their combined review round. The **Factory** page in the left na
 shows the agents and a board with the columns Backlog, To do, In progress,
 In review, Done and Blocked; cards show their pull request and its verdicts.
 
+## Spec-Driven Alignment & Greenfield vs. Brownfield Onboarding
+
+When starting or resuming a factory, the plugin inspects the project repository to detect whether it is **Greenfield** (new project) or **Brownfield** (existing codebase and commit history), or uses the explicit `--mode greenfield|brownfield` setting:
+
+- **Living Repository Truth (`AGENTS.md`, `.specify/memory/constitution.md`, `docs/architecture.md`, `docs/roadmap.md`):** Task comments (`Factory plan: READY`) hold per-task execution plans, while the repository holds the living system truth. Scaffolding missing files with `bb factory init-specs APP` (or via the Factory page) ensures every agent (Lead, Planner, Builder, QA, Reviewers) shares one Constitution and architecture router without overwriting existing docs.
+- **Greenfield Playbook:** The Lead confirms vision and constraints, scaffolds the Constitution and initial specs (`bb factory init-specs APP`), routes Milestone 1 architecture and task breakdown through the Planner, and waits for `Factory plan: READY` before spawning Builders.
+- **Brownfield Playbook:** The Lead runs `bb factory status APP` and `bb factory doctor APP`, reads existing docs (`AGENTS.md`, `.specify/memory/constitution.md`, `docs/architecture.md`, `docs/roadmap.md`), reconciles any merged PRs or orphaned In-Progress tasks (`bb factory reconcile APP`), and gives the person a concise status and next-step brief before dispatching new work.
+- **Spec-Bound Review Convergence:** Reviewers grade diffs against the task's `Factory plan: READY` acceptance criteria and `.specify/memory/constitution.md`. On re-review rounds (Round 2+), reviewers check only whether prior blocking findings were fixed and whether the new delta introduced regressions—never inventing new out-of-scope redesign requests.
+
 ## On-demand planning
 
 Preserve the original request verbatim, its source message references and constraints
@@ -90,8 +99,11 @@ skip docs-only changes. PRs stay drafts until every reviewer approves, so
 | `bb factory agents` | Show the provider, model and reasoning level each agent runs on. Leave changes to the person unless they ask. |
 | `bb factory archive APP` | Archive a factory: it leaves the Factory page tabs, takes no new agents, and gets no automatic PR reviews. |
 | `bb factory restore APP` | Restore an archived factory. Deleting a factory is only possible from the Factory page. |
-| `bb factory create --prefix APP [--project proj_...] [--name "..."]` | Create a factory and its Tasks tracker (or reuse a tracker with that prefix). The project defaults to the current thread's. |
-| `bb factory start APP [--goal "..."]` | Start the Lead thread. |
+| `bb factory create --prefix APP [--project proj_...] [--name "..."] [--mode auto\|greenfield\|brownfield] [--init-specs]` | Create a factory and its Tasks tracker (or reuse a tracker with that prefix). Optionally set the project mode and scaffold missing Spec-Driven alignment files. |
+| `bb factory start APP [--goal "..."] [--mode auto\|greenfield\|brownfield] [--init-specs]` | Start the Lead thread with Greenfield/Brownfield detection and optional spec scaffolding. |
+| `bb factory doctor [APP] [--mode auto\|greenfield\|brownfield]` | Inspect Greenfield/Brownfield mode, Spec-Driven alignment files (`AGENTS.md`, `.specify/memory/constitution.md`, `docs/`), and board health (merged PRs still open, In-Progress tasks without live workers, READY plans awaiting Builders). |
+| `bb factory init-specs [APP] [--mode greenfield\|brownfield]` | Scaffold missing Spec-Driven alignment files in the repository without overwriting existing files. |
+| `bb factory reconcile [APP] [--notify-lead]` | Move tasks with already-merged PRs to Done, audit stalled In-Progress tasks, and optionally send a status/alignment brief to the Lead thread. |
 | `bb factory assign APP-12 --role plan\|build\|qa\|design\|review1\|review2\|security [--instructions "..."]` | Spawn a specialist for the task as the Lead's child. Planner uses the project checkout; Builder and Designer get a new worktree; QA and reviewers reuse the task's builder worktree. PR reviewers are normally started automatically instead. |
 | `bb factory assign APP-12 --role review1\|review2\|security --pr N` | Replace a reviewer that failed (dead provider, removed model) with a fresh one on the current roster, reviewing that PR. Retrying the old thread keeps the model it was spawned with, so it cannot recover from a provider that ran out. |
 | `bb factory plan-ready APP-12 --comment <id>` | Current Planner only: validate its READY planning comment and allow Builder assignments. |

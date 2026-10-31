@@ -18,8 +18,20 @@ import {
   useRpc,
 } from "@get-bb/plugin-sdk/app";
 import type { ExperimentalProviderModelPickerValue, PluginSidebarThread } from "@get-bb/plugin-sdk/app";
-import type { Agent, AgentExec, AgentsView, BoardTask, Column, FactorySummary, PrSummary, TaskComment, rpcContract } from "./server";
-import { ROLES, WORKER_ROLE_IDS, type AssignableRoleId } from "./roles";
+import type {
+  Agent,
+  AgentExec,
+  AgentsView,
+  BoardTask,
+  Column,
+  FactoryDoctorReport,
+  FactorySummary,
+  PrSummary,
+  TaskComment,
+  rpcContract,
+} from "./server";
+import type { RepoInspection } from "./host-contract";
+import { ROLES, WORKER_ROLE_IDS, type AssignableRoleId, type ProjectMode } from "./roles";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import {
@@ -206,6 +218,28 @@ function useBoard(prefix: string) {
     if (changed === undefined || changed === prefix) refetch();
   });
   return { board, setBoard, error, setError, refetch };
+}
+
+function useDoctor(prefix: string) {
+  const rpc = useRpc<typeof rpcContract>();
+  const [doctor, setDoctor] = useState<FactoryDoctorReport | null>(null);
+  const refetchDoctor = useCallback(() => {
+    rpc.call("factory_doctor", { prefix }).then(
+      (result) => setDoctor(result),
+      () => undefined,
+    );
+  }, [rpc, prefix]);
+  useEffect(() => {
+    setDoctor(null);
+  }, [prefix]);
+  useEffect(() => {
+    refetchDoctor();
+  }, [refetchDoctor]);
+  useRealtime("board-changed", (payload) => {
+    const changed = (payload as { prefix?: string } | null)?.prefix;
+    if (changed === undefined || changed === prefix) refetchDoctor();
+  });
+  return { doctor, setDoctor, refetchDoctor };
 }
 
 // ---------- Page ----------
@@ -483,8 +517,10 @@ function DeleteFactoryDialog({
 function FactoryView({ prefix }: { prefix: string }) {
   const rpc = useRpc<typeof rpcContract>();
   const { board, setBoard, error, setError, refetch } = useBoard(prefix);
+  const { doctor, setDoctor, refetchDoctor } = useDoctor(prefix);
   const live = useLiveAgents(board?.agents ?? EMPTY_AGENTS);
   const [openTaskId, setOpenTaskId] = useState<string | null>(null);
+  const [showAlignment, setShowAlignment] = useState(false);
 
   const move = useCallback(
     (taskId: string, column: Column) => {
@@ -505,11 +541,20 @@ function FactoryView({ prefix }: { prefix: string }) {
     return <Frame>{error === null ? <EmptyState>Loading the board…</EmptyState> : <Alert>{error}</Alert>}</Frame>;
   }
   const openTask = board.tasks.find((task) => task.id === openTaskId) ?? null;
+  const refreshAll = () => {
+    refetch();
+    refetchDoctor();
+  };
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
       <div className="space-y-3 px-4 pt-4 md:px-5">
-        <AgentsStrip factory={board.factory} live={live} onStarted={refetch} />
-        <Metrics tasks={board.tasks} live={live} />
+        <AgentsStrip factory={board.factory} doctor={doctor} live={live} onStarted={refreshAll} />
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <Metrics tasks={board.tasks} live={live} />
+          {doctor === null ? null : (
+            <AlignmentBar doctor={doctor} onOpen={() => setShowAlignment(true)} />
+          )}
+        </div>
         {error === null ? null : <Alert>{error}</Alert>}
       </div>
       <Board
@@ -518,7 +563,7 @@ function FactoryView({ prefix }: { prefix: string }) {
         live={live}
         onMove={move}
         onOpen={setOpenTaskId}
-        onCreated={refetch}
+        onCreated={refreshAll}
       />
       <TaskDialog
         task={openTask}
@@ -526,6 +571,16 @@ function FactoryView({ prefix }: { prefix: string }) {
         live={live.filter((entry) => openTask !== null && entry.agent.taskKey === openTask.key)}
         onMove={move}
         onClose={() => setOpenTaskId(null)}
+      />
+      <AlignmentDialog
+        open={showAlignment}
+        doctor={doctor}
+        hasLead={board.factory.leadThreadId !== null}
+        onClose={() => setShowAlignment(false)}
+        onUpdated={(nextDoctor) => {
+          setDoctor(nextDoctor);
+          refetch();
+        }}
       />
     </div>
   );
@@ -536,10 +591,12 @@ const EMPTY_AGENTS: Agent[] = [];
 
 function AgentsStrip({
   factory,
+  doctor,
   live,
   onStarted,
 }: {
   factory: FactorySummary;
+  doctor: FactoryDoctorReport | null;
   live: LiveAgent[];
   onStarted: () => void;
 }) {
@@ -549,7 +606,7 @@ function AgentsStrip({
     .sort((a, b) => b.thread.latestAttentionAt - a.thread.latestAttentionAt);
   return (
     <section aria-label="Agents" className="flex gap-2 overflow-x-auto pb-1">
-      {lead === null ? <StartLead factory={factory} onStarted={onStarted} /> : <AgentCard entry={lead} />}
+      {lead === null ? <StartLead factory={factory} doctor={doctor} onStarted={onStarted} /> : <AgentCard entry={lead} />}
       {workers.map((entry) => (
         <AgentCard key={entry.agent.threadId} entry={entry} />
       ))}
@@ -605,17 +662,42 @@ function AgentProviderIcon({ providerId }: { providerId: string }) {
   );
 }
 
-function StartLead({ factory, onStarted }: { factory: FactorySummary; onStarted: () => void }) {
+function StartLead({
+  factory,
+  doctor,
+  onStarted,
+}: {
+  factory: FactorySummary;
+  doctor: FactoryDoctorReport | null;
+  onStarted: () => void;
+}) {
   const rpc = useRpc<typeof rpcContract>();
   const navigate = useBbNavigate();
   const [goal, setGoal] = useState("");
+  const [projectMode, setProjectMode] = useState<ProjectMode>(factory.projectMode ?? "auto");
+  const missingAnySpec =
+    doctor !== null &&
+    (doctor.files.agentsMd === null ||
+      doctor.files.constitution === null ||
+      doctor.files.specs === null ||
+      doctor.files.roadmap === null);
+  const [initSpecs, setInitSpecs] = useState(true);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  const effectiveMode =
+    projectMode === "auto" ? (doctor?.detectedMode ?? "greenfield") : projectMode;
+
   const start = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     setPending(true);
     try {
-      const { threadId } = await rpc.call("lead_start", { prefix: factory.prefix, goal: goal.trim() || null });
+      const { threadId } = await rpc.call("lead_start", {
+        prefix: factory.prefix,
+        goal: goal.trim() || null,
+        projectMode,
+        initSpecs: initSpecs && (missingAnySpec || doctor === null),
+      });
       onStarted();
       navigate.toThread(threadId, { split: true });
     } catch (cause) {
@@ -627,26 +709,430 @@ function StartLead({ factory, onStarted }: { factory: FactorySummary; onStarted:
   return (
     <form
       onSubmit={start}
-      className="flex w-full max-w-xl shrink-0 flex-col gap-2 rounded-lg border border-primary/40 bg-card p-3"
+      className="flex w-full max-w-2xl shrink-0 flex-col gap-2.5 rounded-lg border border-primary/40 bg-card p-3.5"
     >
-      <div className="text-sm font-medium">Start the Lead</div>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="text-sm font-medium">Start the Lead · Guided Setup</div>
+        {doctor === null ? null : (
+          <span className="inline-flex items-center gap-1.5 rounded-full border border-border bg-muted/40 px-2.5 py-0.5 text-[11px] font-medium">
+            <span
+              className={cn(
+                "size-1.5 rounded-full",
+                effectiveMode === "greenfield" ? "bg-emerald-500" : "bg-sky-500",
+              )}
+            />
+            {effectiveMode === "greenfield"
+              ? "Greenfield (New Project)"
+              : `Brownfield (${doctor.commitCount} commits)`}
+          </span>
+        )}
+      </div>
       <p className="text-xs text-muted-foreground">
-        The Lead turns what you want into tasks and runs the specialists in {factory.bbProjectName}.
+        {effectiveMode === "greenfield"
+          ? `Greenfield mode: the Lead will help you lock the project Constitution, PRD, Architecture, and Milestone 1 tasks in ${factory.bbProjectName} before spawning Builders.`
+          : `Brownfield mode: the Lead will audit existing docs and board state in ${factory.bbProjectName}, align agents on the Constitution, and report where we are at and the next step.`}
       </p>
+      <div className="grid gap-2 sm:grid-cols-[13rem_1fr]">
+        <label className="block space-y-1 text-xs">
+          <span className="font-medium text-muted-foreground">Project type</span>
+          <select
+            value={projectMode}
+            onChange={(event) => setProjectMode(event.target.value as ProjectMode)}
+            className="h-8 w-full rounded-md border border-input bg-transparent px-2 text-xs"
+            aria-label="Project type"
+          >
+            <option value="auto">
+              Auto-detect ({doctor?.detectedMode ?? "detecting…"})
+            </option>
+            <option value="greenfield">Greenfield — New project</option>
+            <option value="brownfield">Brownfield — Existing codebase</option>
+          </select>
+        </label>
+        {doctor === null ? null : (
+          <div className="space-y-1 text-xs">
+            <span className="font-medium text-muted-foreground">Spec-Driven alignment files</span>
+            <div className="flex flex-wrap gap-1 pt-0.5">
+              <SpecPill label="AGENTS.md" path={doctor.files.agentsMd} />
+              <SpecPill label="Constitution" path={doctor.files.constitution} />
+              <SpecPill label="Architecture/Spec" path={doctor.files.specs} />
+              <SpecPill label="Roadmap" path={doctor.files.roadmap} />
+            </div>
+          </div>
+        )}
+      </div>
+      {missingAnySpec ? (
+        <label className="flex items-start gap-2 rounded-md border border-border bg-muted/20 px-2.5 py-2 text-xs">
+          <Checkbox checked={initSpecs} onCheckedChange={(value) => setInitSpecs(value === true)} />
+          <span>
+            Scaffold missing Spec-Driven files (<code className="font-mono">AGENTS.md</code>,{" "}
+            <code className="font-mono">.specify/memory/constitution.md</code>,{" "}
+            <code className="font-mono">docs/</code>) before starting (preserves all existing files)
+          </span>
+        </label>
+      ) : null}
       <div className="flex gap-2">
         <Input
           value={goal}
           onChange={(event) => setGoal(event.target.value)}
-          placeholder="What should the factory build first? (optional)"
+          placeholder={
+            effectiveMode === "greenfield"
+              ? "What are we building? (optional — the Lead will guide you)"
+              : "What should the factory focus on next? (optional — leave blank for status & next-step audit)"
+          }
           aria-label="First goal"
         />
         <Button type="submit" disabled={pending}>
           <Icon name="Play" className="size-4" />
-          Start
+          {pending ? "Starting…" : "Start"}
         </Button>
       </div>
       {error === null ? null : <p className="text-xs text-destructive">{error}</p>}
     </form>
+  );
+}
+
+function SpecPill({ label, path }: { label: string; path: string | null }) {
+  return (
+    <span
+      className={cn(
+        "inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10px]",
+        path !== null
+          ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
+          : "border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300",
+      )}
+      title={path !== null ? `Present: ${path}` : `${label} is missing`}
+    >
+      <span>{path !== null ? "✓" : "!"}</span>
+      <span>{label}</span>
+    </span>
+  );
+}
+
+function AlignmentBar({ doctor, onOpen }: { doctor: FactoryDoctorReport; onOpen: () => void }) {
+  const specCount = [
+    doctor.files.agentsMd,
+    doctor.files.constitution,
+    doctor.files.specs,
+    doctor.files.roadmap,
+  ].filter((f) => f !== null).length;
+  const boardIssues =
+    doctor.boardHealth.mergedPrsStillOpenTasks.length +
+    doctor.boardHealth.inProgressWithoutLiveWorker.length;
+  const needsAttention = specCount < 4 || boardIssues > 0;
+  return (
+    <button
+      type="button"
+      onClick={onOpen}
+      className={cn(
+        "inline-flex items-center gap-2 rounded-md border px-2.5 py-1 text-xs transition-colors hover:bg-state-hover",
+        needsAttention ? "border-amber-500/50 bg-amber-500/10 text-foreground" : "border-border bg-card text-muted-foreground",
+      )}
+    >
+      <span
+        className={cn(
+          "size-2 rounded-full",
+          needsAttention ? "bg-amber-500" : "bg-emerald-500",
+        )}
+      />
+      <span className="font-medium capitalize">{doctor.effectiveMode}</span>
+      <span className="text-muted-foreground">·</span>
+      <span>Specs {specCount}/4</span>
+      {boardIssues > 0 ? (
+        <>
+          <span className="text-muted-foreground">·</span>
+          <span className="font-medium text-amber-600 dark:text-amber-400">
+            {boardIssues} stalled/merged task{boardIssues === 1 ? "" : "s"}
+          </span>
+        </>
+      ) : null}
+    </button>
+  );
+}
+
+function AlignmentDialog({
+  open,
+  doctor,
+  hasLead,
+  onClose,
+  onUpdated,
+}: {
+  open: boolean;
+  doctor: FactoryDoctorReport | null;
+  hasLead: boolean;
+  onClose: () => void;
+  onUpdated: (doctor: FactoryDoctorReport) => void;
+}) {
+  const rpc = useRpc<typeof rpcContract>();
+  const [pendingAction, setPendingAction] = useState<string | null>(null);
+  const [statusNote, setStatusNote] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!open) {
+      setStatusNote(null);
+      setError(null);
+    }
+  }, [open]);
+
+  if (doctor === null) return null;
+
+  const missingAnySpec =
+    doctor.files.agentsMd === null ||
+    doctor.files.constitution === null ||
+    doctor.files.specs === null ||
+    doctor.files.roadmap === null;
+
+  const changeMode = async (projectMode: ProjectMode) => {
+    setPendingAction("mode");
+    setError(null);
+    try {
+      const updated = await rpc.call("factory_set_mode", { prefix: doctor.prefix, projectMode });
+      onUpdated(updated);
+    } catch (cause) {
+      setError(errorText(cause));
+    } finally {
+      setPendingAction(null);
+    }
+  };
+
+  const initSpecs = async () => {
+    setPendingAction("init-specs");
+    setError(null);
+    try {
+      const result = await rpc.call("factory_init_specs", { prefix: doctor.prefix });
+      onUpdated(result.doctor);
+      setStatusNote(
+        result.created.length > 0
+          ? `Created ${result.created.join(", ")} (existing files preserved).`
+          : "All Spec-Driven alignment files are already present.",
+      );
+    } catch (cause) {
+      setError(errorText(cause));
+    } finally {
+      setPendingAction(null);
+    }
+  };
+
+  const reconcile = async (notifyLead: boolean) => {
+    setPendingAction(notifyLead ? "reconcile-notify" : "reconcile");
+    setError(null);
+    try {
+      const result = await rpc.call("factory_reconcile", { prefix: doctor.prefix, notifyLead });
+      onUpdated(result.doctor);
+      const parts: string[] = [];
+      if (result.reconciledMoveToDone.length > 0) {
+        parts.push(`Moved ${result.reconciledMoveToDone.join(", ")} to Done.`);
+      } else {
+        parts.push("No open tasks had already-merged PRs.");
+      }
+      if (result.leadNotified) {
+        parts.push("Sent an alignment & status check-in to the Lead thread.");
+      }
+      setStatusNote(parts.join(" "));
+    } catch (cause) {
+      setError(errorText(cause));
+    } finally {
+      setPendingAction(null);
+    }
+  };
+
+  return (
+    <Dialog open={open} onOpenChange={(next) => (next ? undefined : onClose())}>
+      <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-2xl">
+        <DialogHeader>
+          <DialogTitle>
+            Project Alignment & Factory Doctor · {doctor.factoryName} ({doctor.prefix})
+          </DialogTitle>
+          <DialogDescription>
+            Spec-Driven Development guardrails, Greenfield/Brownfield mode, and board health diagnostics.
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="grid gap-3 rounded-md border border-border bg-muted/20 p-3 sm:grid-cols-2">
+          <label className="block space-y-1 text-xs">
+            <span className="font-medium text-muted-foreground">Project Mode</span>
+            <select
+              value={doctor.configuredMode}
+              disabled={pendingAction !== null}
+              onChange={(event) => void changeMode(event.target.value as ProjectMode)}
+              className="h-8 w-full rounded-md border border-input bg-background px-2 text-xs"
+            >
+              <option value="auto">
+                Auto-detect ({doctor.detectedMode} · {doctor.commitCount} commits)
+              </option>
+              <option value="greenfield">Greenfield — New project</option>
+              <option value="brownfield">Brownfield — Existing codebase</option>
+            </select>
+          </label>
+          <div className="space-y-1 text-xs">
+            <div className="font-medium text-muted-foreground">Checkout & Mode Summary</div>
+            <div className="truncate font-mono text-[11px]">{doctor.projectPath ?? "No local path"}</div>
+            <div className="text-muted-foreground">
+              Effective mode: <strong className="capitalize text-foreground">{doctor.effectiveMode}</strong> ({doctor.commitCount} commits)
+            </div>
+          </div>
+        </div>
+
+        <div className="space-y-2">
+          <div className="flex items-center justify-between">
+            <div className="text-xs font-medium text-muted-foreground">
+              1. Spec-Driven Alignment Files (Living Repo Truth)
+            </div>
+            {missingAnySpec ? (
+              <Button
+                size="sm"
+                variant="secondary"
+                disabled={pendingAction !== null}
+                onClick={() => void initSpecs()}
+              >
+                {pendingAction === "init-specs" ? "Scaffolding…" : "Scaffold Missing Spec Files"}
+              </Button>
+            ) : null}
+          </div>
+          <div className="grid gap-2 text-xs sm:grid-cols-2">
+            <div className="rounded-md border border-border p-2.5">
+              <div className="flex items-center justify-between font-medium">
+                <span>Agent Router (AGENTS.md)</span>
+                <SpecPill label="AGENTS.md" path={doctor.files.agentsMd} />
+              </div>
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                Routes Lead, Planner, Builders, and Reviewers to the canonical specs and workflow rules.
+              </p>
+            </div>
+            <div className="rounded-md border border-border p-2.5">
+              <div className="flex items-center justify-between font-medium">
+                <span>Project Constitution</span>
+                <SpecPill label="Constitution" path={doctor.files.constitution} />
+              </div>
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                Immutable architectural principles and Spec-Bound PR Review Convergence rules (<code className="font-mono">.specify/memory/constitution.md</code>).
+              </p>
+            </div>
+            <div className="rounded-md border border-border p-2.5">
+              <div className="flex items-center justify-between font-medium">
+                <span>Living Architecture & Specs</span>
+                <SpecPill label="Specs" path={doctor.files.specs} />
+              </div>
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                Canonical system architecture and domain contracts (<code className="font-mono">{doctor.files.specs ?? "docs/architecture.md"}</code>).
+              </p>
+            </div>
+            <div className="rounded-md border border-border p-2.5">
+              <div className="flex items-center justify-between font-medium">
+                <span>Milestone & Gate Roadmap</span>
+                <SpecPill label="Roadmap" path={doctor.files.roadmap} />
+              </div>
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                Tracks active milestones, gates, and what comes next (<code className="font-mono">{doctor.files.roadmap ?? "docs/roadmap.md"}</code>).
+              </p>
+            </div>
+          </div>
+        </div>
+
+        <div className="space-y-2">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="text-xs font-medium text-muted-foreground">
+              2. Board & Agent Health Diagnostics
+            </div>
+            <div className="flex flex-wrap gap-1.5">
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={pendingAction !== null}
+                onClick={() => void reconcile(false)}
+              >
+                {pendingAction === "reconcile" ? "Reconciling…" : "Reconcile Merged PRs"}
+              </Button>
+              {hasLead ? (
+                <Button
+                  size="sm"
+                  variant="default"
+                  disabled={pendingAction !== null}
+                  onClick={() => void reconcile(true)}
+                >
+                  {pendingAction === "reconcile-notify"
+                    ? "Notifying Lead…"
+                    : "Reconcile & Ask Lead for Status"}
+                </Button>
+              ) : null}
+            </div>
+          </div>
+
+          <div className="space-y-1.5 rounded-md border border-border p-3 text-xs">
+            <div>
+              <span className="font-medium">Merged PRs still open on board: </span>
+              {doctor.boardHealth.mergedPrsStillOpenTasks.length === 0 ? (
+                <span className="text-emerald-600 dark:text-emerald-400">None ✓</span>
+              ) : (
+                <span className="text-amber-600 dark:text-amber-400">
+                  {doctor.boardHealth.mergedPrsStillOpenTasks
+                    .map((t) => `${t.taskKey} (PR #${t.pr})`)
+                    .join(", ")}
+                </span>
+              )}
+            </div>
+            <div>
+              <span className="font-medium">In-Progress tasks with no active worker thread: </span>
+              {doctor.boardHealth.inProgressWithoutLiveWorker.length === 0 ? (
+                <span className="text-emerald-600 dark:text-emerald-400">None ✓</span>
+              ) : (
+                <span className="text-amber-600 dark:text-amber-400">
+                  {doctor.boardHealth.inProgressWithoutLiveWorker
+                    .map((t) => `${t.taskKey} (${t.lastRoles.join("/") || "no agent"})`)
+                    .join(", ")}
+                </span>
+              )}
+            </div>
+            <div>
+              <span className="font-medium">READY plans awaiting Builder or completion: </span>
+              {doctor.boardHealth.readyPlansAwaitingBuilder.length === 0 ? (
+                <span className="text-muted-foreground">None</span>
+              ) : (
+                <span>
+                  {doctor.boardHealth.readyPlansAwaitingBuilder
+                    .map((t) => `${t.taskKey} (${t.title})`)
+                    .join(", ")}
+                </span>
+              )}
+            </div>
+            <div>
+              <span className="font-medium">Open PRs in flight: </span>
+              {doctor.boardHealth.openPrsAwaitingAction.length === 0 ? (
+                <span className="text-muted-foreground">None</span>
+              ) : (
+                <span>
+                  {doctor.boardHealth.openPrsAwaitingAction
+                    .map((t) => `${t.taskKey} PR #${t.pr} (${t.summary})`)
+                    .join(" · ")}
+                </span>
+              )}
+            </div>
+          </div>
+        </div>
+
+        <div className="space-y-1.5">
+          <div className="text-xs font-medium text-muted-foreground">3. Recommended Actions</div>
+          {doctor.recommendedActions.map((action) => (
+            <div key={action.id} className="rounded-md border border-border bg-muted/30 p-2.5 text-xs">
+              <div className="font-medium">{action.title}</div>
+              <p className="mt-0.5 text-muted-foreground">{action.detail}</p>
+              {action.command === null ? null : (
+                <code className="mt-1 block rounded bg-background px-2 py-1 font-mono text-[11px]">
+                  {action.command}
+                </code>
+              )}
+            </div>
+          ))}
+        </div>
+
+        {statusNote === null ? null : (
+          <p className="rounded-md border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-700 dark:text-emerald-300">
+            {statusNote}
+          </p>
+        )}
+        {error === null ? null : <Alert>{error}</Alert>}
+      </DialogContent>
+    </Dialog>
   );
 }
 
@@ -1099,6 +1585,9 @@ function CreateFactory({
   const [projectId, setProjectId] = useState("");
   const [prefix, setPrefix] = useState("");
   const [name, setName] = useState("");
+  const [projectMode, setProjectMode] = useState<ProjectMode>("auto");
+  const [initSpecs, setInitSpecs] = useState(true);
+  const [inspected, setInspected] = useState<(RepoInspection & { projectPath: string | null }) | null>(null);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -1109,7 +1598,24 @@ function CreateFactory({
     );
   }, [rpc]);
 
+  useEffect(() => {
+    setInspected(null);
+    if (projectId === "") return;
+    let cancelled = false;
+    rpc.call("project_inspect", { bbProjectId: projectId }).then(
+      (result) => {
+        if (!cancelled) setInspected(result);
+      },
+      () => undefined,
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [rpc, projectId]);
+
   const project = projects?.find((candidate) => candidate.id === projectId) ?? null;
+  const effectiveMode =
+    projectMode === "auto" ? (inspected?.detectedMode ?? "greenfield") : projectMode;
   const create = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (project === null) return;
@@ -1120,6 +1626,8 @@ function CreateFactory({
         bbProjectId: project.id,
         prefix: prefix.trim().toUpperCase(),
         name: name.trim() || project.name,
+        projectMode,
+        initSpecs,
       });
       onCreated(created.prefix);
     } catch (cause) {
@@ -1134,8 +1642,8 @@ function CreateFactory({
       <div>
         <h2 className="text-base font-semibold">New software factory</h2>
         <p className="mt-1 text-sm text-muted-foreground">
-          A factory gives one project a Lead agent, specialist agents (builder, QA, designer, two reviewers) and its
-          own task board.
+          A factory gives one project a Lead agent, specialist agents (planner, builder, QA, designer, reviewers),
+          Spec-Driven alignment files, and its own task board.
         </p>
       </div>
       <label className="block space-y-1 text-sm">
@@ -1182,6 +1690,57 @@ function CreateFactory({
           />
         </label>
       </div>
+      {project === null ? null : (
+        <div className="space-y-3 rounded-lg border border-border bg-muted/20 p-3 text-sm">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <span className="font-medium">Project Alignment & Type</span>
+            {inspected === null ? (
+              <span className="text-xs text-muted-foreground">Inspecting repository…</span>
+            ) : (
+              <span className="inline-flex items-center gap-1.5 rounded-full border border-border bg-background px-2.5 py-0.5 text-xs font-medium">
+                <span
+                  className={cn(
+                    "size-2 rounded-full",
+                    effectiveMode === "greenfield" ? "bg-emerald-500" : "bg-sky-500",
+                  )}
+                />
+                Detected: {inspected.detectedMode === "greenfield" ? "Greenfield" : `Brownfield (${inspected.commitCount} commits)`}
+              </span>
+            )}
+          </div>
+          <label className="block space-y-1 text-xs">
+            <span className="font-medium text-muted-foreground">How should the Factory treat this project?</span>
+            <select
+              value={projectMode}
+              onChange={(event) => setProjectMode(event.target.value as ProjectMode)}
+              className="h-8 w-full rounded-md border border-input bg-background px-2.5 text-xs"
+            >
+              <option value="auto">
+                Auto-detect ({inspected?.detectedMode ?? "greenfield"})
+              </option>
+              <option value="greenfield">Greenfield — New project (shape PRD, Constitution & Milestone 1 first)</option>
+              <option value="brownfield">Brownfield — Existing codebase (audit current state, specs & board first)</option>
+            </select>
+          </label>
+          {inspected === null ? null : (
+            <div className="flex flex-wrap gap-1.5">
+              <SpecPill label="AGENTS.md" path={inspected.files.agentsMd} />
+              <SpecPill label="Constitution" path={inspected.files.constitution} />
+              <SpecPill label="Architecture/Spec" path={inspected.files.specs} />
+              <SpecPill label="Roadmap" path={inspected.files.roadmap} />
+            </div>
+          )}
+          <label className="flex items-start gap-2 text-xs">
+            <Checkbox checked={initSpecs} onCheckedChange={(value) => setInitSpecs(value === true)} />
+            <span>
+              Scaffold missing Spec-Driven alignment files (<code className="font-mono">AGENTS.md</code>,{" "}
+              <code className="font-mono">.specify/memory/constitution.md</code>,{" "}
+              <code className="font-mono">docs/architecture.md</code>,{" "}
+              <code className="font-mono">docs/roadmap.md</code>) without overwriting existing files
+            </span>
+          </label>
+        </div>
+      )}
       {error === null ? null : <Alert>{error}</Alert>}
       <div className="flex gap-2">
         <Button type="submit" disabled={pending || project === null || prefix.trim() === ""}>
