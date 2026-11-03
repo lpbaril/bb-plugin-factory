@@ -78,6 +78,28 @@ needed. Do not paste full plans or logs into the Lead thread, or poll active wor
    merge-train note so it can suggest an order. The person merges; the factory
    then moves the task to Done.
 
+## Recurring review findings
+
+Reviewers (not the shadow): when a repository rule would have prevented a blocking
+finding, and it is not a one-off bug, check `bb factory lessons APP`. If one matches,
+run `bb factory lesson APP-12 --same-as <id>`; otherwise run
+`bb factory lesson APP-12 --rule "<one imperative sentence>"`. If `AGENTS.md` or the
+Constitution already states the rule, cite it in the finding instead.
+
+On a second task, the factory sends the Lead one `[factory]` message. The Lead creates
+one task and assigns the Planner, who checks the rule against the cited PRs and names
+the document and wording. A Builder makes the docs-only PR and the person decides
+whether to merge. Never add the rule directly or hold the current PR for it.
+
+## Run ledger and nightly check
+
+`bb factory runs APP` shows finished turns by role and model: outcomes, time, tokens
+and review verdicts. It records tokens, not money.
+
+A nightly check updates the ledger, moves merged tasks to Done and looks for stalled
+work. A nightly `[factory]` message is a report: triage it and tell the person, and
+don't start new agents from it unless they already asked.
+
 ## Keeping CI costs down
 
 Every push to a PR branch re-runs the repo's CI and the re-reviewers, so the
@@ -108,6 +130,9 @@ skip docs-only changes. PRs stay drafts until every reviewer approves, so
 | `bb factory assign APP-12 --role review1\|review2\|security --pr N` | Replace a reviewer that failed (dead provider, removed model) with a fresh one on the current roster, reviewing that PR. Retrying the old thread keeps the model it was spawned with, so it cannot recover from a provider that ran out. |
 | `bb factory plan-ready APP-12 --comment <id>` | Current Planner only: validate its READY planning comment and allow Builder assignments. |
 | `bb factory verdict APP-12 --role review1\|review2\|security\|shadow --verdict approve\|changes [--pr N]` | Record a reviewer's verdict on the task's PR, after posting it (as a PR comment; the shadow reviewer posts a task comment). Only the reviewer thread the factory started can record it. |
+| `bb factory lesson APP-12 --rule "..."\|--same-as <id>` | Task's reviewers only: record a blocking finding a repository rule would have prevented. |
+| `bb factory lessons APP` | List the factory's recurring review findings and their tasks. |
+| `bb factory runs APP [--task APP-12] [--sync]` | Show finished agent turns by role and model. `--sync` first reads every agent thread, including older ones. |
 | `bb factory dismiss APP-12 --reason "..."` | Dismiss the shadow Security reviewer's REQUEST CHANGES. Only the task's Security reviewer can run this; the person can also dismiss from the task on the Factory page. |
 | `bb factory rafter check` | Check the Rafter API key and show the scan quota (never prints the key). |
 | `bb factory rafter scan APP-12` | Rescan the task's open PR with Rafter and hand the results to its Security reviewer. |
@@ -118,8 +143,8 @@ skip docs-only changes. PRs stay drafts until every reviewer approves, so
 | `bb factory unblock APP-12 [--note "..."]` | Clear Blocked. |
 | `bb factory status [APP]` | Print the board, the agents on each task, and each task's branch or PR with its verdicts. |
 
-Add `--json` to `list`, `create`, `start`, `assign` and `status` when the
-output drives code.
+Add `--json` to `list`, `create`, `start`, `assign`, `status`, `runs` and `lessons`
+when the output drives code.
 
 Tasks themselves are managed with `bb tasks` (`create`, `show`, `update
 --status`, `comment`, `attach`). The prefix of a task key names its factory.

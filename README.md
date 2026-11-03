@@ -48,6 +48,7 @@ Settings → Plugins → Factory, or `bb plugin config factory`:
   mark its task Blocked and tell the Lead. Overloads, rate limits, server errors
   and connection failures belong exclusively to bb's Provider retry plugin,
   including when its retry budget is exhausted or that plugin is disabled.
+- **Run a nightly check** (on by default): see [Nightly check](#nightly-check).
 
 Requires bb 0.47 or newer. New workers explicitly report their outcomes to the
 Lead; shadow reviewers have parent notifications turned off. Existing threads
@@ -81,6 +82,51 @@ and product decisions to you. It cannot waive review gates. New PR reviewers
 send parent notifications only when stuck; Factory reports the complete review
 round and alerts when a reviewer finishes without recording a verdict. Existing
 reviewer threads retain their notification settings.
+
+## Run ledger
+
+Factory records every finished turn of every factory agent: its task, role,
+provider, model, reasoning level, outcome and duration, plus token use. Open
+**Runs** on the Factory page, or run `bb factory runs APP [--task APP-12] [--json]`.
+The report groups turns by role and model, and joins review verdicts to the model
+that gave them, so you can compare reviewers on real results.
+
+- **Tokens, not money.** The ledger stores tokens because none of the Claude Code,
+  Codex and Cursor threads checked while building it reported a cost. "New input"
+  is total minus cached and output, because providers count cached input differently;
+  it is the number that compares across providers.
+- **Token attribution.** bb keeps little per-turn token history, so a thread's
+  growth is credited to its newest finished turn. Totals are right per thread and
+  per task; a single turn's figure can include earlier turns. Providers that report
+  no usage show zero.
+- **Backfill.** Threads older than the ledger are read by the nightly check, or on
+  demand with `bb factory runs APP --sync`.
+- **Storage.** The rows live in the plugin database and are never pruned while the
+  factory exists. Deleting a factory deletes its ledger.
+
+## Recurring review findings
+
+When a reviewer blocks on something a repository rule would have prevented, it
+records a lesson with `bb factory lesson APP-12 --rule "..."`, or `--same-as <id>`
+if `bb factory lessons APP` already lists it. Only that task's Reviewer 1, Reviewer 2
+or Security thread can do this.
+
+When the same lesson appears on a second task, the factory tells the Lead once. The
+Lead creates a task and assigns the Planner, who checks the rule against the cited
+PRs and names the document and wording. A Builder makes the docs-only PR, which goes
+through normal review, and you decide whether to merge it. The rule never reaches
+the repository without that PR.
+
+## Nightly check
+
+At 3:00 server time, for each factory that isn't archived, Factory reads new turns
+into the ledger, moves tasks with merged PRs to Done, and looks for In-Progress
+tasks with no live worker and READY plans waiting for a Builder. It runs only while
+bb is running, and a failure shows in `bb plugin list`.
+
+The Lead is woken only when one of those findings is new since the last check, and
+it is told to report rather than start agents. A finding that stays unresolved does
+not wake it again until it clears and comes back.
 
 ## Storage and recovery
 
@@ -116,14 +162,17 @@ For local recovery without automatic GitHub actions, run
 ```sh
 npm install
 npx tsc --noEmit -p .
+node --test factory-storage.test.mjs server.test.mjs host.test.mjs
 bb plugin install .   # registers this directory in place
 bb plugin dev         # rebuilds and reloads on save
 ```
 
-- `factory-storage.ts`: transactional database storage and legacy KV migration.
+- `factory-storage.ts`: transactional database storage, legacy KV migration, the
+  run ledger and lessons.
 - `server.ts`: the `bb factory` CLI, the page's RPC, the board
   change feed, and the pull request flow (watcher, verdicts, Rafter, ready gate,
-  shadow trial), the per-turn role instructions and the failed-turn supervisor.
+  shadow trial), the per-turn role instructions, the failed-turn supervisor, the
+  run ledger, lessons and the nightly check.
   Tasks are read and moved through the built-in Tasks plugin's RPC.
 - `host.ts` and `host-contract.ts`: the host worker that runs the allowlisted
   `gh pr` commands and saves Rafter reports.

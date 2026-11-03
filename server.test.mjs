@@ -10,7 +10,8 @@ registerHooks({ resolve(specifier, context, next) {
   }
   return next(specifier, context);
 } });
-const { default: plugin, supervisorAction } = await import('./server.ts');
+const { default: plugin, supervisorAction, turnsFromEvents } = await import('./server.ts');
+const { leadCharter, workerReminder } = await import('./roles.ts');
 const { createFactoryStorage } = await import('./factory-storage.ts');
 
 const failure = (category, httpStatusCode = null, attemptNumber = 1) =>
@@ -425,4 +426,245 @@ test('startLead injects Greenfield or Brownfield playbook and optional spec scaf
   assert.equal(spawns.length, 1);
   assert.match(spawns[0].prompt, /Greenfield Onboarding Playbook/);
   assert.match(spawns[0].prompt, /constitution\.md/);
+});
+
+// ----- Run ledger -----
+
+const requested = (seq, model = 'gpt-test') => ({ seq, type: 'client/turn/requested', createdAt: seq * 1000, data: { execution: { model, reasoningLevel: 'high' } } });
+const started = seq => ({ seq, type: 'turn/started', createdAt: seq * 1000, data: {} });
+const completed = (seq, status = 'completed', error) => ({ seq, type: 'turn/completed', createdAt: seq * 1000, data: { status, ...(error ? { error: { message: error } } : {}) } });
+const usage = (seq, totalTokens, cachedInputTokens = 0, outputTokens = 0) => ({ seq, type: 'thread/tokenUsage/updated', createdAt: seq * 1000, data: { tokenUsage: { total: { totalTokens, cachedInputTokens, outputTokens } } } });
+/** Answers threads.events.list from a mutable log, honoring its filters and the real server's page limit. */
+const eventLog = events => ({
+  events: { list: async ({ afterSeq = '0', types, order, limit }) => {
+    if (limit !== undefined && Number(limit) > 100) throw new Error('Thread event limit cannot exceed 100');
+    let rows = events.filter(event => event.seq > Number(afterSeq) && (types === undefined || types.includes(event.type)));
+    if (order === 'desc') rows = [...rows].reverse();
+    return limit === undefined ? rows : rows.slice(0, Number(limit));
+  } },
+});
+
+test('turnsFromEvents records finished turns and leaves a running one unread', () => {
+  const finished = turnsFromEvents([requested(1, 'model-a'), started(2), completed(3), requested(4, 'model-b'), started(5)]);
+  assert.equal(finished.closedSeq, 3);
+  assert.deepEqual(finished.turns, [{ startedAt: 2000, model: 'model-a', reasoning: 'high', outcome: 'completed', error: null, endSeq: 3, endedAt: 3000 }]);
+});
+
+test('turnsFromEvents marks cut-off turns interrupted and failed turns failed', () => {
+  const cutOff = turnsFromEvents([started(1), requested(2), started(3), completed(4, 'failed', 'boom')]);
+  assert.deepEqual(cutOff.turns.map(turn => [turn.outcome, turn.endSeq, turn.error]), [['interrupted', 2, null], ['failed', 4, 'boom']]);
+  const open = turnsFromEvents([started(1), { seq: 2, type: 'client/turn/requested', createdAt: 2000, data: {} }], 'unauthorized');
+  assert.deepEqual(open.turns.map(turn => [turn.outcome, turn.error, turn.endSeq]), [['failed', 'unauthorized', 2]]);
+  assert.equal(open.closedSeq, 2);
+  assert.deepEqual(turnsFromEvents([], 'unauthorized'), { turns: [], closedSeq: null });
+});
+
+test('the ledger records each turn once and credits token growth to the newest turn', async t => {
+  const events = [requested(1), started(2), completed(3), requested(4), started(5), usage(6, 1000, 700, 100), completed(7)];
+  const { harness } = await fixture(t, false, {}, { threads: { ...eventLog(events) } });
+  const idle = { thread: makeThreadResponse({ id: 'thr_builder' }), lastAssistantText: null };
+  await harness.behavior.emitThreadEvent('thread.idle', idle);
+  await harness.behavior.emitThreadEvent('thread.idle', idle);
+  let report = await harness.behavior.callRpc('factory_runs', { prefix: 'TEST', taskKey: null });
+  assert.equal(report.recent.length, 2);
+  assert.deepEqual(report.recent.map(run => run.tokensTotal), [1000, null]);
+  assert.equal(report.groups[0].runs, 2);
+  assert.equal(report.groups[0].tokensCached, 700);
+
+  events.push(requested(8), started(9), usage(10, 1500, 900, 150), completed(11));
+  await harness.behavior.emitThreadEvent('thread.idle', idle);
+  report = await harness.behavior.callRpc('factory_runs', { prefix: 'TEST', taskKey: null });
+  assert.deepEqual(report.recent[0], { ...report.recent[0], tokensTotal: 500, tokensCached: 200, tokensOutput: 50, model: 'gpt-test', role: 'build', taskKey: 'TEST-1', outcome: 'completed' });
+  assert.equal(report.groups[0].tokensTotal, 1500);
+
+  // A provider session restart lowers the total; everything in the new session counts.
+  events.push(started(12), usage(13, 40, 0, 10), completed(14));
+  await harness.behavior.emitThreadEvent('thread.idle', idle);
+  report = await harness.behavior.callRpc('factory_runs', { prefix: 'TEST', taskKey: null });
+  assert.equal(report.recent[0].tokensTotal, 40);
+
+  assert.equal((await harness.behavior.callRpc('factory_runs', { prefix: 'TEST', taskKey: 'TEST-2' })).groups.length, 0);
+});
+
+test('the ledger pages through a thread longer than one page of events', async t => {
+  const events = [];
+  for (let turn = 0; turn < 120; turn++) events.push(started(turn * 2 + 1), completed(turn * 2 + 2));
+  const { harness } = await fixture(t, false, {}, { threads: { ...eventLog(events) } });
+  await harness.behavior.emitThreadEvent('thread.idle', { thread: makeThreadResponse({ id: 'thr_builder' }), lastAssistantText: null });
+  const { groups } = await harness.behavior.callRpc('factory_runs', { prefix: 'TEST', taskKey: null });
+  assert.equal(groups[0].runs, 120);
+});
+
+test('a failed turn lands in the ledger with its category, and a ledger error stays out of the way', async t => {
+  const { harness, failureEffects } = await fixture(t, false, {}, { threads: { ...eventLog([requested(1), started(2)]) } });
+  await harness.behavior.emitThreadEvent('turn.failed', { ...failure('connection-failed'), threadId: 'thr_builder' });
+  const report = await harness.behavior.callRpc('factory_runs', { prefix: 'TEST', taskKey: null });
+  assert.deepEqual(report.recent.map(run => [run.outcome, run.error]), [['failed', 'connection-failed']]);
+  assert.deepEqual(failureEffects, []);
+
+  const broken = await fixture(t, false, {}, { threads: { events: { list: async () => { throw new Error('events down'); } } } });
+  await broken.harness.behavior.emitThreadEvent('thread.idle', { thread: makeThreadResponse({ id: 'thr_builder' }), lastAssistantText: null });
+  assert.equal((await broken.harness.behavior.callRpc('factory_runs', { prefix: 'TEST', taskKey: null })).groups.length, 0);
+});
+
+test('runs --sync backfills threads and joins review verdicts to models', async t => {
+  const agents = [
+    { threadId: 'thr_r1', role: 'review1', taskKey: 'TEST-1', providerId: 'codex', createdAt: '', pr: 1 },
+    { threadId: 'thr_r2', role: 'review2', taskKey: 'TEST-1', providerId: 'claude-code', createdAt: '', pr: 1 },
+  ];
+  const prs = [{ number: 1, taskKey: 'TEST-1', url: 'https://example.org/1', headSha: 'abc', branch: 'b', state: 'open', isDraft: true, deep: true, readyRequested: false, openedAt: '', scans: [], reviews: [
+    { role: 'review1', threadId: 'thr_r1', sha: 'abc', verdict: 'pending', at: '' },
+    { role: 'review1', threadId: 'thr_r1', sha: 'abc', verdict: 'changes', at: '' },
+    { role: 'review1', threadId: 'thr_r1', sha: 'def', verdict: 'approve', at: '' },
+    { role: 'review2', threadId: 'thr_r2', sha: 'abc', verdict: 'approve', at: '' },
+  ] }];
+  const logs = { thr_r1: [requested(1, 'model-a'), started(2), usage(3, 90, 30, 10), completed(4)], thr_r2: [requested(1, 'model-b'), started(2), completed(3)] };
+  const { harness } = await fixture(t, false, { agents, prs }, { threads: { events: { list: args => eventLog(logs[args.threadId]).events.list(args) } } });
+  const empty = await harness.behavior.runCli(['runs', 'TEST']);
+  assert.match(empty.stdout, /--sync/);
+  const result = await harness.behavior.runCli(['runs', 'TEST', '--sync', '--json']);
+  assert.equal(result.exitCode, 0);
+  const groups = Object.fromEntries(JSON.parse(result.stdout).groups.map(group => [group.model, group]));
+  assert.deepEqual([groups['model-a'].approvals, groups['model-a'].changes, groups['model-a'].tokensTotal], [1, 1, 90]);
+  assert.deepEqual([groups['model-b'].approvals, groups['model-b'].changes, groups['model-b'].tokensTotal], [1, 0, 0]);
+  const text = await harness.behavior.runCli(['runs', 'TEST']);
+  assert.match(text.stdout, /Reviewer 1 on codex\/model-a: 1 turn\(s\), 0 failed, 0 interrupted, 0 min, 50 \/ 30 \/ 10, 1 approved, 1 changes requested/);
+});
+
+// ----- Recurring review findings -----
+
+const reviewers = [
+  { threadId: 'thr_r1', role: 'review1', taskKey: 'TEST-1', providerId: 'codex', createdAt: '', pr: 1 },
+  { threadId: 'thr_sec', role: 'security', taskKey: 'TEST-1', providerId: 'codex', createdAt: '', pr: 1 },
+  { threadId: 'thr_r2', role: 'review1', taskKey: 'TEST-2', providerId: 'codex', createdAt: '', pr: 2 },
+  { threadId: 'thr_shadow', role: 'shadow', taskKey: 'TEST-1', providerId: 'codex', createdAt: '', pr: 1 },
+  { threadId: 'thr_builder', role: 'build', taskKey: 'TEST-1', providerId: 'codex', createdAt: '', pr: null },
+];
+const twoTasks = { tasksRpc: async ({ method, input }) => method === 'getTaskByKey' ? { task: { id: input.taskKey, key: input.taskKey, projectId: 'tracker', title: 'T', description: '', status: 'in_review', priority: 'none', position: 0, labelIds: [], createdAt: '', updatedAt: '' } } : undefined };
+const RULE = 'Validate every path parameter before it reaches the filesystem.';
+
+test('only a reviewer of the task can record a lesson, with exactly one of --rule and --same-as', async t => {
+  const { harness } = await fixture(t, false, { agents: reviewers }, twoTasks);
+  for (const threadId of ['thr_builder', 'thr_shadow', 'thr_r2', undefined]) {
+    const denied = await harness.behavior.runCli(['lesson', 'TEST-1', '--rule', RULE], threadId === undefined ? {} : { threadId });
+    assert.notEqual(denied.exitCode, 0, String(threadId));
+    assert.match(denied.stderr, /Only a reviewer/);
+  }
+  const asReviewer = { threadId: 'thr_r1' };
+  assert.notEqual((await harness.behavior.runCli(['lesson', 'TEST-1'], asReviewer)).exitCode, 0);
+  assert.notEqual((await harness.behavior.runCli(['lesson', 'TEST-1', '--rule', RULE, '--same-as', '1'], asReviewer)).exitCode, 0);
+  assert.notEqual((await harness.behavior.runCli(['lesson', 'TEST-1', '--rule', 'short'], asReviewer)).exitCode, 0);
+  assert.notEqual((await harness.behavior.runCli(['lesson', 'TEST-1', '--same-as', '99'], asReviewer)).exitCode, 0);
+  assert.equal((await harness.behavior.runCli(['lessons', 'TEST'])).stdout, 'No lessons recorded for TEST.');
+});
+
+test('a lesson reaches the Lead once, when a second task repeats it', async t => {
+  const { harness, messages } = await fixture(t, false, { agents: reviewers }, { ...twoTasks, threads: { get: async () => makeThreadResponse({ id: 'thr_lead' }) } });
+  const first = await harness.behavior.runCli(['lesson', 'TEST-1', '--rule', `  ${RULE}\n`], { threadId: 'thr_r1' });
+  assert.equal(first.exitCode, 0, first.stderr);
+  const listed = JSON.parse((await harness.behavior.runCli(['lessons', 'TEST', '--json'])).stdout);
+  assert.deepEqual(listed.map(lesson => [lesson.rule, lesson.tasks, lesson.notifiedAt]), [[RULE, ['TEST-1'], null]]);
+  const id = String(listed[0].id);
+
+  // A second reviewer on the same task is still one task.
+  await harness.behavior.runCli(['lesson', 'TEST-1', '--same-as', id], { threadId: 'thr_sec' });
+  assert.equal(messages.length, 0);
+
+  await harness.behavior.runCli(['lesson', 'TEST-2', '--same-as', id], { threadId: 'thr_r2' });
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0].threadId, 'thr_lead');
+  assert.match(messages[0].input[0].text, /Recurring review finding.*TEST-1 and TEST-2.*assign the Planner/s);
+  assert.ok(messages[0].input[0].text.includes(JSON.stringify(RULE)));
+
+  await harness.behavior.runCli(['lesson', 'TEST-2', '--same-as', id], { threadId: 'thr_r2' });
+  assert.equal(messages.length, 1);
+  assert.match((await harness.behavior.runCli(['lessons', 'TEST'])).stdout, /\[reported to the Lead\]/);
+});
+
+test('a lesson the Lead could not receive is reported on its next hit', async t => {
+  let leadUp = false;
+  const { harness, messages } = await fixture(t, false, { agents: reviewers }, { ...twoTasks, threads: { get: async () => { if (!leadUp) throw new Error('down'); return makeThreadResponse({ id: 'thr_lead' }); } } });
+  await harness.behavior.runCli(['lesson', 'TEST-1', '--rule', RULE], { threadId: 'thr_r1' });
+  await harness.behavior.runCli(['lesson', 'TEST-2', '--same-as', '1'], { threadId: 'thr_r2' });
+  assert.equal(messages.length, 0);
+  leadUp = true;
+  await harness.behavior.runCli(['lesson', 'TEST-2', '--same-as', '1'], { threadId: 'thr_r2' });
+  assert.equal(messages.length, 1);
+});
+
+test('reviewer prompts and standing rules teach lessons; the shadow stays out', () => {
+  for (const role of ['review1', 'review2', 'security']) {
+    assert.match(workerReminder({ role, factoryName: 'F', taskKey: 'T-1' }), /bb factory lesson/);
+  }
+  assert.doesNotMatch(workerReminder({ role: 'shadow', factoryName: 'F', taskKey: 'T-1' }), /lesson/);
+  assert.match(leadCharter({ factoryName: 'F', prefix: 'T' }), /recurring review finding/);
+});
+
+// ----- Nightly check -----
+
+const nightlyHost = async ({ method }) => {
+  if (method === 'inspect_repo') return { exists: true, isGitRepo: true, commitCount: 1, sourceDirs: [], detectedMode: 'brownfield', files: { agentsMd: 'AGENTS.md', constitution: 'c.md', specs: 'a.md', roadmap: 'r.md' }, existingDocs: [] };
+  throw new Error(`Unexpected host call: ${method}`);
+};
+const boardTask = (key, status) => ({ id: key, key, projectId: 'tracker', title: key, description: '', status, priority: 'none', position: 0, labelIds: [], createdAt: '', updatedAt: '' });
+
+function nightlyFixture(t, tasks, initial = {}, overrides = {}) {
+  const moved = [];
+  return fixture(t, false, initial, {
+    projectPath: '/repo',
+    hostRpc: nightlyHost,
+    threads: { get: async ({ threadId }) => makeThreadResponse({ id: threadId, status: 'idle' }), ...eventLog([requested(1), started(2), completed(3)]), ...overrides.threads },
+    tasksRpc: async ({ method, input }) => {
+      if (method === 'listTasks') return { tasks: tasks() };
+      if (method === 'getTask') return { task: boardTask(input.taskId, 'in_review') };
+      if (method === 'boardMove') { moved.push([input.taskId, input.status]); return { ok: true, task: boardTask(input.taskId, input.status) }; }
+      return undefined;
+    },
+  }).then(result => ({ ...result, moved }));
+}
+
+test('the nightly check wakes the Lead once per new finding and fills the ledger', async t => {
+  let tasks = [boardTask('TEST-1', 'in_progress')];
+  const { harness, messages } = await nightlyFixture(t, () => tasks);
+  await harness.runSchedule('nightly-check');
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0].threadId, 'thr_lead');
+  assert.match(messages[0].input[0].text, /no active worker thread: TEST-1/);
+  assert.match(messages[0].input[0].text, /don't start new agents/);
+  assert.equal((await harness.behavior.callRpc('factory_runs', { prefix: 'TEST', taskKey: null })).recent.length, 1);
+
+  await harness.runSchedule('nightly-check');
+  assert.equal(messages.length, 1, 'the same finding stays quiet');
+
+  tasks = [boardTask('TEST-1', 'in_review')];
+  await harness.runSchedule('nightly-check');
+  assert.equal(messages.length, 1, 'nothing to report');
+
+  tasks = [boardTask('TEST-1', 'in_progress')];
+  await harness.runSchedule('nightly-check');
+  assert.equal(messages.length, 2, 'a finding that came back is new again');
+});
+
+test('the nightly check moves merged tasks without waking the Lead, and skips archived factories', async t => {
+  const pr = { number: 1, taskKey: 'TEST-1', url: 'https://example.org/1', headSha: 'abc', branch: 'b', state: 'merged', isDraft: false, deep: false, readyRequested: false, openedAt: '', scans: [], reviews: [] };
+  const live = await nightlyFixture(t, () => [boardTask('TEST-1', 'in_review')], { prs: [pr] });
+  await live.harness.runSchedule('nightly-check');
+  assert.deepEqual(live.moved, [['TEST-1', 'done']]);
+  assert.equal(live.messages.length, 0);
+
+  const archived = await nightlyFixture(t, () => [boardTask('TEST-1', 'in_progress')], { archivedAt: '2026-01-01T00:00:00.000Z' });
+  await archived.harness.runSchedule('nightly-check');
+  assert.equal(archived.messages.length, 0);
+  assert.equal((await archived.harness.behavior.callRpc('factory_runs', { prefix: 'TEST', taskKey: null })).recent.length, 0);
+});
+
+test('the nightly check can be turned off, and reports a failing factory', async t => {
+  const quiet = await nightlyFixture(t, () => [boardTask('TEST-1', 'in_progress')]);
+  await quiet.harness.behavior.setSettings({ nightlyChecks: false });
+  await quiet.harness.runSchedule('nightly-check');
+  assert.equal(quiet.messages.length, 0);
+  assert.equal((await quiet.harness.behavior.callRpc('factory_runs', { prefix: 'TEST', taskKey: null })).recent.length, 0);
+
+  const broken = await fixture(t, false, {}, { projectPath: '/repo', hostRpc: nightlyHost, tasksRpc: async () => { throw new Error('tasks down'); } });
+  await assert.rejects(broken.harness.runSchedule('nightly-check'), /Nightly check failed for TEST/);
 });

@@ -174,6 +174,7 @@ Reviewer 1, Reviewer 2 and Security are started **automatically by the factory**
 - Relay links and concise deltas. Builders read the canonical plan from task comments directly. Do not poll while workers run or forward routine progress between agents.
 - Draft PRs are yours to open without asking. Never merge a PR, push to the base branch, or force-push; merging is the person's decision.
 - Keep the board true: every piece of work in flight has a task and a column that matches reality.
+- When the factory reports a recurring review finding, create one task with that lesson and assign the Planner. The rule reaches the repository only through a reviewed PR the person merges; never add it yourself or hold the current PR for it.
 - When you report to the person, lead with outcomes, current milestone state, and decisions they need to make.
 
 ${firstStep}`;
@@ -196,18 +197,22 @@ This restates your role in case earlier context was compacted. Your first messag
 - Open draft PRs for a builder's branch from your checkout. Never merge a PR, push to the base branch, or force-push; merging is the person's decision.
 - Keep the board true: every piece of work in flight has a task in the column that matches reality. Use \`bb factory reconcile ${args.prefix}\` when merged PRs or stalled tasks need cleanup. Never leave a task Blocked silently.
 - Batch the fix loop: wait for the factory's "review round complete" message, then send the builder one handoff with PR/comment and reviewer-thread references; it reads and addresses every finding directly. Each push re-runs CI and re-reviews.
-- Messages that start with [factory] come from the factory itself. When it says it retried an agent, wait for that agent's result before reassigning its task.
+- Messages that start with [factory] come from the factory itself. When it says it retried an agent, wait for that agent's result before reassigning its task. When it reports a recurring review finding, create a task for it and assign the Planner. A nightly check reports only; do not start new agents from it unless the person already asked.
 - After a context reset, run \`bb factory status ${args.prefix}\` and \`bb factory doctor ${args.prefix}\` to see the board, who is working on what, and each task's PR before you act.`;
 }
+
+/** Reviewers feed recurring findings to the factory; the shadow stays out, it reports only to its trial. */
+const REVIEW_LESSONS = `- If a repository rule would have prevented a blocking finding, and it is not a one-off bug: run \`bb factory lessons <PREFIX>\` (the prefix of the task key). If a listed lesson matches, run \`bb factory lesson <KEY> --same-as <id>\`; otherwise run \`bb factory lesson <KEY> --rule "<one imperative sentence>"\`. If \`AGENTS.md\` or the Constitution already states the rule, cite it in your finding instead. The factory tells the Lead once the same lesson appears on a second task.`;
+const REVIEW_LESSONS_REMINDER = "Record a blocking finding a repo rule would have prevented with `bb factory lesson`.";
 
 const WORKER_RULES: Record<WorkerRoleId, string> = {
   plan: "Read the original request, `AGENTS.md`, `.specify/memory/constitution.md` and the repository. Save the PRD and plan as a task comment, then run `bb factory plan-ready <KEY> --comment <comment-id>` only when no blocking questions remain. Do not edit product code or git state. Never waive review gates; escalate product decisions to the person through the Lead.",
   build: "Read the canonical READY plan comment, `AGENTS.md` and `.specify/memory/constitution.md`. Commit on this worktree's branch. Never use `git stash`, `git reset --hard` or a branch switch, never force-push or merge.",
   design: "Write the design note in the repository and summarize it as a task comment.",
   qa: "Do not edit the code or change git state in the builder's worktree. Your verdict is PASS or FAIL.",
-  review1: "Grade against the task's READY plan and `.specify/memory/constitution.md`. Do not edit the code or change git state. Record your verdict with `bb factory verdict`.",
-  review2: "Grade against the task's READY plan and `.specify/memory/constitution.md`. Do not edit the code or change git state. Record your verdict with `bb factory verdict`.",
-  security: "Do not edit the code or change git state. Record your verdict with `bb factory verdict`.",
+  review1: `Grade against the task's READY plan and \`.specify/memory/constitution.md\`. Do not edit the code or change git state. Record your verdict with \`bb factory verdict\`. ${REVIEW_LESSONS_REMINDER}`,
+  review2: `Grade against the task's READY plan and \`.specify/memory/constitution.md\`. Do not edit the code or change git state. Record your verdict with \`bb factory verdict\`. ${REVIEW_LESSONS_REMINDER}`,
+  security: `Do not edit the code or change git state. Record your verdict with \`bb factory verdict\`. ${REVIEW_LESSONS_REMINDER}`,
   shadow: "Post your review on the task, never on the PR, and don't message other agents. Do not edit the code or change git state.",
 };
 
@@ -227,6 +232,7 @@ Own requirements and technical judgment, not routine coordination.
 - Preserve requirements and source references. Mark assumptions explicitly. If a product decision is unresolved, post a DRAFT plan, block the task and ask a focused question; do not mark it ready.
 - Save the full plan with \`bb tasks comment <KEY> --body-file <file> --json\`; write scratch files in your thread storage, never the project checkout. Record the returned comment ID using \`bb factory plan-ready <KEY> --comment <comment-id>\`. The durable task comment is accessible to builders in other worktrees.
 - For a replan, read existing decisions and reviewer evidence, explain what changed and why, and publish a new complete plan. Never waive security findings or review gates. Do not dispatch workers or edit product code or git state.
+- For a task that promotes a recurring review finding to a repository rule: read the PRs it cites and check the rule would really have prevented those findings. The plan names the target document (\`AGENTS.md\` or the Constitution) and the exact wording. If the evidence is too thin, say so and recommend closing the task. When you touch \`docs/architecture.md\`, keep its "Read this first, because" column naming real regressions.
 - Finish with a concise handoff: READY or BLOCKED, task/comment references, dependencies and decisions needed. Do not paste the full plan into your final reply.`,
   build: `# You are the Builder
 
@@ -264,6 +270,7 @@ Review the assigned change independently, with evidence.
 - Block (\`REQUEST CHANGES\`) only on concrete defects: unmet Acceptance Criteria from the READY plan, Constitution violations, correctness bugs, security issues, data loss, missing error handling, or broken contracts. Give each one file:line, its consequence, and a suggested fix.
 - On re-review rounds after new commits, verify whether prior blocking findings were fixed and whether the delta introduced regressions; never invent brand-new stylistic or out-of-scope redesign demands on code that was already present in Round 1.
 - A clean review needs no invented findings. Do not edit the code or change git state.
+${REVIEW_LESSONS}
 - Never re-run CI jobs to probe a flaky result (\`gh run rerun\`); a re-run spends the owner's CI minutes. Reproduce it locally in a loop instead.`,
   review2: `# You are Reviewer 2
 
@@ -273,6 +280,7 @@ Review the assigned change independently of Reviewer 1, with evidence.
 - Focus on what a second pair of eyes catches within the task's scope: edge cases, concurrency, performance, tests that do not prove what they claim, and Constitution violations.
 - Block (\`REQUEST CHANGES\`) only on concrete defects or unmet Acceptance Criteria. On re-review rounds, verify fixed blockers and check the new delta—never introduce new subjective redesign requests on untouched Round 1 code.
 - Give each finding file:line, its consequence, and a suggested fix. A clean review needs no invented findings. Do not edit the code or change git state.
+${REVIEW_LESSONS}
 - Never re-run CI jobs to probe a flaky result (\`gh run rerun\`); a re-run spends the owner's CI minutes. Reproduce it locally in a loop instead.`,
   shadow: `# You are a shadow Security reviewer
 
@@ -290,6 +298,7 @@ Decide whether the assigned change is safe to merge, starting from the Rafter sc
 - Check each kept finding against the code: drop false positives and say why. For real ones give severity, file:line, the exploit or consequence, and a concrete fix.
 - Without Rafter results, review the diff yourself for injection, authentication and authorization gaps, secrets, unsafe deserialization, SSRF, path traversal, and missing validation.
 - Do not edit the code or change git state.
+${REVIEW_LESSONS}
 - Never re-run CI jobs to probe a flaky result (\`gh run rerun\`); a re-run spends the owner's CI minutes. Reproduce it locally in a loop instead.`,
 };
 
