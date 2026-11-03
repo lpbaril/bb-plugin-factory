@@ -690,6 +690,8 @@ test('a dismissed nightly report stays hidden until something changes', async t 
   let tasks = [boardTask('TEST-1', 'in_progress')];
   const { harness, messages } = await nightlyFixture(t, () => tasks);
   await harness.runSchedule('nightly-check');
+  await assert.rejects(harness.behavior.callRpc('factory_nightly_dismiss', { prefix: 'TEST' }, { experimental_caller: { kind: 'plugin', pluginId: 'other' } }), /Only the Factory page/);
+  assert.equal((await nightly(harness)).dismissed, false, 'another plugin cannot hide findings');
   assert.equal((await harness.behavior.callRpc('factory_nightly_dismiss', { prefix: 'TEST' })).dismissed, true);
   await harness.runSchedule('nightly-check');
   assert.equal((await nightly(harness)).dismissed, true, 'the same finding stays read');

@@ -3036,7 +3036,8 @@ ${findings}`;
       };
     },
     factory_nightly: async ({ prefix }) => readNightlyReport((await findFactory(prefix)).prefix),
-    factory_nightly_dismiss: async ({ prefix }) => {
+    factory_nightly_dismiss: async ({ prefix }, ctx) => {
+      if (ctx.experimental_caller?.kind !== "client") throw new Error("Only the Factory page can dismiss a nightly report.");
       const { prefix: key } = await findFactory(prefix);
       const report = await readNightlyReport(key);
       if (report === null) return null;
