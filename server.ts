@@ -22,6 +22,7 @@ import { createFactoryStorage } from "./factory-storage";
 import type { Lesson, RunCursor, RunRow } from "./factory-storage";
 import {
   MERGE_POLICIES,
+  TASK_KINDS,
   PROJECT_MODES,
   PR_REVIEW_ROLES,
   ROLES,
@@ -202,6 +203,8 @@ const factorySchema = z.object({
   /** Project mode override ("auto" detects Greenfield vs. Brownfield from the repository). */
   projectMode: z.enum(PROJECT_MODES).default("auto"),
   mergePolicy: z.enum(MERGE_POLICIES).default("person"),
+  /** Tasks marked as coordination or person-owned, which are never reported as stalled. */
+  taskKinds: z.record(z.string(), z.enum(TASK_KINDS)).default({}),
 });
 export type Factory = z.infer<typeof factorySchema>;
 
@@ -254,6 +257,7 @@ export const factoryDoctorSchema = z.object({
       z.object({ taskKey: z.string(), title: z.string(), lastRoles: z.array(z.string()) }),
     ),
     readyPlansAwaitingBuilder: z.array(z.object({ taskKey: z.string(), title: z.string(), commentId: z.string() })),
+    markedNotStalled: z.array(z.object({ taskKey: z.string(), kind: z.enum(TASK_KINDS) })),
     openPrsAwaitingAction: z.array(
       z.object({ taskKey: z.string(), title: z.string(), pr: z.number(), isDraft: z.boolean(), summary: z.string() }),
     ),
@@ -338,6 +342,17 @@ const agentsViewSchema = z.object({
   shadowCustomModel: z.string().nullable(),
 });
 export type AgentsView = z.infer<typeof agentsViewSchema>;
+
+const nightlyReportSchema = z.object({
+  at: z.string(),
+  movedToDone: z.array(z.string()),
+  stalled: z.array(z.object({ taskKey: z.string(), title: z.string() })),
+  readyPlans: z.array(z.object({ taskKey: z.string(), title: z.string() })),
+  error: z.string().nullable(),
+  /** The person has read it. A later run stays read only if it finds exactly the same things. */
+  dismissed: z.boolean(),
+});
+export type NightlyReport = z.infer<typeof nightlyReportSchema>;
 
 const runRowSchema = z.object({
   threadId: z.string(),
@@ -448,6 +463,14 @@ export const rpcContract = defineRpcContract({
       leadNotified: z.boolean(),
       doctor: factoryDoctorSchema,
     }),
+  },
+  factory_nightly: {
+    input: z.object({ prefix: z.string() }),
+    output: nightlyReportSchema.nullable(),
+  },
+  factory_nightly_dismiss: {
+    input: z.object({ prefix: z.string() }),
+    output: nightlyReportSchema.nullable(),
   },
   factory_runs: {
     input: z.object({ prefix: z.string(), taskKey: z.string().nullable() }),
@@ -678,7 +701,7 @@ export default async function plugin(bb: BbPluginApi) {
       type: "boolean",
       label: "Run a nightly check",
       description:
-        "At 3:00 server time, update the run ledger, move tasks with merged PRs to Done, and look for stalled tasks. The Lead is woken only when a stalled task or a waiting READY plan is new since the last check, and it reports without starting new agents.",
+        "At 3:00 server time, update the run ledger, move tasks with merged PRs to Done, and look for stalled tasks and READY plans waiting for a Builder. It never messages an agent: findings wait for you on the Factory page and in `bb factory nightly`.",
       default: true,
     },
     superviseAgents: {
@@ -1152,6 +1175,7 @@ export default async function plugin(bb: BbPluginApi) {
       trackerProjectId: tracker.id,
       blockedLabelId: blocked.id,
       mergePolicy: "person",
+      taskKinds: {},
       leadThreadId: null,
       agents: [],
       createdAt: new Date().toISOString(),
@@ -1242,6 +1266,7 @@ export default async function plugin(bb: BbPluginApi) {
     const readyPlansAwaitingBuilder: FactoryDoctorReport["boardHealth"]["readyPlansAwaitingBuilder"] = [];
     const openPrsAwaitingAction: FactoryDoctorReport["boardHealth"]["openPrsAwaitingAction"] = [];
     const blockedTasks: FactoryDoctorReport["boardHealth"]["blockedTasks"] = [];
+    const markedNotStalled: FactoryDoctorReport["boardHealth"]["markedNotStalled"] = [];
 
     for (const task of allTasks) {
       const isBlocked = task.labelIds.includes(factory.blockedLabelId) && task.status !== "done";
@@ -1278,6 +1303,11 @@ export default async function plugin(bb: BbPluginApi) {
           summary,
         });
       }
+      const kind = factory.taskKinds[task.key];
+      if (kind !== undefined) {
+        if (task.status !== "done") markedNotStalled.push({ taskKey: task.key, kind });
+        continue;
+      }
       const plan = factory.plans.find((entry) => entry.taskKey === task.key);
       const hasBuilder = factory.agents.some((agent) => agent.taskKey === task.key && agent.role === "build");
       if (task.status !== "done" && plan?.commentId != null && !hasBuilder) {
@@ -1302,7 +1332,10 @@ export default async function plugin(bb: BbPluginApi) {
             break;
           }
         }
-        if (!anyActive && (pr === null || pr.state !== "open")) {
+        // Nobody assigned means the person owns it. A Planner alone means coordination,
+        // or a plan the READY list above already reports; neither is a worker gone quiet.
+        const hasWorker = taskAgents.some((agent) => agent.role !== "plan");
+        if (hasWorker && !anyActive && (pr === null || pr.state !== "open")) {
           const lastRoles = [...new Set(taskAgents.map((agent) => ROLES[agent.role].label))];
           inProgressWithoutLiveWorker.push({ taskKey: task.key, title: task.title, lastRoles });
         }
@@ -1384,6 +1417,7 @@ export default async function plugin(bb: BbPluginApi) {
         mergedPrsStillOpenTasks,
         inProgressWithoutLiveWorker,
         readyPlansAwaitingBuilder,
+        markedNotStalled,
         openPrsAwaitingAction,
         blockedTasks,
       },
@@ -1413,6 +1447,7 @@ export default async function plugin(bb: BbPluginApi) {
       `  READY plans awaiting Builder:      ${report.boardHealth.readyPlansAwaitingBuilder.length === 0 ? "0" : report.boardHealth.readyPlansAwaitingBuilder.map((t) => `${t.taskKey} (comment ${t.commentId})`).join(", ")}`,
       `  Open PRs in flight:                ${report.boardHealth.openPrsAwaitingAction.length === 0 ? "0" : report.boardHealth.openPrsAwaitingAction.map((t) => `${t.taskKey} PR #${t.pr} (${t.summary})`).join("; ")}`,
       `  Blocked tasks:                     ${report.boardHealth.blockedTasks.length === 0 ? "0" : report.boardHealth.blockedTasks.map((t) => t.taskKey).join(", ")}`,
+      `  Marked as not stalled:             ${report.boardHealth.markedNotStalled.length === 0 ? "0" : report.boardHealth.markedNotStalled.map((t) => `${t.taskKey} (${t.kind})`).join(", ")}`,
       "",
       "Recommended Actions:",
       ...report.recommendedActions.map(
@@ -2922,23 +2957,42 @@ ${findings}`;
 
   // ----- Nightly check -----
 
-  /** Wakes the Lead only for findings it hasn't heard about, so a stuck board costs one turn, not one a night. */
+  const nightlyKey = (prefix: string) => `nightly-report:${prefix}`;
+  async function readNightlyReport(prefix: string): Promise<NightlyReport | null> {
+    const parsed = nightlyReportSchema.safeParse(await bb.storage.kv.get(nightlyKey(prefix)));
+    return parsed.success ? parsed.data : null;
+  }
+  /** Replaces the factory's report. Something new shows again even if the last one was dismissed. */
+  async function saveNightlyReport(prefix: string, report: Omit<NightlyReport, "dismissed">): Promise<void> {
+    const previous = await readNightlyReport(prefix);
+    const findings = (value: Pick<NightlyReport, "stalled" | "readyPlans">) => JSON.stringify([value.stalled.map((t) => t.taskKey), value.readyPlans.map((t) => t.taskKey)]);
+    const unchanged = previous !== null && findings(previous) === findings(report) && report.movedToDone.length === 0 && report.error === null;
+    await bb.storage.kv.set(nightlyKey(prefix), { ...report, dismissed: unchanged && previous.dismissed });
+    bb.realtime.publish(BOARD_CHANGED, { prefix });
+  }
+  /** Never messages an agent, so nothing starts while nobody is watching. Findings wait for the person. */
   async function nightlyCheck(factory: Factory): Promise<void> {
     await syncFactoryRuns(factory);
     const { reconciledMoveToDone, doctor } = await reconcileFactory(factory);
-    const { inProgressWithoutLiveWorker: idle, readyPlansAwaitingBuilder: ready } = doctor.boardHealth;
-    const findings = [...idle.map((t) => `idle:${t.taskKey}`), ...ready.map((t) => `ready:${t.taskKey}`)].sort().join(",");
-    const key = `nightly-findings:${factory.prefix}`;
-    if (findings === "") {
-      await bb.storage.kv.delete(key);
-      return;
-    }
-    if ((await bb.storage.kv.get(key)) === findings || factory.leadThreadId === null) return;
-    const message = [
-      ...reconcileBrief(factory, doctor, reconciledMoveToDone),
-      "This is the nightly check and nobody may be watching. Triage these and report them to the person; don't start new agents for them unless the person already asked.",
-    ].join("\n");
-    if (await tellThread(factory.leadThreadId, message)) await bb.storage.kv.set(key, findings);
+    const pick = ({ taskKey, title }: { taskKey: string; title: string }) => ({ taskKey, title });
+    await saveNightlyReport(factory.prefix, {
+      at: new Date().toISOString(),
+      movedToDone: reconciledMoveToDone,
+      stalled: doctor.boardHealth.inProgressWithoutLiveWorker.map(pick),
+      readyPlans: doctor.boardHealth.readyPlansAwaitingBuilder.map(pick),
+      error: null,
+    });
+    await bb.storage.kv.delete(`nightly-findings:${factory.prefix}`);
+  }
+  function formatNightlyReport(prefix: string, report: NightlyReport | null): string {
+    if (report === null) return `${prefix}: no nightly check yet.`;
+    const lines = [`${prefix}: nightly check at ${report.at}${report.dismissed ? " (read)" : ""}`];
+    if (report.error !== null) lines.push(`  Failed: ${report.error}`);
+    if (report.movedToDone.length > 0) lines.push(`  Moved to Done: ${report.movedToDone.join(", ")}`);
+    if (report.stalled.length > 0) lines.push(`  Stalled, no active worker: ${report.stalled.map((t) => `${t.taskKey} (${t.title})`).join(", ")}`);
+    if (report.readyPlans.length > 0) lines.push(`  READY plans waiting for a Builder: ${report.readyPlans.map((t) => `${t.taskKey} (${t.title})`).join(", ")}`);
+    if (lines.length === 1) lines.push("  Nothing to report.");
+    return lines.join("\n");
   }
   bb.background.schedule("nightly-check", "0 3 * * *", async () => {
     if (!(await settings.get()).nightlyChecks) return;
@@ -2950,6 +3004,7 @@ ${findings}`;
       } catch (error) {
         bb.log.warn(`nightly check failed for ${factory.prefix}: ${String(error)}`);
         failed.push(factory.prefix);
+        await saveNightlyReport(factory.prefix, { at: new Date().toISOString(), movedToDone: [], stalled: [], readyPlans: [], error: String(error).slice(0, 300) }).catch(() => {});
       }
     }
     // One bad factory doesn't stop the rest; this makes the failure visible in `bb plugin list`.
@@ -2979,6 +3034,15 @@ ${findings}`;
         agents: factory.agents,
         tasks: tasks.filter((task) => task.status !== "canceled").map((task) => toBoardTask(factory, task)),
       };
+    },
+    factory_nightly: async ({ prefix }) => readNightlyReport((await findFactory(prefix)).prefix),
+    factory_nightly_dismiss: async ({ prefix }) => {
+      const { prefix: key } = await findFactory(prefix);
+      const report = await readNightlyReport(key);
+      if (report === null) return null;
+      const dismissed = { ...report, dismissed: true };
+      await bb.storage.kv.set(nightlyKey(key), dismissed);
+      return dismissed;
     },
     factory_runs: async ({ prefix, taskKey }) => runReport(await findFactory(prefix), taskKey),
     factory_doctor: async ({ prefix }) => computeDoctorReport(await findFactory(prefix)),
@@ -3442,6 +3506,43 @@ ${findings}`;
               current.mergePolicy = policy.data;
             });
             return { exitCode: 0, stdout: `${factory.prefix}: ${policy.data}` };
+          },
+        }),
+        nightly: cliCommand({
+          summary: "Show the latest nightly check: tasks moved to Done, stalled tasks and READY plans waiting for a Builder",
+          positionals: [{ name: "factory", description: "Factory prefix; defaults to every active factory" }],
+          options: { json },
+          async run(input) {
+            const factories = input.positionals.factory !== undefined
+              ? [await findFactory(input.positionals.factory)]
+              : (await listFactories()).filter((factory) => factory.archivedAt === null);
+            const reports = await Promise.all(factories.map(async (factory) => ({ prefix: factory.prefix, report: await readNightlyReport(factory.prefix) })));
+            if (input.options.json) return { exitCode: 0, stdout: JSON.stringify(reports) };
+            return { exitCode: 0, stdout: reports.map(({ prefix, report }) => formatNightlyReport(prefix, report)).join("\n") };
+          },
+        }),
+        "task-kind": cliCommand({
+          summary: "Mark a task as coordination or person-owned so it isn't reported as stalled, or work to undo that (Lead or person)",
+          positionals: [
+            { name: "task", description: "Task key, such as APP-12", required: true },
+            { name: "kind", description: "coordination, person or work; omit to show it", },
+          ],
+          async run(input, ctx) {
+            const task = await getTaskByKey(input.positionals.task);
+            const factory = await factoryForTaskKey(task.key);
+            const requested = input.positionals.kind;
+            if (requested === undefined) return { exitCode: 0, stdout: `${task.key}: ${factory.taskKinds[task.key] ?? "work"}` };
+            const kind = z.enum([...TASK_KINDS, "work"]).safeParse(requested);
+            if (!kind.success) throw new PluginCliError("The kind is coordination, person or work.", { code: "task_kind_input" });
+            const threadId = ctx.threadId ?? null;
+            if (threadId !== null && threadId !== factory.leadThreadId && !factory.agents.some((agent) => agent.threadId === threadId && agent.role === "lead")) {
+              throw new PluginCliError("Only the factory's Lead or the person can change a task's kind.", { code: "task_kind_not_allowed" });
+            }
+            await mutateFactory(factory.prefix, (current) => {
+              if (kind.data === "work") delete current.taskKinds[task.key];
+              else current.taskKinds[task.key] = kind.data;
+            });
+            return { exitCode: 0, stdout: `${task.key}: ${kind.data}` };
           },
         }),
         lesson: cliCommand({

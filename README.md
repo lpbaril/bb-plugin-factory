@@ -142,13 +142,19 @@ the repository without that PR.
 ## Nightly check
 
 At 3:00 server time, for each factory that isn't archived, Factory reads new turns
-into the ledger, moves tasks with merged PRs to Done, and looks for In-Progress
-tasks with no live worker and READY plans waiting for a Builder. It runs only while
-bb is running, and a failure shows in `bb plugin list`.
+into the ledger, moves tasks with merged PRs to Done, and looks for stalled tasks
+and READY plans waiting for a Builder. It runs only while bb is running, and a
+failure also shows in `bb plugin list`.
 
-The Lead is woken only when one of those findings is new since the last check, and
-it is told to report rather than start agents. A finding that stays unresolved does
-not wake it again until it clears and comes back.
+**It never messages an agent**, so nothing starts while nobody is watching. Findings
+wait for you in a notice on the Factory page and in `bb factory nightly [APP]`.
+Dismissing the notice keeps it hidden until a later run finds something different.
+
+A task counts as stalled only if a worker other than the Planner was assigned. A task
+with no agents is treated as yours, and one with only a Planner as coordination. A
+Planner-only task with a READY plan still shows as waiting for a Builder, so mark a
+long-running task with `bb factory task-kind APP-88 coordination` or `person` to stop
+reporting it, and `work` to undo that. The Lead or you can set this.
 
 ## Storage and recovery
 

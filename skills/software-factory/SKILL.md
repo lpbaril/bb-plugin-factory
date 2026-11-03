@@ -98,8 +98,9 @@ whether to merge. Never add the rule directly or hold the current PR for it.
 and review verdicts. It records tokens, not money.
 
 A nightly check updates the ledger, moves merged tasks to Done and looks for stalled
-work. A nightly `[factory]` message is a report: triage it and tell the person, and
-don't start new agents from it unless they already asked.
+work. It messages no agent; the person reads its findings on the Factory page or with
+`bb factory nightly`. Mark a long-running coordination task, or one only the person can
+finish, with `bb factory task-kind APP-88 coordination|person` so it isn't reported.
 
 ## Keeping CI costs down
 
@@ -133,6 +134,8 @@ skip docs-only changes. PRs stay drafts until every reviewer approves, so
 | `bb factory verdict APP-12 --role review1\|review2\|security\|shadow --verdict approve\|changes [--pr N]` | Record a reviewer's verdict on the task's PR, after posting it (as a PR comment; the shadow reviewer posts a task comment). Only the reviewer thread the factory started can record it. |
 | `bb factory merge APP-12 [--pr N]` | Lead under the `when-green` policy, or the person: squash-merge after checking approvals and CI on the exact head. Fix what it names if it refuses. |
 | `bb factory merge-policy APP [person\|when-green]` | Show the policy. Only the person can set it, from outside an agent thread. |
+| `bb factory nightly [APP]` | Show the latest nightly check's findings. |
+| `bb factory task-kind APP-12 [coordination\|person\|work]` | Lead or person: stop reporting a task as stalled, or undo that with `work`. |
 | `bb factory lesson APP-12 --rule "..."\|--same-as <id>` | Task's reviewers only: record a blocking finding a repository rule would have prevented. |
 | `bb factory lessons APP` | List the factory's recurring review findings and their tasks. |
 | `bb factory runs APP [--task APP-12] [--sync]` | Show finished agent turns by role and model. `--sync` first reads every agent thread, including older ones. |

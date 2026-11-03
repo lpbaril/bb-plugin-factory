@@ -26,6 +26,7 @@ import type {
   Column,
   FactoryDoctorReport,
   FactorySummary,
+  NightlyReport,
   PrSummary,
   RunReport,
   TaskComment,
@@ -563,6 +564,7 @@ function FactoryView({ prefix }: { prefix: string }) {
           </div>
         </div>
         {error === null ? null : <Alert>{error}</Alert>}
+        <NightlyNotice prefix={prefix} />
       </div>
       <Board
         prefix={prefix}
@@ -594,6 +596,48 @@ function FactoryView({ prefix }: { prefix: string }) {
   );
 }
 const EMPTY_AGENTS: Agent[] = [];
+
+// ---------- Nightly check ----------
+
+function NightlyNotice({ prefix }: { prefix: string }) {
+  const rpc = useRpc<typeof rpcContract>();
+  const [report, setReport] = useState<NightlyReport | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    setReport(null);
+    rpc.call("factory_nightly", { prefix }).then(
+      (next) => { if (!cancelled) setReport(next); },
+      () => {},
+    );
+    return () => { cancelled = true; };
+  }, [rpc, prefix]);
+  if (report === null || report.dismissed) return null;
+  const lines = [
+    report.error === null ? null : `Failed: ${report.error}`,
+    report.movedToDone.length === 0 ? null : `Moved to Done: ${report.movedToDone.join(", ")}`,
+    report.stalled.length === 0 ? null : `Stalled, no active worker: ${report.stalled.map((task) => `${task.taskKey} (${task.title})`).join(", ")}`,
+    report.readyPlans.length === 0 ? null : `READY plans waiting for a Builder: ${report.readyPlans.map((task) => `${task.taskKey} (${task.title})`).join(", ")}`,
+  ].filter((line) => line !== null);
+  if (lines.length === 0) return null;
+  return (
+    <div className="flex items-start justify-between gap-3 rounded-md border border-border bg-muted/20 p-3 text-xs">
+      <div className="min-w-0 space-y-1">
+        <div className="font-medium">Nightly check · {new Date(report.at).toLocaleString()}</div>
+        {lines.map((line) => <div key={line} className="text-muted-foreground">{line}</div>)}
+      </div>
+      <Button
+        size="sm"
+        variant="secondary"
+        onClick={() => {
+          setReport({ ...report, dismissed: true });
+          void rpc.call("factory_nightly_dismiss", { prefix });
+        }}
+      >
+        Dismiss
+      </Button>
+    </div>
+  );
+}
 
 // ---------- Run ledger ----------
 

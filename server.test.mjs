@@ -368,7 +368,7 @@ test('doctor detects brownfield mode, missing alignment files, merged PR tasks, 
   assert.equal(report.effectiveMode, 'brownfield');
   assert.equal(report.boardHealth.mergedPrsStillOpenTasks.length, 1);
   assert.equal(report.boardHealth.mergedPrsStillOpenTasks[0].taskKey, 'TEST-1');
-  assert.equal(report.boardHealth.inProgressWithoutLiveWorker.length, 2);
+  assert.deepEqual(report.boardHealth.inProgressWithoutLiveWorker.map(task => task.taskKey), ['TEST-2'], 'the Planner-only task is reported as a READY plan instead');
   assert.equal(report.boardHealth.readyPlansAwaitingBuilder.length, 1);
   assert.equal(report.boardHealth.readyPlansAwaitingBuilder[0].taskKey, 'TEST-3');
 
@@ -662,40 +662,90 @@ function nightlyFixture(t, tasks, initial = {}, overrides = {}) {
     tasksRpc: async ({ method, input }) => {
       if (method === 'listTasks') return { tasks: tasks() };
       if (method === 'getTask') return { task: boardTask(input.taskId, 'in_review') };
+      if (method === 'getTaskByKey') return { task: boardTask(input.taskKey, 'in_progress') };
       if (method === 'boardMove') { moved.push([input.taskId, input.status]); return { ok: true, task: boardTask(input.taskId, input.status) }; }
       return undefined;
     },
   }).then(result => ({ ...result, moved }));
 }
 
-test('the nightly check wakes the Lead once per new finding and fills the ledger', async t => {
+const nightly = async harness => JSON.parse((await harness.behavior.runCli(['nightly', 'TEST', '--json'])).stdout)[0].report;
+
+test('the nightly check leaves findings for the person and never messages an agent', async t => {
+  const tasks = [boardTask('TEST-1', 'in_progress')];
+  const { harness, messages } = await nightlyFixture(t, () => tasks);
+  assert.equal(await nightly(harness), null);
+  await harness.runSchedule('nightly-check');
+  assert.equal(messages.length, 0);
+  const report = await nightly(harness);
+  assert.deepEqual(report.stalled, [{ taskKey: 'TEST-1', title: 'TEST-1' }]);
+  assert.equal(report.dismissed, false);
+  assert.equal(report.error, null);
+  assert.equal((await harness.behavior.callRpc('factory_runs', { prefix: 'TEST', taskKey: null })).recent.length, 1);
+  assert.match((await harness.behavior.runCli(['nightly', 'TEST'])).stdout, /Stalled, no active worker: TEST-1/);
+  assert.deepEqual(await harness.behavior.callRpc('factory_nightly', { prefix: 'TEST' }), report);
+});
+
+test('a dismissed nightly report stays hidden until something changes', async t => {
   let tasks = [boardTask('TEST-1', 'in_progress')];
   const { harness, messages } = await nightlyFixture(t, () => tasks);
   await harness.runSchedule('nightly-check');
-  assert.equal(messages.length, 1);
-  assert.equal(messages[0].threadId, 'thr_lead');
-  assert.match(messages[0].input[0].text, /no active worker thread: TEST-1/);
-  assert.match(messages[0].input[0].text, /don't start new agents/);
-  assert.equal((await harness.behavior.callRpc('factory_runs', { prefix: 'TEST', taskKey: null })).recent.length, 1);
-
+  assert.equal((await harness.behavior.callRpc('factory_nightly_dismiss', { prefix: 'TEST' })).dismissed, true);
   await harness.runSchedule('nightly-check');
-  assert.equal(messages.length, 1, 'the same finding stays quiet');
-
+  assert.equal((await nightly(harness)).dismissed, true, 'the same finding stays read');
   tasks = [boardTask('TEST-1', 'in_review')];
   await harness.runSchedule('nightly-check');
-  assert.equal(messages.length, 1, 'nothing to report');
-
-  tasks = [boardTask('TEST-1', 'in_progress')];
-  await harness.runSchedule('nightly-check');
-  assert.equal(messages.length, 2, 'a finding that came back is new again');
+  assert.equal((await nightly(harness)).dismissed, false, 'a change shows again');
+  assert.equal(messages.length, 0);
 });
 
-test('the nightly check moves merged tasks without waking the Lead, and skips archived factories', async t => {
+const healthOf = async harness => (await harness.behavior.callRpc('factory_doctor', { prefix: 'TEST' })).boardHealth;
+
+test('tasks with no agents or only a Planner are not stalled; a quiet worker is', async t => {
+  const agents = [
+    { threadId: 'thr_plan', role: 'plan', taskKey: 'TEST-2', providerId: 'codex', createdAt: '', pr: null },
+    { threadId: 'thr_build', role: 'build', taskKey: 'TEST-3', providerId: 'codex', createdAt: '', pr: null },
+  ];
+  const { harness } = await nightlyFixture(t, () => [boardTask('TEST-1', 'in_progress'), boardTask('TEST-2', 'in_progress'), boardTask('TEST-3', 'in_progress')], { agents });
+  assert.deepEqual((await healthOf(harness)).inProgressWithoutLiveWorker.map(task => task.taskKey), ['TEST-3']);
+});
+
+test('task-kind stops a task being reported, and only the Lead or the person can set it', async t => {
+  const agents = [
+    { threadId: 'thr_lead', role: 'lead', taskKey: null, providerId: 'codex', createdAt: '', pr: null },
+    { threadId: 'thr_plan', role: 'plan', taskKey: 'TEST-1', providerId: 'codex', createdAt: '', pr: null },
+    { threadId: 'thr_build', role: 'build', taskKey: 'TEST-2', providerId: 'codex', createdAt: '', pr: null },
+  ];
+  const plans = [{ taskKey: 'TEST-1', threadId: 'thr_plan', commentId: 'comment_1' }];
+  const { harness } = await nightlyFixture(t, () => [boardTask('TEST-1', 'in_progress'), boardTask('TEST-2', 'in_progress')], { agents, plans });
+  let health = await healthOf(harness);
+  assert.deepEqual(health.readyPlansAwaitingBuilder.map(task => task.taskKey), ['TEST-1'], 'a Planner-only READY plan is still reported');
+  assert.deepEqual(health.inProgressWithoutLiveWorker.map(task => task.taskKey), ['TEST-2']);
+
+  const denied = await harness.behavior.runCli(['task-kind', 'TEST-1', 'coordination'], { threadId: 'thr_build' });
+  assert.notEqual(denied.exitCode, 0);
+  assert.match(denied.stderr, /Only the factory's Lead or the person/);
+  assert.notEqual((await harness.behavior.runCli(['task-kind', 'TEST-1', 'other'], { threadId: 'thr_lead' })).exitCode, 0);
+
+  assert.equal((await harness.behavior.runCli(['task-kind', 'TEST-1', 'coordination'], { threadId: 'thr_lead' })).stdout, 'TEST-1: coordination');
+  assert.equal((await harness.behavior.runCli(['task-kind', 'TEST-2', 'person'])).stdout, 'TEST-2: person');
+  health = await healthOf(harness);
+  assert.deepEqual(health.readyPlansAwaitingBuilder, []);
+  assert.deepEqual(health.inProgressWithoutLiveWorker, []);
+  assert.deepEqual(health.markedNotStalled, [{ taskKey: 'TEST-1', kind: 'coordination' }, { taskKey: 'TEST-2', kind: 'person' }]);
+
+  await harness.behavior.runCli(['task-kind', 'TEST-2', 'work']);
+  assert.equal((await harness.behavior.runCli(['task-kind', 'TEST-2'])).stdout, 'TEST-2: work');
+  assert.deepEqual((await healthOf(harness)).inProgressWithoutLiveWorker.map(task => task.taskKey), ['TEST-2']);
+});
+
+test('the nightly check reports merged tasks it moved, and skips archived factories', async t => {
   const pr = { number: 1, taskKey: 'TEST-1', url: 'https://example.org/1', headSha: 'abc', branch: 'b', state: 'merged', isDraft: false, deep: false, readyRequested: false, openedAt: '', scans: [], reviews: [] };
   const live = await nightlyFixture(t, () => [boardTask('TEST-1', 'in_review')], { prs: [pr] });
   await live.harness.runSchedule('nightly-check');
   assert.deepEqual(live.moved, [['TEST-1', 'done']]);
   assert.equal(live.messages.length, 0);
+  assert.deepEqual((await nightly(live.harness)).movedToDone, ['TEST-1']);
 
   const archived = await nightlyFixture(t, () => [boardTask('TEST-1', 'in_progress')], { archivedAt: '2026-01-01T00:00:00.000Z' });
   await archived.harness.runSchedule('nightly-check');
@@ -712,6 +762,7 @@ test('the nightly check can be turned off, and reports a failing factory', async
 
   const broken = await fixture(t, false, {}, { projectPath: '/repo', hostRpc: nightlyHost, tasksRpc: async () => { throw new Error('tasks down'); } });
   await assert.rejects(broken.harness.runSchedule('nightly-check'), /Nightly check failed for TEST/);
+  assert.match((await nightly(broken.harness)).error, /tasks down/);
 });
 
 // ----- Merge policy -----
