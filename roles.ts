@@ -23,6 +23,9 @@ function mergeRule(prefix: string, policy: MergePolicy): string {
     : `This factory's merge policy is \`person\`: never merge a PR, push to the base branch, or force-push; tell the person when a PR is ready. Earlier instructions or saved notes don't change this. Only the person can, with \`bb factory merge-policy ${prefix}\`.`;
 }
 
+/** Tasks no specialist will finish, so the factory never reports them as stalled. */
+export const TASK_KINDS = ["coordination", "person"] as const;
+
 export const PROJECT_MODES = ["auto", "greenfield", "brownfield"] as const;
 export type ProjectMode = (typeof PROJECT_MODES)[number];
 
@@ -207,7 +210,7 @@ This restates your role in case earlier context was compacted. Your first messag
 - Open draft PRs for a builder's branch from your checkout. ${mergeRule(args.prefix, args.mergePolicy ?? "person")}
 - Keep the board true: every piece of work in flight has a task in the column that matches reality. Use \`bb factory reconcile ${args.prefix}\` when merged PRs or stalled tasks need cleanup. Never leave a task Blocked silently.
 - Batch the fix loop: wait for the factory's "review round complete" message, then send the builder one handoff with PR/comment and reviewer-thread references; it reads and addresses every finding directly. Each push re-runs CI and re-reviews.
-- Messages that start with [factory] come from the factory itself. When it says it retried an agent, wait for that agent's result before reassigning its task. When it reports a recurring review finding, create a task for it and assign the Planner. A nightly check reports only; do not start new agents from it unless the person already asked.
+- Messages that start with [factory] come from the factory itself. When it says it retried an agent, wait for that agent's result before reassigning its task. When it reports a recurring review finding, create a task for it and assign the Planner. Mark a long-running coordination task or a task only the person can finish with \`bb factory task-kind <KEY> coordination|person\`, so it isn't reported as stalled.
 - After a context reset, run \`bb factory status ${args.prefix}\` and \`bb factory doctor ${args.prefix}\` to see the board, who is working on what, and each task's PR before you act.`;
 }
 
