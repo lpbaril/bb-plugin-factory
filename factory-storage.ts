@@ -1,7 +1,7 @@
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import type { Factory } from "./server";
 
-/** One finished agent turn. Tokens are the thread's growth since the previous row, so they sum correctly. */
+/** One finished agent turn, with the tokens from the usage events reported while it was the latest turn. */
 export type RunRow = {
   threadId: string;
   endSeq: number;
@@ -19,8 +19,8 @@ export type RunRow = {
   tokensCached: number | null;
   tokensOutput: number | null;
 };
-/** How far a thread has been read, and its cumulative tokens at that point. */
-export type RunCursor = { lastSeq: number; tokensTotal: number; tokensCached: number; tokensOutput: number };
+/** How far a thread's turns and usage events have been read, and the provider's running totals at that point. */
+export type RunCursor = { lastSeq: number; usageSeq: number; tokensTotal: number; tokensCached: number; tokensOutput: number };
 export type RunGroup = {
   role: string;
   providerId: string;
@@ -35,11 +35,7 @@ export type RunGroup = {
 };
 export type Lesson = { id: number; rule: string; createdAt: string; notifiedAt: string | null; tasks: string[] };
 
-/** KV is only a fixed-size locator. Histories grow as rows, never as KV values
- * (or as a task-sized JSON blob). Array positions preserve the original order. */
-export function createFactoryStorage(storage: BbPluginApi["storage"], parse: (value: unknown) => Factory) {
-  const db = storage.database();
-  storage.migrate(db, [
+export const FACTORY_MIGRATIONS = [
     `CREATE TABLE factory_metadata (prefix TEXT PRIMARY KEY, payload TEXT NOT NULL);
      CREATE TABLE factory_records (
        prefix TEXT NOT NULL, kind TEXT NOT NULL, position INTEGER NOT NULL,
@@ -68,7 +64,18 @@ export function createFactoryStorage(storage: BbPluginApi["storage"], parse: (va
        lesson_id INTEGER NOT NULL REFERENCES factory_lessons(id) ON DELETE CASCADE, task_key TEXT NOT NULL,
        thread_id TEXT NOT NULL, created_at TEXT NOT NULL,
        PRIMARY KEY (lesson_id, task_key));`,
-  ]);
+    // Earlier ledger rows credited only each thread's latest usage total. They come
+    // from thread events, so clearing them lets the next sync rebuild them correctly.
+    `DELETE FROM factory_runs;
+     DELETE FROM factory_run_cursors;
+     ALTER TABLE factory_run_cursors ADD COLUMN usage_seq INTEGER NOT NULL DEFAULT 0;`,
+];
+
+/** KV is only a fixed-size locator. Histories grow as rows, never as KV values
+ * (or as a task-sized JSON blob). Array positions preserve the original order. */
+export function createFactoryStorage(storage: BbPluginApi["storage"], parse: (value: unknown) => Factory) {
+  const db = storage.database();
+  storage.migrate(db, FACTORY_MIGRATIONS);
   const metadata = db.prepare("SELECT payload FROM factory_metadata WHERE prefix = ?");
   const records = db.prepare("SELECT kind, position, parent, payload FROM factory_records WHERE prefix = ? ORDER BY parent, position");
   const putMetadata = db.prepare("INSERT INTO factory_metadata VALUES (?, ?) ON CONFLICT(prefix) DO UPDATE SET payload=excluded.payload");
@@ -209,12 +216,12 @@ export function createFactoryStorage(storage: BbPluginApi["storage"], parse: (va
 
   // ----- Run ledger: append-only, and separate from the factory rows that writeRows rewrites. -----
   function runCursor(threadId: string): RunCursor {
-    const row = db.prepare("SELECT last_seq, tokens_total, tokens_cached, tokens_output FROM factory_run_cursors WHERE thread_id = ?").get(threadId) as
-      | { last_seq: number; tokens_total: number; tokens_cached: number; tokens_output: number }
+    const row = db.prepare("SELECT last_seq, usage_seq, tokens_total, tokens_cached, tokens_output FROM factory_run_cursors WHERE thread_id = ?").get(threadId) as
+      | { last_seq: number; usage_seq: number; tokens_total: number; tokens_cached: number; tokens_output: number }
       | undefined;
     return row === undefined
-      ? { lastSeq: 0, tokensTotal: 0, tokensCached: 0, tokensOutput: 0 }
-      : { lastSeq: row.last_seq, tokensTotal: row.tokens_total, tokensCached: row.tokens_cached, tokensOutput: row.tokens_output };
+      ? { lastSeq: 0, usageSeq: 0, tokensTotal: 0, tokensCached: 0, tokensOutput: 0 }
+      : { lastSeq: row.last_seq, usageSeq: row.usage_seq, tokensTotal: row.tokens_total, tokensCached: row.tokens_cached, tokensOutput: row.tokens_output };
   }
   /** Rows and the cursor commit together, so a crash can neither lose nor double-count a turn. */
   const appendRuns = db.transaction((threadId: string, rows: RunRow[], cursor: RunCursor) => {
@@ -223,10 +230,10 @@ export function createFactoryStorage(storage: BbPluginApi["storage"], parse: (va
       insert.run(r.threadId, r.endSeq, r.prefix, r.taskKey, r.role, r.providerId, r.model, r.reasoning, r.outcome, r.error, r.startedAt, r.endedAt, r.tokensTotal, r.tokensCached, r.tokensOutput);
     }
     db.prepare(
-      `INSERT INTO factory_run_cursors VALUES (?, ?, ?, ?, ?)
-       ON CONFLICT(thread_id) DO UPDATE SET last_seq=excluded.last_seq, tokens_total=excluded.tokens_total,
+      `INSERT INTO factory_run_cursors (thread_id, last_seq, usage_seq, tokens_total, tokens_cached, tokens_output) VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(thread_id) DO UPDATE SET last_seq=excluded.last_seq, usage_seq=excluded.usage_seq, tokens_total=excluded.tokens_total,
          tokens_cached=excluded.tokens_cached, tokens_output=excluded.tokens_output`,
-    ).run(threadId, cursor.lastSeq, cursor.tokensTotal, cursor.tokensCached, cursor.tokensOutput);
+    ).run(threadId, cursor.lastSeq, cursor.usageSeq, cursor.tokensTotal, cursor.tokensCached, cursor.tokensOutput);
   });
   function runGroups(prefix: string, taskKey: string | null): RunGroup[] {
     return db.prepare(

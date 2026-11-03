@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { createFakePluginHost } from '@get-bb/plugin-sdk/testing';
-import { createFactoryStorage } from './factory-storage.ts';
+import { FACTORY_MIGRATIONS, createFactoryStorage } from './factory-storage.ts';
 
 function history(count = 250) {
   const factory = { prefix: 'BIG', name: 'Large factory', bbProjectId: 'proj_big', trackerProjectId: 'tracker', blockedLabelId: 'blocked', leadThreadId: 'lead', createdAt: '', repo: 'owner/repo', archivedAt: null, agents: [], prs: [], plans: [] };
@@ -104,7 +104,7 @@ test('the run ledger survives factory rewrites, ignores replays, and leaves with
   const factory = history(1);
   await store.write(factory);
   const row = { threadId: 'thr', endSeq: 5, prefix: 'BIG', taskKey: 'BIG-1', role: 'build', providerId: 'codex', model: 'm', reasoning: null, outcome: 'completed', error: null, startedAt: 1000, endedAt: 4000, tokensTotal: 10, tokensCached: 4, tokensOutput: 2 };
-  const cursor = { lastSeq: 5, tokensTotal: 10, tokensCached: 4, tokensOutput: 2 };
+  const cursor = { lastSeq: 5, usageSeq: 4, tokensTotal: 10, tokensCached: 4, tokensOutput: 2 };
   store.appendRuns('thr', [row], cursor);
   store.appendRuns('thr', [row], cursor);
   await store.write(factory);
@@ -114,12 +114,28 @@ test('the run ledger survives factory rewrites, ignores replays, and leaves with
   assert.equal(store.recentRuns('BIG', 'BIG-2', 10).length, 0);
   assert.deepEqual(store.runGroups('BIG', null), [{ role: 'build', providerId: 'codex', model: 'm', runs: 1, failed: 0, interrupted: 0, durationMs: 3000, tokensTotal: 10, tokensCached: 4, tokensOutput: 2 }]);
 
-  assert.deepEqual(store.runCursor('unknown'), { lastSeq: 0, tokensTotal: 0, tokensCached: 0, tokensOutput: 0 });
+  assert.deepEqual(store.runCursor('unknown'), { lastSeq: 0, usageSeq: 0, tokensTotal: 0, tokensCached: 0, tokensOutput: 0 });
   const lesson = store.recordLesson('BIG', { rule: 'Do the thing.' }, 'BIG-1', 'thr');
   assert.deepEqual(lesson.tasks, ['BIG-1']);
   assert.equal(store.recordLesson('OTHER', { id: lesson.id }, 'OTHER-1', 'thr'), null, 'a lesson belongs to one factory');
   await store.remove('BIG');
   assert.equal(store.recentRuns('BIG', null, 10).length, 0);
-  assert.deepEqual(store.runCursor('thr'), { lastSeq: 0, tokensTotal: 0, tokensCached: 0, tokensOutput: 0 });
+  assert.deepEqual(store.runCursor('thr'), { lastSeq: 0, usageSeq: 0, tokensTotal: 0, tokensCached: 0, tokensOutput: 0 });
   assert.deepEqual(store.lessons('BIG'), []);
+});
+
+test('upgrading clears ledger rows with bad token credit, and only those', async t => {
+  const { bb, harness } = createFakePluginHost({ pluginId: 'factory' });
+  t.after(() => harness.lifecycle.dispose());
+  const db = bb.storage.database();
+  bb.storage.migrate(db, FACTORY_MIGRATIONS.slice(0, -1));
+  db.prepare("INSERT INTO factory_runs VALUES ('thr', 5, 'BIG', 'BIG-1', 'build', 'codex', 'm', null, 'completed', null, 1, 2, 10, 4, 2)").run();
+  db.prepare("INSERT INTO factory_run_cursors VALUES ('thr', 5, 10, 4, 2)").run();
+  db.prepare("INSERT INTO factory_lessons (prefix, rule, created_at) VALUES ('BIG', 'Keep this lesson.', '')").run();
+  const store = createFactoryStorage(bb.storage, identity);
+  assert.equal(store.recentRuns('BIG', null, 10).length, 0);
+  assert.deepEqual(store.runCursor('thr'), { lastSeq: 0, usageSeq: 0, tokensTotal: 0, tokensCached: 0, tokensOutput: 0 });
+  assert.equal(store.lessons('BIG').length, 1);
+  store.appendRuns('thr', [], { lastSeq: 7, usageSeq: 6, tokensTotal: 1, tokensCached: 0, tokensOutput: 0 });
+  assert.equal(store.runCursor('thr').usageSeq, 6);
 });

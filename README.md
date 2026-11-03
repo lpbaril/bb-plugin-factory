@@ -95,12 +95,15 @@ that gave them, so you can compare reviewers on real results.
   Codex and Cursor threads checked while building it reported a cost. "New input"
   is total minus cached and output, because providers count cached input differently;
   it is the number that compares across providers.
-- **Token attribution.** bb keeps little per-turn token history, so a thread's
-  growth is credited to its newest finished turn. Totals are right per thread and
-  per task; a single turn's figure can include earlier turns. Providers that report
-  no usage show zero.
-- **Backfill.** Threads older than the ledger are read by the nightly check, or on
-  demand with `bb factory runs APP --sync`.
+- **Token accounting.** Providers report running totals that restart with each
+  session. Factory reads every usage event bb still has, adds across restarts, and
+  credits each event to the turn and model running when it was reported. A turn with
+  no usage event shows no tokens, and providers that report no usage show zero.
+- **Older threads are a lower bound.** New turns are read as they finish, but bb
+  drops older usage events, so tokens from before the ledger was installed can be
+  far too low. Turn counts, outcomes, durations and verdicts don't depend on those
+  events. The nightly check reads threads older than the ledger, or you can run
+  `bb factory runs APP --sync`.
 - **Storage.** The rows live in the plugin database and are never pruned while the
   factory exists. Deleting a factory deletes its ledger.
 

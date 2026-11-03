@@ -10,7 +10,7 @@ registerHooks({ resolve(specifier, context, next) {
   }
   return next(specifier, context);
 } });
-const { default: plugin, supervisorAction, turnsFromEvents } = await import('./server.ts');
+const { default: plugin, supervisorAction, turnsFromEvents, creditUsage } = await import('./server.ts');
 const { leadCharter, workerReminder } = await import('./roles.ts');
 const { createFactoryStorage } = await import('./factory-storage.ts');
 
@@ -447,7 +447,8 @@ const eventLog = events => ({
 test('turnsFromEvents records finished turns and leaves a running one unread', () => {
   const finished = turnsFromEvents([requested(1, 'model-a'), started(2), completed(3), requested(4, 'model-b'), started(5)]);
   assert.equal(finished.closedSeq, 3);
-  assert.deepEqual(finished.turns, [{ startedAt: 2000, model: 'model-a', reasoning: 'high', outcome: 'completed', error: null, endSeq: 3, endedAt: 3000 }]);
+  assert.equal(finished.openStartSeq, 5);
+  assert.deepEqual(finished.turns, [{ startSeq: 2, startedAt: 2000, model: 'model-a', reasoning: 'high', outcome: 'completed', error: null, endSeq: 3, endedAt: 3000 }]);
 });
 
 test('turnsFromEvents marks cut-off turns interrupted and failed turns failed', () => {
@@ -456,7 +457,8 @@ test('turnsFromEvents marks cut-off turns interrupted and failed turns failed', 
   const open = turnsFromEvents([started(1), { seq: 2, type: 'client/turn/requested', createdAt: 2000, data: {} }], 'unauthorized');
   assert.deepEqual(open.turns.map(turn => [turn.outcome, turn.error, turn.endSeq]), [['failed', 'unauthorized', 2]]);
   assert.equal(open.closedSeq, 2);
-  assert.deepEqual(turnsFromEvents([], 'unauthorized'), { turns: [], closedSeq: null });
+  assert.equal(open.openStartSeq, null);
+  assert.deepEqual(turnsFromEvents([], 'unauthorized'), { turns: [], closedSeq: null, openStartSeq: null });
 });
 
 test('the ledger records each turn once and credits token growth to the newest turn', async t => {
@@ -493,6 +495,49 @@ test('the ledger pages through a thread longer than one page of events', async t
   await harness.behavior.emitThreadEvent('thread.idle', { thread: makeThreadResponse({ id: 'thr_builder' }), lastAssistantText: null });
   const { groups } = await harness.behavior.callRpc('factory_runs', { prefix: 'TEST', taskKey: null });
   assert.equal(groups[0].runs, 120);
+});
+
+const noTokens = { tokensTotal: 0, tokensCached: 0, tokensOutput: 0 };
+const turnAt = (startSeq, endSeq) => ({ startSeq, endSeq, startedAt: 0, endedAt: 0, model: null, reasoning: null, outcome: 'completed', error: null });
+
+test('creditUsage adds across session restarts instead of keeping only the latest total', () => {
+  const { credits, totals, lastSeq } = creditUsage([turnAt(1, 9)], null, [usage(2, 100, 60, 10), usage(3, 900, 700, 50), usage(4, 40, 0, 5), usage(5, 70, 10, 8)], noTokens);
+  assert.deepEqual(credits.get(0), { tokensTotal: 970, tokensCached: 710, tokensOutput: 58 });
+  assert.deepEqual(totals, { tokensTotal: 70, tokensCached: 10, tokensOutput: 8 });
+  assert.equal(lastSeq, 5);
+});
+
+test('creditUsage credits each event to the turn running when it was reported', () => {
+  const turns = [turnAt(2, 5), turnAt(10, 15)];
+  const { credits } = creditUsage(turns, null, [usage(1, 5), usage(3, 100), usage(7, 130), usage(12, 200), usage(20, 220)], noTokens);
+  assert.equal(credits.get(0).tokensTotal, 130, 'an early event, a mid-turn event and a late event after the turn ended');
+  assert.equal(credits.get(1).tokensTotal, 90, 'a mid-turn event and a late event after the last turn ended');
+});
+
+test('creditUsage leaves a running turn\'s events for when it finishes', () => {
+  const { credits, totals, lastSeq } = creditUsage([turnAt(1, 3)], 5, [usage(2, 100), usage(6, 150)], noTokens);
+  assert.equal(credits.get(0).tokensTotal, 100);
+  assert.equal(totals.tokensTotal, 100);
+  assert.equal(lastSeq, 2);
+  assert.deepEqual(creditUsage([], null, [usage(2, 100)], noTokens), { credits: new Map(), totals: noTokens, lastSeq: null });
+});
+
+test('the ledger keeps tokens on the right model and never counts a usage event twice', async t => {
+  const events = [requested(1, 'model-a'), started(2), usage(3, 500, 100, 10), completed(4), requested(5, 'model-b'), started(6), usage(7, 90, 0, 9), usage(8, 120, 0, 12), completed(9)];
+  const { harness } = await fixture(t, false, {}, { threads: { ...eventLog(events) } });
+  const idle = { thread: makeThreadResponse({ id: 'thr_builder' }), lastAssistantText: null };
+  const byModel = async () => Object.fromEntries((await harness.behavior.callRpc('factory_runs', { prefix: 'TEST', taskKey: null })).groups.map(group => [group.model, group.tokensTotal]));
+  await harness.behavior.emitThreadEvent('thread.idle', idle);
+  assert.deepEqual(await byModel(), { 'model-a': 500, 'model-b': 120 });
+
+  // Without a usage-event cursor, the earlier 90 would read as another session restart.
+  events.push(requested(10, 'model-b'), started(11), completed(12));
+  await harness.behavior.emitThreadEvent('thread.idle', idle);
+  assert.deepEqual(await byModel(), { 'model-a': 500, 'model-b': 120 });
+
+  events.push(requested(13, 'model-b'), started(14), usage(15, 150, 0, 15), completed(16));
+  await harness.behavior.emitThreadEvent('thread.idle', idle);
+  assert.deepEqual(await byModel(), { 'model-a': 500, 'model-b': 150 });
 });
 
 test('a failed turn lands in the ledger with its category, and a ledger error stays out of the way', async t => {
