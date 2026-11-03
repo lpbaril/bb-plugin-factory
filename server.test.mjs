@@ -10,7 +10,7 @@ registerHooks({ resolve(specifier, context, next) {
   }
   return next(specifier, context);
 } });
-const { default: plugin, supervisorAction, turnsFromEvents, creditUsage } = await import('./server.ts');
+const { default: plugin, supervisorAction, turnsFromEvents, creditUsage, mergeBlockers } = await import('./server.ts');
 const { leadCharter, workerReminder } = await import('./roles.ts');
 const { createFactoryStorage } = await import('./factory-storage.ts');
 
@@ -712,4 +712,108 @@ test('the nightly check can be turned off, and reports a failing factory', async
 
   const broken = await fixture(t, false, {}, { projectPath: '/repo', hostRpc: nightlyHost, tasksRpc: async () => { throw new Error('tasks down'); } });
   await assert.rejects(broken.harness.runSchedule('nightly-check'), /Nightly check failed for TEST/);
+});
+
+// ----- Merge policy -----
+
+const HEAD = 'abc1234def';
+const greenChecks = [{ name: 'test', conclusion: 'SUCCESS' }, { name: 'skip', conclusion: 'SKIPPED' }, { context: 'pages', state: 'SUCCESS' }];
+const liveView = (over = {}) => ({ state: 'OPEN', isDraft: false, headRefOid: HEAD, mergeable: 'MERGEABLE', statusCheckRollup: greenChecks, ...over });
+const approved = (role, sha = HEAD, verdict = 'approve') => ({ role, threadId: `thr_${role}`, sha, verdict, at: '' });
+const readyPr = (over = {}) => ({ deep: false, scans: [], reviews: [approved('review1'), approved('security')], ...over });
+
+test('mergeBlockers passes only with approvals and green CI on the exact head', () => {
+  assert.deepEqual(mergeBlockers(readyPr(), liveView(), false), []);
+  const cases = [
+    [readyPr(), liveView({ isDraft: true }), /draft/],
+    [readyPr(), liveView({ state: 'MERGED' }), /merged/],
+    [readyPr(), liveView({ mergeable: 'CONFLICTING' }), /conflicting/],
+    [readyPr(), liveView({ mergeable: 'UNKNOWN' }), /unknown/],
+    [readyPr(), liveView({ statusCheckRollup: [] }), /no CI checks/],
+    [readyPr(), liveView({ statusCheckRollup: null }), /no CI checks/],
+    [readyPr(), liveView({ statusCheckRollup: [{ name: 'test', conclusion: 'FAILURE' }] }), /CI isn't green: test/],
+    [readyPr(), liveView({ statusCheckRollup: [{ name: 'slow', conclusion: '' }] }), /CI isn't green: slow/],
+    [readyPr({ reviews: [approved('review1')] }), liveView(), /Security has not approved/],
+    [readyPr({ reviews: [approved('review1', 'old0000'), approved('security')] }), liveView(), /Reviewer 1 approved old0000, not the head/],
+    [readyPr({ deep: true }), liveView(), /Reviewer 2 has not approved/],
+    [readyPr({ reviews: [approved('review1'), approved('security', HEAD, 'approve'), approved('security', HEAD, 'changes')] }), liveView(), /Security has not approved/],
+    [readyPr({ scans: [{ status: 'running' }] }), liveView(), /Rafter scan/],
+  ];
+  for (const [pr, view, pattern] of cases) assert.match(mergeBlockers(pr, view, false).join('; '), pattern);
+  const shadowed = readyPr({ reviews: [...readyPr().reviews, approved('shadow', HEAD, 'changes')] });
+  assert.match(mergeBlockers(shadowed, liveView(), true).join('; '), /shadow/);
+  assert.deepEqual(mergeBlockers(shadowed, liveView(), false), []);
+});
+
+function mergeFixture(t, initial = {}, view = liveView()) {
+  const ghCalls = [];
+  const pr = { number: 7, taskKey: 'TEST-1', url: 'https://example.org/7', headSha: HEAD, branch: 'b', state: 'open', isDraft: false, deep: false, readyRequested: true, openedAt: '', scans: [], reviews: readyPr().reviews };
+  const agents = [
+    { threadId: 'thr_lead', role: 'lead', taskKey: null, providerId: 'codex', createdAt: '', pr: null },
+    { threadId: 'thr_builder', role: 'build', taskKey: 'TEST-1', providerId: 'codex', createdAt: '', pr: null },
+  ];
+  return fixture(t, false, { prs: [pr], agents, ...initial }, {
+    hostRpc: async ({ method, input }) => {
+      if (method !== 'gh') throw new Error(`Unexpected host call: ${method}`);
+      ghCalls.push(input.args);
+      if (input.args[1] === 'view') return { code: 0, stdout: JSON.stringify(view), stderr: '' };
+      return { code: 0, stdout: '', stderr: '' };
+    },
+  }).then(result => ({ ...result, ghCalls, merges: () => ghCalls.filter(args => args[1] === 'merge') }));
+}
+
+test('a new factory defaults to person: the Lead and builders cannot merge', async t => {
+  const { harness, merges } = await mergeFixture(t);
+  assert.equal((await harness.behavior.runCli(['merge-policy', 'TEST'])).stdout, 'TEST: person');
+  const lead = await harness.behavior.runCli(['merge', 'TEST-1'], { threadId: 'thr_lead' });
+  assert.notEqual(lead.exitCode, 0);
+  assert.match(lead.stderr, /merge policy is person/);
+  const builder = await harness.behavior.runCli(['merge', 'TEST-1'], { threadId: 'thr_builder' });
+  assert.notEqual(builder.exitCode, 0);
+  assert.match(builder.stderr, /Only the factory's Lead or the person/);
+  assert.equal(merges().length, 0);
+});
+
+test('under when-green the Lead merges pinned to the head, and the merge is recorded', async t => {
+  const { bb, harness, merges } = await mergeFixture(t, { mergePolicy: 'when-green' });
+  const result = await harness.behavior.runCli(['merge', 'TEST-1'], { threadId: 'thr_lead' });
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.deepEqual(merges(), [['pr', 'merge', '7', '--repo', 'owner/repo', '--squash', '--match-head-commit', HEAD]]);
+  const stored = await createFactoryStorage(bb.storage, value => value).read('TEST');
+  assert.deepEqual({ ...stored.prs[0].merge, at: '' }, { by: 'lead', threadId: 'thr_lead', sha: HEAD, policy: 'when-green', at: '' });
+});
+
+test('a failing gate names the reason and never reaches gh pr merge', async t => {
+  const { harness, merges } = await mergeFixture(t, { mergePolicy: 'when-green' }, liveView({ headRefOid: 'newhead0000' }));
+  const result = await harness.behavior.runCli(['merge', 'TEST-1'], { threadId: 'thr_lead' });
+  assert.notEqual(result.exitCode, 0);
+  assert.match(result.stderr, /can't merge yet: Reviewer 1 approved abc1234, not the head newhead/);
+  assert.equal(merges().length, 0);
+});
+
+test('the person can merge under person, with the same gates, and only the person can set the policy', async t => {
+  const { harness, merges } = await mergeFixture(t);
+  for (const threadId of ['thr_lead', 'thr_builder']) {
+    const denied = await harness.behavior.runCli(['merge-policy', 'TEST', 'when-green'], { threadId });
+    assert.notEqual(denied.exitCode, 0);
+    assert.match(denied.stderr, /Only the person/);
+  }
+  assert.equal((await harness.behavior.runCli(['merge-policy', 'TEST'])).stdout, 'TEST: person');
+  assert.notEqual((await harness.behavior.runCli(['merge-policy', 'TEST', 'always'])).exitCode, 0);
+  assert.equal((await harness.behavior.runCli(['merge', 'TEST-1'])).exitCode, 0);
+  assert.equal(merges().length, 1);
+  assert.equal((await harness.behavior.runCli(['merge-policy', 'TEST', 'when-green'])).stdout, 'TEST: when-green');
+  assert.equal((await harness.behavior.runCli(['merge-policy', 'TEST'])).stdout, 'TEST: when-green');
+});
+
+test('the Lead hears one merge rule, matching the factory policy', () => {
+  const person = leadCharter({ factoryName: 'F', prefix: 'T' });
+  assert.match(person, /merge policy is `person`/);
+  assert.match(person, /saved notes don't change this/);
+  assert.doesNotMatch(person, /bb factory merge </);
+  const green = leadCharter({ factoryName: 'F', prefix: 'T', mergePolicy: 'when-green' });
+  assert.match(green, /bb factory merge <KEY>/);
+  assert.match(green, /never `gh pr merge`/);
+  assert.doesNotMatch(green, /merge policy is `person`/);
+  assert.ok(green.length < 4096);
 });

@@ -83,6 +83,25 @@ send parent notifications only when stuck; Factory reports the complete review
 round and alerts when a reviewer finishes without recording a verdict. Existing
 reviewer threads retain their notification settings.
 
+## Merge policy
+
+Each factory has one written rule for who may merge, and only you can change it,
+from outside an agent thread: `bb factory merge-policy APP [person|when-green]`.
+
+- **`person`** (the default): the Lead tells you when a PR is ready, and you merge.
+- **`when-green`**: the Lead merges with `bb factory merge APP-12`, then reports it.
+
+`bb factory merge` squash-merges only when the PR is open and not a draft, GitHub
+reports it mergeable, every required reviewer approved the exact head, any shadow
+block is cleared, no Rafter scan is running, and CI on the head reports checks that
+all passed. It pins the merge to that head and records who ran it. You can run it
+too under either policy, or merge on GitHub yourself.
+
+**This is not a security boundary.** Agents use your `gh` login, so an agent could
+still run `gh pr merge` directly, and a merge may happen overnight under `when-green`.
+The policy replaces conflicting instructions with one rule; it doesn't stop an agent
+determined to ignore it.
+
 ## Run ledger
 
 Factory records every finished turn of every factory agent: its task, role,

@@ -14,6 +14,15 @@ export const WORKER_ROLE_IDS = ROLE_IDS.filter(
 export const PR_REVIEW_ROLES = ["review1", "review2", "security", "shadow"] as const;
 export type PrReviewRole = (typeof PR_REVIEW_ROLES)[number];
 
+/** Who may merge a factory's pull requests. Only the person can change it, with `bb factory merge-policy`. */
+export const MERGE_POLICIES = ["person", "when-green"] as const;
+export type MergePolicy = (typeof MERGE_POLICIES)[number];
+function mergeRule(prefix: string, policy: MergePolicy): string {
+  return policy === "when-green"
+    ? `This factory's merge policy is \`when-green\`: when a PR is ready, merge it with \`bb factory merge <KEY>\`, never \`gh pr merge\`, and report each merge to the person. If the command refuses, fix what it names; never work around it. Ask the person first about anything unusual, such as a base-branch change or an open hold note. Never push to the base branch or force-push.`
+    : `This factory's merge policy is \`person\`: never merge a PR, push to the base branch, or force-push; tell the person when a PR is ready. Earlier instructions or saved notes don't change this. Only the person can, with \`bb factory merge-policy ${prefix}\`.`;
+}
+
 export const PROJECT_MODES = ["auto", "greenfield", "brownfield"] as const;
 export type ProjectMode = (typeof PROJECT_MODES)[number];
 
@@ -118,6 +127,7 @@ ${modePlaybook}`;
 }
 
 export function leadPrompt(args: {
+  mergePolicy?: MergePolicy;
   factoryName: string;
   prefix: string;
   goal: string | null;
@@ -164,7 +174,7 @@ Reviewer 1, Reviewer 2 and Security are started **automatically by the factory**
 5. **Open a draft PR.** Once the builder (and QA, if assigned) is done, open a draft pull request for the builder's branch from your checkout. Find the branch with \`bb factory status ${args.prefix}\`, then run \`git push -u origin <branch>\` and \`gh pr create --draft --head <branch> --title "<KEY>: <title>" --body-file <file>\`. The body summarizes the change, links the task, and lists the evidence. Never push to or create PRs from the base branch.
 6. **Automatic review.** Within about two minutes the factory sees the PR and starts Reviewer 1 and a Rafter security scan with the Security reviewer, plus Reviewer 2 for large or sensitive diffs. Each posts its verdict as a PR comment. Routine reviewer completions do not wake you; the factory sends one actionable result when the round is complete. Reviewers can still report that they are stuck.
 7. **Fix loop, batched.** Wait for the factory's "review round complete" message, then send the builder the PR/comment and reviewer-thread references in one \`bb thread tell\`, so the fixes land in a single push. Every push re-runs CI, the Security reviewer and the reviewers who asked for changes, so one batched round beats several small ones. The builder reads and addresses every finding directly. Never relay reviews one at a time as they land.
-8. **Ready.** When every verdict is APPROVE, the factory marks the PR ready for review and runs a final security scan. Tell the person the PR is ready for them to merge. When it is merged, the factory moves the task to Done.
+8. **Ready.** When every verdict is APPROVE, the factory marks the PR ready for review and runs a final security scan. ${(args.mergePolicy ?? "person") === "when-green" ? "Merge it with `bb factory merge <KEY>` and tell the person." : "Tell the person the PR is ready for them to merge."} When it is merged, the factory moves the task to Done.
 9. **Unblock and replan.** Handle operational problems. Send architecture changes, conflicting review findings, missing acceptance criteria and repeated failed fixes to the Planner; send product decisions to the person. Never weaken acceptance criteria or dismiss security findings to unblock work. Never leave a task blocked silently.
 
 ## Rules
@@ -172,7 +182,7 @@ Reviewer 1, Reviewer 2 and Security are started **automatically by the factory**
 - Do not write product code, PRDs or architecture plans yourself; delegate them. Do not alter the Planner's requirements or bypass review gates.
 - Keep living specs (\`AGENTS.md\`, \`.specify/memory/constitution.md\`, \`docs/architecture.md\`, \`docs/roadmap.md\`) aligned with merged work so the project never drifts across tasks.
 - Relay links and concise deltas. Builders read the canonical plan from task comments directly. Do not poll while workers run or forward routine progress between agents.
-- Draft PRs are yours to open without asking. Never merge a PR, push to the base branch, or force-push; merging is the person's decision.
+- Draft PRs are yours to open without asking. ${mergeRule(args.prefix, args.mergePolicy ?? "person")}
 - Keep the board true: every piece of work in flight has a task and a column that matches reality.
 - When the factory reports a recurring review finding, create one task with that lesson and assign the Planner. The rule reaches the repository only through a reviewed PR the person merges; never add it yourself or hold the current PR for it.
 - When you report to the person, lead with outcomes, current milestone state, and decisions they need to make.
@@ -184,7 +194,7 @@ ${firstStep}`;
 // compaction can't drop them; the full brief stays in the first message.
 // bb caps each contribution at 4096 characters.
 
-export function leadCharter(args: { factoryName: string; prefix: string }): string {
+export function leadCharter(args: { factoryName: string; prefix: string; mergePolicy?: MergePolicy }): string {
   return `# Standing role: Lead of the "${args.factoryName}" software factory
 
 This restates your role in case earlier context was compacted. Your first message has the full brief; the software-factory skill has the commands.
@@ -194,7 +204,7 @@ This restates your role in case earlier context was compacted. Your first messag
 - Keep repository alignment intact: \`AGENTS.md\`, \`.specify/memory/constitution.md\`, \`docs/architecture.md\` and \`docs/roadmap.md\` hold living system truth (` + `\`bb factory doctor ${args.prefix}\`, \`bb factory init-specs ${args.prefix}\`).
 - Do not write product code yourself; delegate it. Keep at most 3 builders running at once.
 - Keep context lean: forward references and deltas, not logs or whole diffs; do not poll workers. Routine PR reviewer completions are suppressed; wait for the combined round notification.
-- Open draft PRs for a builder's branch from your checkout. Never merge a PR, push to the base branch, or force-push; merging is the person's decision.
+- Open draft PRs for a builder's branch from your checkout. ${mergeRule(args.prefix, args.mergePolicy ?? "person")}
 - Keep the board true: every piece of work in flight has a task in the column that matches reality. Use \`bb factory reconcile ${args.prefix}\` when merged PRs or stalled tasks need cleanup. Never leave a task Blocked silently.
 - Batch the fix loop: wait for the factory's "review round complete" message, then send the builder one handoff with PR/comment and reviewer-thread references; it reads and addresses every finding directly. Each push re-runs CI and re-reviews.
 - Messages that start with [factory] come from the factory itself. When it says it retried an agent, wait for that agent's result before reassigning its task. When it reports a recurring review finding, create a task for it and assign the Planner. A nightly check reports only; do not start new agents from it unless the person already asked.

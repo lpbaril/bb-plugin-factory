@@ -75,8 +75,9 @@ needed. Do not paste full plans or logs into the Lead thread, or poll active wor
 5. When every required verdict is APPROVE, the factory marks the PR ready for
    review (which also runs full CI) and, with Rafter, runs a final scan. If
    the PR touches files another open factory PR also touches, the Lead gets a
-   merge-train note so it can suggest an order. The person merges; the factory
-   then moves the task to Done.
+   merge-train note so it can suggest an order. The factory's merge policy says who
+   merges: the person, or under `when-green` the Lead with `bb factory merge`. The
+   factory then moves the task to Done.
 
 ## Recurring review findings
 
@@ -130,6 +131,8 @@ skip docs-only changes. PRs stay drafts until every reviewer approves, so
 | `bb factory assign APP-12 --role review1\|review2\|security --pr N` | Replace a reviewer that failed (dead provider, removed model) with a fresh one on the current roster, reviewing that PR. Retrying the old thread keeps the model it was spawned with, so it cannot recover from a provider that ran out. |
 | `bb factory plan-ready APP-12 --comment <id>` | Current Planner only: validate its READY planning comment and allow Builder assignments. |
 | `bb factory verdict APP-12 --role review1\|review2\|security\|shadow --verdict approve\|changes [--pr N]` | Record a reviewer's verdict on the task's PR, after posting it (as a PR comment; the shadow reviewer posts a task comment). Only the reviewer thread the factory started can record it. |
+| `bb factory merge APP-12 [--pr N]` | Lead under the `when-green` policy, or the person: squash-merge after checking approvals and CI on the exact head. Fix what it names if it refuses. |
+| `bb factory merge-policy APP [person\|when-green]` | Show the policy. Only the person can set it, from outside an agent thread. |
 | `bb factory lesson APP-12 --rule "..."\|--same-as <id>` | Task's reviewers only: record a blocking finding a repository rule would have prevented. |
 | `bb factory lessons APP` | List the factory's recurring review findings and their tasks. |
 | `bb factory runs APP [--task APP-12] [--sync]` | Show finished agent turns by role and model. `--sync` first reads every agent thread, including older ones. |
@@ -196,5 +199,6 @@ Provider retry plugin, even when its retry budget is exhausted or it is disabled
 - Assign a Builder before QA or a reviewer: they check the builder's worktree.
 - Blocked is a label on top of the status. Use `bb factory block`, not a
   status change, and always give the reason.
-- The Lead may push builder branches and open draft PRs. Never merge, force-push
-  or push to the base branch; merging is the user's decision.
+- The Lead may push builder branches and open draft PRs. Never force-push or push
+  to the base branch. Merge only as the factory's merge policy allows, and only with
+  `bb factory merge`, never `gh pr merge`.

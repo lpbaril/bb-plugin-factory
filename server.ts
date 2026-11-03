@@ -21,6 +21,7 @@ import { hostContract, repoInspectionSchema, type RepoInspection } from "./host-
 import { createFactoryStorage } from "./factory-storage";
 import type { Lesson, RunCursor, RunRow } from "./factory-storage";
 import {
+  MERGE_POLICIES,
   PROJECT_MODES,
   PR_REVIEW_ROLES,
   ROLES,
@@ -132,8 +133,55 @@ const prSchema = z.object({
   shadowStallNotifiedAt: z.string().nullable().default(null),
   /** The head whose completed review round was reported to the Lead (batched findings). */
   roundNotifiedSha: z.string().nullable().default(null),
+  /** Set when `bb factory merge` merged this PR; a merge on GitHub leaves it null. */
+  merge: z.object({ by: z.enum(["lead", "person"]), threadId: z.string().nullable(), sha: z.string(), policy: z.enum(MERGE_POLICIES), at: z.string() }).nullable().default(null),
 });
 type Pr = z.infer<typeof prSchema>;
+
+const prMergeViewSchema = z.object({
+  state: z.string(),
+  isDraft: z.boolean(),
+  headRefOid: z.string(),
+  mergeable: z.string(),
+  statusCheckRollup: z.array(z.object({
+    name: z.string().nullish(),
+    context: z.string().nullish(),
+    conclusion: z.string().nullish(),
+    state: z.string().nullish(),
+  })).nullish(),
+});
+const PASSING_CHECKS = ["SUCCESS", "NEUTRAL", "SKIPPED"];
+/**
+ * What stops a PR merging, from its live GitHub state. Empty means every gate
+ * passes. Approvals must be on the exact head: the ready gate alone doesn't
+ * promise that, because new commits re-request only some reviewers.
+ */
+export function mergeBlockers(
+  pr: Pick<Pr, "deep" | "reviews" | "scans">,
+  view: z.infer<typeof prMergeViewSchema>,
+  shadowBlocks: boolean,
+): string[] {
+  const blockers: string[] = [];
+  if (view.state !== "OPEN") blockers.push(`it is ${view.state.toLowerCase()}`);
+  if (view.isDraft) blockers.push("it is still a draft");
+  if (view.mergeable !== "MERGEABLE") blockers.push(`GitHub reports it as ${view.mergeable.toLowerCase()}`);
+  const latest = (role: PrReviewRole) => pr.reviews.filter((review) => review.role === role).at(-1);
+  const required: PrReviewRole[] = pr.deep ? ["review1", "review2", "security"] : ["review1", "security"];
+  for (const role of required) {
+    const review = latest(role);
+    if (review?.verdict !== "approve") blockers.push(`${ROLES[role].label} has not approved`);
+    else if (review.sha !== view.headRefOid) blockers.push(`${ROLES[role].label} approved ${review.sha.slice(0, 7)}, not the head ${view.headRefOid.slice(0, 7)}`);
+  }
+  const shadow = latest("shadow");
+  if (shadowBlocks && shadow !== undefined && shadow.verdict !== "approve" && shadow.verdict !== "dismissed") blockers.push("the shadow reviewer's block is open");
+  if (pr.scans.some((scan) => scan.status === "running")) blockers.push("a Rafter scan is still running");
+  const checks = view.statusCheckRollup ?? [];
+  // A head just pushed has no checks yet, so none is not the same as green.
+  if (checks.length === 0) blockers.push("no CI checks are reported on the head");
+  const failing = checks.filter((check) => !PASSING_CHECKS.includes(check.conclusion ?? check.state ?? ""));
+  if (failing.length > 0) blockers.push(`CI isn't green: ${failing.slice(0, 5).map((check) => check.name ?? check.context ?? "unnamed").join(", ")}`);
+  return blockers;
+}
 
 const factorySchema = z.object({
   /** The tracker prefix, which is also the factory's id. */
@@ -153,6 +201,7 @@ const factorySchema = z.object({
   archivedAt: z.string().nullable().default(null),
   /** Project mode override ("auto" detects Greenfield vs. Brownfield from the repository). */
   projectMode: z.enum(PROJECT_MODES).default("auto"),
+  mergePolicy: z.enum(MERGE_POLICIES).default("person"),
 });
 export type Factory = z.infer<typeof factorySchema>;
 
@@ -1028,7 +1077,7 @@ export default async function plugin(bb: BbPluginApi) {
     const entry = agentsByThread.get(threadId);
     if (entry === undefined || entry.factory.archivedAt !== null) return null;
     const { factory, agent } = entry;
-    if (agent.role === "lead") return leadCharter({ factoryName: factory.name, prefix: factory.prefix });
+    if (agent.role === "lead") return leadCharter({ factoryName: factory.name, prefix: factory.prefix, mergePolicy: factory.mergePolicy });
     if (agent.taskKey === null) return null;
     return workerReminder({ role: agent.role, factoryName: factory.name, taskKey: agent.taskKey });
   });
@@ -1102,6 +1151,7 @@ export default async function plugin(bb: BbPluginApi) {
       bbProjectId: args.bbProjectId,
       trackerProjectId: tracker.id,
       blockedLabelId: blocked.id,
+      mergePolicy: "person",
       leadThreadId: null,
       agents: [],
       createdAt: new Date().toISOString(),
@@ -1217,7 +1267,9 @@ export default async function plugin(bb: BbPluginApi) {
             ? `Waiting on ${pending.join(", ")}`
             : pr.isDraft
             ? "All required reviews approved (marking ready)"
-            : "Ready for human merge";
+            : factory.mergePolicy === "when-green"
+            ? `Ready to merge: the Lead may run \`bb factory merge ${task.key}\``
+            : "Ready for the person to merge";
         openPrsAwaitingAction.push({
           taskKey: task.key,
           title: task.title,
@@ -1482,7 +1534,7 @@ export default async function plugin(bb: BbPluginApi) {
       permissionMode: await permissionModeFor(providerId),
       title: `${currentFactory.name} · Lead`,
       pinned: true,
-      prompt: leadPrompt({ factoryName: currentFactory.name, prefix: currentFactory.prefix, goal, alignment }),
+      prompt: leadPrompt({ factoryName: currentFactory.name, prefix: currentFactory.prefix, goal, alignment, mergePolicy: currentFactory.mergePolicy }),
       pluginMetadata: { factory: currentFactory.prefix, role: "lead" },
     });
     await mutateFactory(currentFactory.prefix, (current) => {
@@ -2091,6 +2143,7 @@ ${sections.join("\n\n---\n\n")}`;
         reviews: [],
         scans: [],
         readyRequested: false,
+        merge: null,
         openedAt: new Date().toISOString(),
         shadow: wantsShadow(files, gp.title).length > 0,
         shadowStallNotifiedAt: null,
@@ -2336,10 +2389,10 @@ ${sections.join("\n\n---\n\n")}`;
       await startScan(factory.prefix, repo, pr.number, "ready");
     }
     const labels = roles.map((role) => `${ROLES[role].label} ✓`).join(", ");
-    await prComment(hostId, repo, pr.number, `**Factory:** every reviewer approves (${labels}). Marked ready for review${(await rafterKey()) !== null ? "; a final Rafter scan is running" : ""}. Merging is up to you.`);
+    await prComment(hostId, repo, pr.number, `**Factory:** every reviewer approves (${labels}). Marked ready for review${(await rafterKey()) !== null ? "; a final Rafter scan is running" : ""}. ${factory.mergePolicy === "when-green" ? "The Lead may merge once its gates pass." : "Merging is up to you."}`);
     const task = await getTaskByKey(pr.taskKey);
     await comment(task.id, `[PR #${pr.number}](${pr.url}) approved by ${labels} and marked ready for review.`);
-    await tellLead(factory, `[factory] PR #${pr.number} (${pr.taskKey}) has every approval and is marked ready for review. Tell the person it's ready for them to merge.`);
+    await tellLead(factory, `[factory] PR #${pr.number} (${pr.taskKey}) has every approval and is marked ready for review. ${factory.mergePolicy === "when-green" ? `Merge it with \`bb factory merge ${pr.taskKey}\` once CI is green and every approval covers the head.` : "Tell the person it's ready for them to merge."}`);
     await warnMergeOverlap(factory, hostId, repo, pr);
   }
 
@@ -2496,6 +2549,45 @@ ${sections.join("\n\n---\n\n")}`;
     await maybeReportRound(factory, pr.number);
     wakePrWatch();
     return pr;
+  }
+
+  async function mergePr(args: { taskKey: string; pr: number | null; threadId: string | null }): Promise<{ pr: Pr; sha: string }> {
+    const task = await getTaskByKey(args.taskKey);
+    const factory = await factoryForTaskKey(task.key);
+    const isLead = args.threadId !== null && (args.threadId === factory.leadThreadId || factory.agents.some((agent) => agent.threadId === args.threadId && agent.role === "lead"));
+    if (args.threadId !== null && !isLead) {
+      throw new PluginCliError("Only the factory's Lead or the person can merge a pull request.", { code: "not_allowed_to_merge" });
+    }
+    if (isLead && factory.mergePolicy !== "when-green") {
+      throw new PluginCliError(`${factory.prefix}'s merge policy is ${factory.mergePolicy}, so the Lead can't merge. Tell the person the PR is ready.`, {
+        code: "merge_policy",
+        hint: `Only the person can change this, with \`bb factory merge-policy ${factory.prefix} when-green\`.`,
+      });
+    }
+    const pr = args.pr === null ? latestPr(factory, task.key) : factory.prs.find((candidate) => candidate.number === args.pr) ?? null;
+    if (pr === null || pr.taskKey !== task.key) {
+      throw new PluginCliError(`${task.key} has no pull request the factory is tracking.`, { code: "no_pr" });
+    }
+    const { hostId, repo } = await projectHost(factory);
+    if (repo === null) throw new PluginCliError(`Factory ${factory.prefix} has no GitHub repository.`, { code: "no_repo" });
+    const view = prMergeViewSchema.parse(JSON.parse(await gh(hostId, ["pr", "view", String(pr.number), "--repo", repo, "--json", "state,isDraft,headRefOid,mergeable,statusCheckRollup"])));
+    const blockers = mergeBlockers(pr, view, (await settings.get()).shadowBlocks);
+    if (blockers.length > 0) {
+      throw new PluginCliError(`PR #${pr.number} can't merge yet: ${blockers.join("; ")}.`, {
+        code: "merge_blocked",
+        hint: "For an approval on an older head, ask that reviewer's thread to check the delta and record its verdict again.",
+      });
+    }
+    // Pinned, so a commit pushed after these checks makes GitHub refuse the merge.
+    await gh(hostId, ["pr", "merge", String(pr.number), "--repo", repo, "--squash", "--match-head-commit", view.headRefOid]);
+    const by = isLead ? "lead" : "person";
+    await mutateFactory(factory.prefix, (current) => {
+      const target = current.prs.find((candidate) => candidate.number === pr.number);
+      if (target !== undefined) target.merge = { by, threadId: args.threadId, sha: view.headRefOid, policy: factory.mergePolicy, at: new Date().toISOString() };
+    });
+    await comment(task.id, `Merged [PR #${pr.number}](${pr.url}) at \`${view.headRefOid.slice(0, 7)}\` with \`bb factory merge\`, run by ${isLead ? `the Lead under the ${factory.mergePolicy} policy` : "the person"}.`);
+    wakePrWatch();
+    return { pr, sha: view.headRefOid };
   }
 
   /**
@@ -3321,6 +3413,37 @@ ${findings}`;
             return { exitCode: 0, stdout: `Recorded ${input.options.verdict} from ${ROLES[input.options.role as PrReviewRole].label} on PR #${pr.number}.` };
           },
         }),
+        merge: cliCommand({
+          summary: "Squash-merge the task's pull request after checking its approvals and CI on the exact head",
+          positionals: [{ name: "task", description: "Task key, such as APP-12", required: true }],
+          options: { pr: { type: "integer", min: 1, max: 10_000_000, description: "PR number; defaults to the task's latest PR" } },
+          async run(input, ctx) {
+            const taskKey = input.positionals.task;
+            const { pr, sha } = await withTaskLock(taskKey, () => mergePr({ taskKey, pr: input.options.pr ?? null, threadId: ctx.threadId ?? null }));
+            return { exitCode: 0, stdout: `Merged PR #${pr.number} at ${sha.slice(0, 7)}.` };
+          },
+        }),
+        "merge-policy": cliCommand({
+          summary: "Show or set who may merge a factory's pull requests: person, or when-green to let the Lead (setting it is for the person only)",
+          positionals: [
+            { name: "factory", description: "Factory prefix", required: true },
+            { name: "policy", description: "person or when-green; omit to show the current policy" },
+          ],
+          async run(input, ctx) {
+            const factory = await findFactory(input.positionals.factory);
+            const requested = input.positionals.policy;
+            if (requested === undefined) return { exitCode: 0, stdout: `${factory.prefix}: ${factory.mergePolicy}` };
+            const policy = z.enum(MERGE_POLICIES).safeParse(requested);
+            if (!policy.success) throw new PluginCliError("The policy is person or when-green.", { code: "merge_policy_input" });
+            if (ctx.threadId != null) {
+              throw new PluginCliError("Only the person can change a merge policy, from outside an agent thread.", { code: "merge_policy_person_only" });
+            }
+            await mutateFactory(factory.prefix, (current) => {
+              current.mergePolicy = policy.data;
+            });
+            return { exitCode: 0, stdout: `${factory.prefix}: ${policy.data}` };
+          },
+        }),
         lesson: cliCommand({
           summary: "Record a blocking finding a repository rule would have prevented (reviewers only)",
           positionals: [{ name: "task", description: "Task key, such as APP-12", required: true }],
@@ -3559,7 +3682,7 @@ ${findings}`;
               environmentBranchName: string | null;
             }[];
             const branches = new Map(listed.map((thread) => [thread.id, thread.environmentBranchName]));
-            const lines = [`Factory ${factory.prefix} · ${factory.name} · Lead ${factory.leadThreadId ?? "not started"}`];
+            const lines = [`Factory ${factory.prefix} · ${factory.name} · Lead ${factory.leadThreadId ?? "not started"} · Merge policy ${factory.mergePolicy}`];
             for (const column of COLUMNS) {
               const inColumn = tasks.filter((task) => task.column === column);
               lines.push("", `${COLUMN_LABELS[column]} (${inColumn.length})`);
