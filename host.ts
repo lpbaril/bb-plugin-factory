@@ -237,6 +237,16 @@ Before planning, writing code, or reviewing a pull request, consult:
 ### Discovered Repository Docs
 ${docList}
 
+### Read First, Because
+
+A document only gets opened if skipping it has a known price, so each row names what goes wrong without it. When a review or an incident exposes a real trap, replace the generic reason with that trap and link the PR.
+
+| Document | Read it before | Because |
+| --- | --- | --- |
+| \`.specify/memory/constitution.md\` | Planning, building or reviewing anything | Reviews otherwise block on personal taste, and builders ship what the review contract rejects. |
+| \`docs/architecture.md\` | Changing any path listed in its module table | Its "Read this first, because" column names the regression a naive change to that path causes. |
+| \`docs/roadmap.md\` | Starting or replanning a task | Work otherwise lands outside the active milestone gate and has to be redone or dropped. |
+
 ## 2. How Work Flows Across Roles (${mode === "greenfield" ? "Greenfield Mode" : "Brownfield Mode"})
 
 1. **Lead (\`lead\`):** Coordinates the \`${prefix}\` board, keeps \`docs/roadmap.md\` aligned with reality, delegates ambiguity/architecture to the **Planner**, and opens draft PRs when Builders finish. Never writes product code directly.
@@ -257,10 +267,12 @@ _Describe the core runtime components, data flow, and primary user surfaces._
 
 ## 2. Module & Directory Boundaries
 
-| Path / Module | Responsibility | Allowed Dependencies |
-| --- | --- | --- |
-| \`src/\` or \`crates/\` | Core application logic | Internal domain modules only |
-| \`docs/\` & \`.specify/\` | Living specs, ADRs, Constitution | Referenced by all agents |
+The last column is the point: a topic label gives an agent no reason to open a document, but a named regression does. Write what a naive change to that path breaks, and link the PR or incident once one exists.
+
+| Path / Module | Responsibility | Allowed Dependencies | Read this first, because |
+| --- | --- | --- | --- |
+| \`src/\` or \`crates/\` | Core application logic | Internal domain modules only | _Name the invariant a naive change here breaks and what the failure looks like._ |
+| \`docs/\` & \`.specify/\` | Living specs, ADRs, Constitution | Referenced by all agents | Editing a rule here changes what every later review blocks on. |
 
 ## 3. Key Invariants & Contracts
 

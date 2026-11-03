@@ -27,6 +27,7 @@ import type {
   FactoryDoctorReport,
   FactorySummary,
   PrSummary,
+  RunReport,
   TaskComment,
   rpcContract,
 } from "./server";
@@ -521,6 +522,7 @@ function FactoryView({ prefix }: { prefix: string }) {
   const live = useLiveAgents(board?.agents ?? EMPTY_AGENTS);
   const [openTaskId, setOpenTaskId] = useState<string | null>(null);
   const [showAlignment, setShowAlignment] = useState(false);
+  const [showRuns, setShowRuns] = useState(false);
 
   const move = useCallback(
     (taskId: string, column: Column) => {
@@ -551,9 +553,14 @@ function FactoryView({ prefix }: { prefix: string }) {
         <AgentsStrip factory={board.factory} doctor={doctor} live={live} onStarted={refreshAll} />
         <div className="flex flex-wrap items-center justify-between gap-2">
           <Metrics tasks={board.tasks} live={live} />
-          {doctor === null ? null : (
-            <AlignmentBar doctor={doctor} onOpen={() => setShowAlignment(true)} />
-          )}
+          <div className="flex flex-wrap items-center gap-2">
+            <Button size="sm" variant="secondary" onClick={() => setShowRuns(true)}>
+              Runs
+            </Button>
+            {doctor === null ? null : (
+              <AlignmentBar doctor={doctor} onOpen={() => setShowAlignment(true)} />
+            )}
+          </div>
         </div>
         {error === null ? null : <Alert>{error}</Alert>}
       </div>
@@ -572,6 +579,7 @@ function FactoryView({ prefix }: { prefix: string }) {
         onMove={move}
         onClose={() => setOpenTaskId(null)}
       />
+      <RunsDialog open={showRuns} prefix={prefix} onClose={() => setShowRuns(false)} />
       <AlignmentDialog
         open={showAlignment}
         doctor={doctor}
@@ -586,6 +594,101 @@ function FactoryView({ prefix }: { prefix: string }) {
   );
 }
 const EMPTY_AGENTS: Agent[] = [];
+
+// ---------- Run ledger ----------
+
+const TOKENS = new Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 1 });
+const roleName = (role: string) => ROLES[role as keyof typeof ROLES]?.label ?? role;
+const minutes = (ms: number) => (ms < 60_000 ? "<1 min" : `${Math.round(ms / 60_000)} min`);
+
+function RunsDialog({ open, prefix, onClose }: { open: boolean; prefix: string; onClose: () => void }) {
+  const rpc = useRpc<typeof rpcContract>();
+  const [report, setReport] = useState<RunReport | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    setError(null);
+    rpc.call("factory_runs", { prefix, taskKey: null }).then(
+      (next) => { if (!cancelled) setReport(next); },
+      (cause) => { if (!cancelled) setError(errorText(cause)); },
+    );
+    return () => { cancelled = true; };
+  }, [rpc, open, prefix]);
+  return (
+    <Dialog open={open} onOpenChange={(next) => { if (!next) onClose(); }}>
+      <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-3xl">
+        <DialogHeader>
+          <DialogTitle>Runs</DialogTitle>
+          <DialogDescription>
+            Finished agent turns by role and model. New input excludes cached tokens, so it compares across providers.
+          </DialogDescription>
+        </DialogHeader>
+        {error === null ? null : <Alert>{error}</Alert>}
+        {report === null ? (
+          error === null ? <EmptyState>Loading runs…</EmptyState> : null
+        ) : report.groups.length === 0 ? (
+          <EmptyState>
+            No runs yet. Turns appear as agents finish, and the nightly check fills in older threads. To do that now, run{" "}
+            <code className="font-mono">bb factory runs {prefix} --sync</code>.
+          </EmptyState>
+        ) : (
+          <div className="space-y-4 text-xs">
+            <div className="overflow-x-auto">
+              <table className="w-full text-left">
+                <thead className="text-muted-foreground">
+                  <tr>
+                    <th className="py-1 pr-3 font-medium">Role</th>
+                    <th className="py-1 pr-3 font-medium">Model</th>
+                    <th className="py-1 pr-3 text-right font-medium">Turns</th>
+                    <th className="py-1 pr-3 text-right font-medium">Failed</th>
+                    <th className="py-1 pr-3 text-right font-medium">Time</th>
+                    <th className="py-1 pr-3 text-right font-medium">New input</th>
+                    <th className="py-1 pr-3 text-right font-medium">Cached</th>
+                    <th className="py-1 pr-3 text-right font-medium">Output</th>
+                    <th className="py-1 text-right font-medium">Verdicts</th>
+                  </tr>
+                </thead>
+                <tbody className="tabular-nums">
+                  {report.groups.map((group) => (
+                    <tr key={`${group.role}/${group.providerId}/${group.model}`} className="border-t border-border">
+                      <td className="py-1 pr-3">{roleName(group.role)}</td>
+                      <td className="py-1 pr-3 font-mono text-[11px]">{group.model ?? group.providerId}</td>
+                      <td className="py-1 pr-3 text-right">{group.runs}</td>
+                      <td className="py-1 pr-3 text-right">{group.failed}</td>
+                      <td className="py-1 pr-3 text-right">{minutes(group.durationMs)}</td>
+                      <td className="py-1 pr-3 text-right">{TOKENS.format(group.tokensTotal - group.tokensCached - group.tokensOutput)}</td>
+                      <td className="py-1 pr-3 text-right">{TOKENS.format(group.tokensCached)}</td>
+                      <td className="py-1 pr-3 text-right">{TOKENS.format(group.tokensOutput)}</td>
+                      <td className="py-1 text-right">
+                        {group.approvals + group.changes === 0 ? "—" : `${group.approvals} approved, ${group.changes} changes`}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div className="space-y-1">
+              <div className="font-medium text-muted-foreground">Latest turns</div>
+              <ul className="divide-y divide-border">
+                {report.recent.map((run) => (
+                  <li key={`${run.threadId}/${run.endSeq}`} className="flex flex-wrap items-baseline gap-x-2 py-1">
+                    <span className="font-mono text-[11px]">{run.taskKey ?? "—"}</span>
+                    <span>{roleName(run.role)}</span>
+                    <span className={cn("capitalize", run.outcome === "completed" ? "text-muted-foreground" : "text-destructive")}>{run.outcome}</span>
+                    <span className="text-muted-foreground">{minutes(run.endedAt - run.startedAt)}</span>
+                    <span className="ml-auto text-muted-foreground">{new Date(run.endedAt).toLocaleString()}</span>
+                    {run.error === null ? null : <span className="w-full truncate text-destructive">{run.error}</span>}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </div>
+        )}
+      </DialogContent>
+    </Dialog>
+  );
+}
 
 // ---------- Agents ----------
 

@@ -19,6 +19,7 @@ import {
 import { z } from "zod";
 import { hostContract, repoInspectionSchema, type RepoInspection } from "./host-contract";
 import { createFactoryStorage } from "./factory-storage";
+import type { Lesson, RunCursor, RunRow } from "./factory-storage";
 import {
   PROJECT_MODES,
   PR_REVIEW_ROLES,
@@ -289,6 +290,43 @@ const agentsViewSchema = z.object({
 });
 export type AgentsView = z.infer<typeof agentsViewSchema>;
 
+const runRowSchema = z.object({
+  threadId: z.string(),
+  endSeq: z.number(),
+  taskKey: z.string().nullable(),
+  role: z.string(),
+  providerId: z.string(),
+  model: z.string().nullable(),
+  reasoning: z.string().nullable(),
+  outcome: z.enum(["completed", "failed", "interrupted"]),
+  error: z.string().nullable(),
+  startedAt: z.number(),
+  endedAt: z.number(),
+  tokensTotal: z.number().nullable(),
+  tokensCached: z.number().nullable(),
+  tokensOutput: z.number().nullable(),
+});
+const runGroupSchema = z.object({
+  role: z.string(),
+  providerId: z.string(),
+  model: z.string().nullable(),
+  runs: z.number(),
+  failed: z.number(),
+  interrupted: z.number(),
+  durationMs: z.number(),
+  tokensTotal: z.number(),
+  tokensCached: z.number(),
+  tokensOutput: z.number(),
+  /** Verdicts this role and model recorded; zero outside the review roles. */
+  approvals: z.number(),
+  changes: z.number(),
+});
+const runReportSchema = z.object({
+  groups: z.array(runGroupSchema),
+  recent: z.array(runRowSchema),
+});
+export type RunReport = z.infer<typeof runReportSchema>;
+
 export const rpcContract = defineRpcContract({
   factories_list: {
     input: z.null(),
@@ -361,6 +399,10 @@ export const rpcContract = defineRpcContract({
       leadNotified: z.boolean(),
       doctor: factoryDoctorSchema,
     }),
+  },
+  factory_runs: {
+    input: z.object({ prefix: z.string(), taskKey: z.string().nullable() }),
+    output: runReportSchema,
   },
   lead_start: {
     input: z.object({
@@ -447,6 +489,56 @@ export function supervisorAction(
   return event.attemptNumber <= 1 ? "retry" : "escalate";
 }
 
+/** The fields of a thread event the run ledger reads. */
+type RunEvent = { seq: number | string; type: string; createdAt: number; data: unknown };
+export type LedgerTurn = Pick<RunRow, "endSeq" | "model" | "reasoning" | "outcome" | "error" | "startedAt" | "endedAt">;
+const turnRequestedData = z.object({
+  execution: z.object({ model: z.string().nullish(), reasoningLevel: z.string().nullish() }).nullish(),
+});
+const turnCompletedData = z.object({
+  status: z.enum(["completed", "failed", "interrupted"]),
+  error: z.object({ message: z.string() }).nullish(),
+});
+/**
+ * Turns finished in a stretch of a thread's events, and the last sequence safe
+ * to skip next time. A turn still running stays unread, so it is recorded when
+ * it ends, unless `failure` says the thread already landed in error.
+ */
+export function turnsFromEvents(events: readonly RunEvent[], failure: string | null = null): { turns: LedgerTurn[]; closedSeq: number | null } {
+  const turns: LedgerTurn[] = [];
+  let requested = { model: null as string | null, reasoning: null as string | null };
+  let open: { startedAt: number; model: string | null; reasoning: string | null } | null = null;
+  let closedSeq: number | null = null;
+  let previous: { seq: number; createdAt: number } | null = null;
+  const close = (outcome: LedgerTurn["outcome"], error: string | null, endSeq: number, endedAt: number) => {
+    if (open === null) return;
+    turns.push({ ...open, outcome, error: error === null ? null : error.slice(0, 300), endSeq, endedAt });
+    open = null;
+    closedSeq = endSeq;
+  };
+  for (const event of events) {
+    const seq = Number(event.seq);
+    if (event.type === "client/turn/requested" && open === null) {
+      const execution = turnRequestedData.safeParse(event.data).data?.execution;
+      if (execution != null) requested = { model: execution.model ?? null, reasoning: execution.reasoningLevel ?? null };
+    } else if (event.type === "turn/started") {
+      // A new turn started without the last one reporting an end: it was cut off.
+      if (previous !== null) close("interrupted", null, previous.seq, previous.createdAt);
+      open = { startedAt: event.createdAt, ...requested };
+    } else if (event.type === "turn/completed") {
+      const parsed = turnCompletedData.safeParse(event.data).data;
+      close(parsed?.status ?? "completed", parsed?.error?.message ?? (parsed?.status === "failed" ? failure : null), seq, event.createdAt);
+      closedSeq = seq;
+    }
+    previous = { seq, createdAt: event.createdAt };
+  }
+  if (failure !== null && previous !== null) close("failed", failure, previous.seq, previous.createdAt);
+  return { turns, closedSeq };
+}
+const tokenUsageData = z.object({
+  tokenUsage: z.object({ total: z.object({ totalTokens: z.number(), cachedInputTokens: z.number(), outputTokens: z.number() }) }),
+});
+
 const AGENTS_KV = "agents";
 /** Set once the old per-role settings have been copied into AGENTS_KV. */
 const AGENTS_MIGRATED_KV = "agents-migrated";
@@ -492,6 +584,13 @@ export default async function plugin(bb: BbPluginApi) {
       label: "Review factory pull requests automatically",
       description:
         "When the Lead opens a PR for a task, start Reviewer 1 (and Reviewer 2 for large or sensitive diffs) plus the Security reviewer. Each posts its verdict as a PR comment.",
+      default: true,
+    },
+    nightlyChecks: {
+      type: "boolean",
+      label: "Run a nightly check",
+      description:
+        "At 3:00 server time, update the run ledger, move tasks with merged PRs to Done, and look for stalled tasks. The Lead is woken only when a stalled task or a waiting READY plan is new since the last check, and it reports without starting new agents.",
       default: true,
     },
     superviseAgents: {
@@ -1233,6 +1332,22 @@ export default async function plugin(bb: BbPluginApi) {
     return lines.join("\n");
   }
 
+  function reconcileBrief(factory: Factory, doctor: FactoryDoctorReport, reconciledMoveToDone: string[]): string[] {
+    const idleList = doctor.boardHealth.inProgressWithoutLiveWorker.map((t) => `${t.taskKey} (${t.title})`).join(", ");
+    const readyList = doctor.boardHealth.readyPlansAwaitingBuilder.map((t) => `${t.taskKey} (comment ${t.commentId})`).join(", ");
+    const prList = doctor.boardHealth.openPrsAwaitingAction.map((t) => `${t.taskKey} PR #${t.pr}: ${t.summary}`).join("; ");
+    return [
+      `[factory] Alignment & Board Reconciliation check for ${factory.prefix} (${doctor.effectiveMode} mode):`,
+      reconciledMoveToDone.length > 0
+        ? `- Auto-moved merged PR task(s) to Done: ${reconciledMoveToDone.join(", ")}.`
+        : null,
+      `- Alignment files in repo: AGENTS.md=${doctor.files.agentsMd ?? "missing"}, Constitution=${doctor.files.constitution ?? "missing"}, Specs=${doctor.files.specs ?? "missing"}, Roadmap=${doctor.files.roadmap ?? "missing"}.`,
+      idleList ? `- In-progress task(s) with no active worker thread: ${idleList}. Check their output/comments and move them to Done, To do, or Blocked, or assign the next specialist.` : null,
+      readyList ? `- Task(s) with a READY plan comment awaiting Builder or closure: ${readyList}.` : null,
+      prList ? `- Open PRs in flight: ${prList}.` : null,
+    ].filter((line) => line !== null);
+  }
+
   async function reconcileFactory(
     factory: Factory,
     notifyLead = false,
@@ -1254,22 +1369,10 @@ export default async function plugin(bb: BbPluginApi) {
     const doctor = await computeDoctorReport(factory);
     let leadNotified = false;
     if (notifyLead && factory.leadThreadId !== null) {
-      const idleList = doctor.boardHealth.inProgressWithoutLiveWorker.map((t) => `${t.taskKey} (${t.title})`).join(", ");
-      const readyList = doctor.boardHealth.readyPlansAwaitingBuilder.map((t) => `${t.taskKey} (comment ${t.commentId})`).join(", ");
-      const prList = doctor.boardHealth.openPrsAwaitingAction.map((t) => `${t.taskKey} PR #${t.pr}: ${t.summary}`).join("; ");
       const message = [
-        `[factory] Alignment & Board Reconciliation check for ${factory.prefix} (${doctor.effectiveMode} mode):`,
-        reconciledMoveToDone.length > 0
-          ? `- Auto-moved merged PR task(s) to Done: ${reconciledMoveToDone.join(", ")}.`
-          : null,
-        `- Alignment files in repo: AGENTS.md=${doctor.files.agentsMd ?? "missing"}, Constitution=${doctor.files.constitution ?? "missing"}, Specs=${doctor.files.specs ?? "missing"}, Roadmap=${doctor.files.roadmap ?? "missing"}.`,
-        idleList ? `- In-progress task(s) with no active worker thread: ${idleList}. Check their output/comments and move them to Done, To do, or Blocked, or assign the next specialist.` : null,
-        readyList ? `- Task(s) with a READY plan comment awaiting Builder or closure: ${readyList}.` : null,
-        prList ? `- Open PRs in flight: ${prList}.` : null,
+        ...reconcileBrief(factory, doctor, reconciledMoveToDone),
         `Please read \`AGENTS.md\` and \`.specify/memory/constitution.md\` (if present), resolve any stalled board items above, and give the person a concise status update: (1) where we are in the current milestone, (2) what was just reconciled or unblocked, and (3) the exact next step.`,
-      ]
-        .filter((line) => line !== null)
-        .join("\n");
+      ].join("\n");
       leadNotified = await tellThread(factory.leadThreadId, message);
     }
     return { reconciledMoveToDone, leadNotified, doctor };
@@ -2545,6 +2648,201 @@ ${findings}`;
     await tellLead(factory, `[factory] ${who} failed${again}: ${why}. ${agent.taskKey} is marked Blocked. ${next}.`);
   });
 
+  // ----- Run ledger -----
+
+  const RUN_EVENT_TYPES = ["client/turn/requested", "turn/started", "turn/completed"] as const;
+  /** The most events the server returns in one page. */
+  const RUN_EVENT_PAGE = 100;
+  /** Sync one thread at a time: its idle event, a failure and the nightly check can overlap. */
+  const runSyncs = new Map<string, Promise<unknown>>();
+  function syncRuns(prefix: string, agent: Agent, failure: string | null = null): Promise<void> {
+    const next = (runSyncs.get(agent.threadId) ?? Promise.resolve()).catch(() => {}).then(() => readRuns(prefix, agent, failure));
+    runSyncs.set(agent.threadId, next);
+    return next.finally(() => {
+      if (runSyncs.get(agent.threadId) === next) runSyncs.delete(agent.threadId);
+    });
+  }
+  async function readRuns(prefix: string, agent: Agent, failure: string | null): Promise<void> {
+    const cursor = factoryStorage.runCursor(agent.threadId);
+    const events: RunEvent[] = [];
+    for (let afterSeq = cursor.lastSeq; ; ) {
+      const page = await bb.sdk.threads.events.list({
+        threadId: agent.threadId, afterSeq: String(afterSeq), types: RUN_EVENT_TYPES, order: "asc", limit: String(RUN_EVENT_PAGE),
+      });
+      events.push(...page);
+      const last = page.at(-1);
+      if (last === undefined || page.length < RUN_EVENT_PAGE) break;
+      afterSeq = Number(last.seq);
+    }
+    const { turns, closedSeq } = turnsFromEvents(events, failure);
+    if (closedSeq === null) return;
+    const next: RunCursor = { ...cursor, lastSeq: closedSeq };
+    let tokens = { tokensTotal: null as number | null, tokensCached: null as number | null, tokensOutput: null as number | null };
+    if (turns.length > 0) {
+      // Core keeps little token history, so the thread's growth goes on its newest turn; totals stay right.
+      const [latest] = await bb.sdk.threads.events.list({ threadId: agent.threadId, types: ["thread/tokenUsage/updated"], order: "desc", limit: "1" });
+      const total = tokenUsageData.safeParse(latest?.data).data?.tokenUsage.total;
+      if (total !== undefined) {
+        // A smaller total means the provider session restarted; everything in it is new.
+        const base = total.totalTokens >= cursor.tokensTotal ? cursor : { tokensTotal: 0, tokensCached: 0, tokensOutput: 0 };
+        if (total.totalTokens > base.tokensTotal) {
+          tokens = {
+            tokensTotal: total.totalTokens - base.tokensTotal,
+            tokensCached: Math.max(0, total.cachedInputTokens - base.tokensCached),
+            tokensOutput: Math.max(0, total.outputTokens - base.tokensOutput),
+          };
+        }
+        next.tokensTotal = total.totalTokens;
+        next.tokensCached = total.cachedInputTokens;
+        next.tokensOutput = total.outputTokens;
+      }
+    }
+    const rows: RunRow[] = turns.map((turn, index) => ({
+      ...turn,
+      threadId: agent.threadId,
+      prefix,
+      taskKey: agent.taskKey,
+      role: agent.role,
+      providerId: agent.providerId,
+      ...(index === turns.length - 1 ? tokens : { tokensTotal: null, tokensCached: null, tokensOutput: null }),
+    }));
+    factoryStorage.appendRuns(agent.threadId, rows, next);
+  }
+  /** Reads every agent's new turns, which also backfills threads older than the ledger. */
+  async function syncFactoryRuns(factory: Factory): Promise<void> {
+    for (const agent of factory.agents) {
+      await syncRuns(factory.prefix, agent).catch((error: unknown) => bb.log.warn(`run ledger could not read ${agent.threadId}: ${String(error)}`));
+    }
+  }
+  function runReport(factory: Factory, taskKey: string | null): RunReport {
+    const models = factoryStorage.threadModels(factory.prefix);
+    const verdicts = new Map<string, { approvals: number; changes: number }>();
+    for (const pr of factory.prs) {
+      if (taskKey !== null && pr.taskKey !== taskKey) continue;
+      for (const review of pr.reviews) {
+        if (review.threadId === null || !models.has(review.threadId)) continue;
+        if (review.verdict !== "approve" && review.verdict !== "changes") continue;
+        const key = `${review.role}\0${models.get(review.threadId) ?? ""}`;
+        const count = verdicts.get(key) ?? { approvals: 0, changes: 0 };
+        if (review.verdict === "approve") count.approvals += 1;
+        else count.changes += 1;
+        verdicts.set(key, count);
+      }
+    }
+    return {
+      groups: factoryStorage.runGroups(factory.prefix, taskKey).map((group) => ({
+        ...group,
+        ...(verdicts.get(`${group.role}\0${group.model ?? ""}`) ?? { approvals: 0, changes: 0 }),
+      })),
+      recent: factoryStorage.recentRuns(factory.prefix, taskKey, 50),
+    };
+  }
+  const roleLabel = (role: string) => ROLES[role as RoleId]?.label ?? role;
+  function formatRunReport(prefix: string, taskKey: string | null, report: RunReport): string {
+    if (report.groups.length === 0) {
+      return `No runs recorded for ${taskKey ?? prefix}. Add --sync to read existing threads.`;
+    }
+    const number = (value: number) => value.toLocaleString("en-US");
+    const lines = [`Runs for ${taskKey ?? prefix}, by role and model (tokens: new input / cached / output):`];
+    for (const group of report.groups) {
+      const uncached = group.tokensTotal - group.tokensCached - group.tokensOutput;
+      const verdicts = group.approvals + group.changes > 0 ? `, ${group.approvals} approved, ${group.changes} changes requested` : "";
+      lines.push(
+        `  ${roleLabel(group.role)} on ${group.providerId}/${group.model ?? "unknown"}: ${group.runs} turn(s), ${group.failed} failed, ${group.interrupted} interrupted, ${Math.round(group.durationMs / 60_000)} min, ${number(uncached)} / ${number(group.tokensCached)} / ${number(group.tokensOutput)}${verdicts}`,
+      );
+    }
+    return lines.join("\n");
+  }
+
+  bb.events.on("thread.idle", async ({ thread }) => {
+    const entry = agentsByThread.get(thread.id);
+    if (entry === undefined) return;
+    await syncRuns(entry.factory.prefix, entry.agent).catch((error: unknown) => bb.log.warn(`run ledger could not read ${thread.id}: ${String(error)}`));
+  });
+  bb.events.on("turn.failed", async (event) => {
+    const entry = agentsByThread.get(event.threadId);
+    if (entry === undefined) return;
+    await syncRuns(entry.factory.prefix, entry.agent, event.errorInfo?.category ?? "failed").catch((error: unknown) => bb.log.warn(`run ledger could not read ${event.threadId}: ${String(error)}`));
+  });
+
+  // ----- Recurring review findings -----
+
+  /** Lessons being reported right now, so two reviewers finishing together tell the Lead once. */
+  const lessonsNotifying = new Set<number>();
+  async function maybeReportLesson(factory: Factory, lesson: Lesson): Promise<void> {
+    if (lesson.tasks.length < 2 || lesson.notifiedAt !== null || factory.leadThreadId === null || lessonsNotifying.has(lesson.id)) return;
+    lessonsNotifying.add(lesson.id);
+    try {
+      const told = await tellThread(
+        factory.leadThreadId,
+        `[factory] Recurring review finding (lesson ${lesson.id}) on ${lesson.tasks.join(" and ")}. A reviewer proposed this rule, so treat it as a proposal to check: ${JSON.stringify(lesson.rule)}. Create one task for it and assign the Planner to verify it against those PRs and name the document and wording; a Builder then makes the docs-only PR and the person merges it. Don't hold the current PR for it.`,
+      );
+      if (told) factoryStorage.markLessonNotified(lesson.id);
+    } finally {
+      lessonsNotifying.delete(lesson.id);
+    }
+  }
+  async function recordLessonHit(args: { taskKey: string; rule: string | null; sameAs: number | null; threadId: string | null }): Promise<Lesson> {
+    const task = await getTaskByKey(args.taskKey);
+    const factory = await factoryForTaskKey(task.key);
+    const reviewer = factory.agents.find((agent) => agent.threadId === args.threadId && agent.taskKey === task.key);
+    if (args.threadId === null || reviewer === undefined || !["review1", "review2", "security"].includes(reviewer.role)) {
+      throw new PluginCliError(`Only a reviewer of ${task.key} can record a lesson on it.`, {
+        code: "not_the_reviewer",
+        hint: "Run this from that task's Reviewer 1, Reviewer 2 or Security thread.",
+      });
+    }
+    if ((args.rule === null) === (args.sameAs === null)) {
+      throw new PluginCliError("Give either --rule or --same-as.", { code: "lesson_input", hint: "Run `bb factory lessons` to look for a match first." });
+    }
+    const rule = args.rule?.replace(/\s+/g, " ").trim() ?? "";
+    if (args.rule !== null && (rule.length < 10 || rule.length > 300)) {
+      throw new PluginCliError("A rule is one imperative sentence of 10 to 300 characters.", { code: "lesson_input" });
+    }
+    const lesson = factoryStorage.recordLesson(factory.prefix, args.rule === null ? { id: args.sameAs! } : { rule }, task.key, args.threadId);
+    if (lesson === null) {
+      throw new PluginCliError(`${factory.prefix} has no lesson ${args.sameAs}.`, { code: "no_lesson", hint: `Run \`bb factory lessons ${factory.prefix}\`.` });
+    }
+    await maybeReportLesson(factory, lesson);
+    return lesson;
+  }
+
+  // ----- Nightly check -----
+
+  /** Wakes the Lead only for findings it hasn't heard about, so a stuck board costs one turn, not one a night. */
+  async function nightlyCheck(factory: Factory): Promise<void> {
+    await syncFactoryRuns(factory);
+    const { reconciledMoveToDone, doctor } = await reconcileFactory(factory);
+    const { inProgressWithoutLiveWorker: idle, readyPlansAwaitingBuilder: ready } = doctor.boardHealth;
+    const findings = [...idle.map((t) => `idle:${t.taskKey}`), ...ready.map((t) => `ready:${t.taskKey}`)].sort().join(",");
+    const key = `nightly-findings:${factory.prefix}`;
+    if (findings === "") {
+      await bb.storage.kv.delete(key);
+      return;
+    }
+    if ((await bb.storage.kv.get(key)) === findings || factory.leadThreadId === null) return;
+    const message = [
+      ...reconcileBrief(factory, doctor, reconciledMoveToDone),
+      "This is the nightly check and nobody may be watching. Triage these and report them to the person; don't start new agents for them unless the person already asked.",
+    ].join("\n");
+    if (await tellThread(factory.leadThreadId, message)) await bb.storage.kv.set(key, findings);
+  }
+  bb.background.schedule("nightly-check", "0 3 * * *", async () => {
+    if (!(await settings.get()).nightlyChecks) return;
+    const failed: string[] = [];
+    for (const factory of await listFactories()) {
+      if (factory.archivedAt !== null) continue;
+      try {
+        await nightlyCheck(factory);
+      } catch (error) {
+        bb.log.warn(`nightly check failed for ${factory.prefix}: ${String(error)}`);
+        failed.push(factory.prefix);
+      }
+    }
+    // One bad factory doesn't stop the rest; this makes the failure visible in `bb plugin list`.
+    if (failed.length > 0) throw new Error(`Nightly check failed for ${failed.join(", ")}; see the plugin log.`);
+  });
+
   // ----- RPC for the Factory page -----
 
   bb.rpc.register(rpcContract, {
@@ -2569,6 +2867,7 @@ ${findings}`;
         tasks: tasks.filter((task) => task.status !== "canceled").map((task) => toBoardTask(factory, task)),
       };
     },
+    factory_runs: async ({ prefix, taskKey }) => runReport(await findFactory(prefix), taskKey),
     factory_doctor: async ({ prefix }) => computeDoctorReport(await findFactory(prefix)),
     factory_set_mode: async ({ prefix, projectMode }) => {
       const updated = await mutateFactory(prefix, (factory) => {
@@ -2999,6 +3298,54 @@ ${findings}`;
               threadId: ctx.threadId ?? null,
             });
             return { exitCode: 0, stdout: `Recorded ${input.options.verdict} from ${ROLES[input.options.role as PrReviewRole].label} on PR #${pr.number}.` };
+          },
+        }),
+        lesson: cliCommand({
+          summary: "Record a blocking finding a repository rule would have prevented (reviewers only)",
+          positionals: [{ name: "task", description: "Task key, such as APP-12", required: true }],
+          options: {
+            rule: { type: "string", description: "A new lesson: one imperative sentence" },
+            "same-as": { type: "integer", min: 1, max: 1_000_000_000, description: "An existing lesson's id, from `bb factory lessons`" },
+          },
+          async run(input, ctx) {
+            const lesson = await recordLessonHit({
+              taskKey: input.positionals.task,
+              rule: input.options.rule ?? null,
+              sameAs: input.options["same-as"] ?? null,
+              threadId: ctx.threadId ?? null,
+            });
+            return { exitCode: 0, stdout: `Recorded lesson ${lesson.id}, now on ${lesson.tasks.join(", ")}.` };
+          },
+        }),
+        lessons: cliCommand({
+          summary: "List the factory's recurring review findings",
+          positionals: [{ name: "factory", description: "Factory prefix", required: true }],
+          options: { json },
+          async run(input) {
+            const factory = await findFactory(input.positionals.factory);
+            const lessons = factoryStorage.lessons(factory.prefix);
+            if (input.options.json) return { exitCode: 0, stdout: JSON.stringify(lessons) };
+            if (lessons.length === 0) return { exitCode: 0, stdout: `No lessons recorded for ${factory.prefix}.` };
+            return {
+              exitCode: 0,
+              stdout: lessons.map((lesson) => `${lesson.id}  ${lesson.rule}  (${lesson.tasks.join(", ")})${lesson.notifiedAt === null ? "" : "  [reported to the Lead]"}`).join("\n"),
+            };
+          },
+        }),
+        runs: cliCommand({
+          summary: "Show recorded agent turns by role and model: outcomes, time, tokens and review verdicts",
+          positionals: [{ name: "factory", description: "Factory prefix", required: true }],
+          options: {
+            task: { type: "string", description: "Only this task, such as APP-12" },
+            sync: { type: "boolean", description: "Read new turns from every agent thread first, including older threads" },
+            json,
+          },
+          async run(input) {
+            const factory = await findFactory(input.positionals.factory);
+            if (input.options.sync) await syncFactoryRuns(factory);
+            const taskKey = input.options.task ?? null;
+            const report = runReport(factory, taskKey);
+            return { exitCode: 0, stdout: input.options.json ? JSON.stringify(report) : formatRunReport(factory.prefix, taskKey, report) };
           },
         }),
         dismiss: cliCommand({

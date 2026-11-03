@@ -96,3 +96,30 @@ test('shadow trial runs and retired history migrate into rows and survive later 
   assert.equal(db.prepare('SELECT count(*) AS n FROM factory_legacy_backups').get().n, 2);
   assert.ok(Buffer.byteLength(JSON.stringify(await bb.storage.kv.get('shadow-trial-history'))) < 100);
 });
+
+test('the run ledger survives factory rewrites, ignores replays, and leaves with its factory', async t => {
+  const { bb, harness } = createFakePluginHost({ pluginId: 'factory' });
+  t.after(() => harness.lifecycle.dispose());
+  const store = createFactoryStorage(bb.storage, identity);
+  const factory = history(1);
+  await store.write(factory);
+  const row = { threadId: 'thr', endSeq: 5, prefix: 'BIG', taskKey: 'BIG-1', role: 'build', providerId: 'codex', model: 'm', reasoning: null, outcome: 'completed', error: null, startedAt: 1000, endedAt: 4000, tokensTotal: 10, tokensCached: 4, tokensOutput: 2 };
+  const cursor = { lastSeq: 5, tokensTotal: 10, tokensCached: 4, tokensOutput: 2 };
+  store.appendRuns('thr', [row], cursor);
+  store.appendRuns('thr', [row], cursor);
+  await store.write(factory);
+  assert.deepEqual(store.recentRuns('BIG', null, 10), [row]);
+  assert.deepEqual(store.runCursor('thr'), cursor);
+  assert.equal(store.recentRuns('BIG', null, 0).length, 0);
+  assert.equal(store.recentRuns('BIG', 'BIG-2', 10).length, 0);
+  assert.deepEqual(store.runGroups('BIG', null), [{ role: 'build', providerId: 'codex', model: 'm', runs: 1, failed: 0, interrupted: 0, durationMs: 3000, tokensTotal: 10, tokensCached: 4, tokensOutput: 2 }]);
+
+  assert.deepEqual(store.runCursor('unknown'), { lastSeq: 0, tokensTotal: 0, tokensCached: 0, tokensOutput: 0 });
+  const lesson = store.recordLesson('BIG', { rule: 'Do the thing.' }, 'BIG-1', 'thr');
+  assert.deepEqual(lesson.tasks, ['BIG-1']);
+  assert.equal(store.recordLesson('OTHER', { id: lesson.id }, 'OTHER-1', 'thr'), null, 'a lesson belongs to one factory');
+  await store.remove('BIG');
+  assert.equal(store.recentRuns('BIG', null, 10).length, 0);
+  assert.deepEqual(store.runCursor('thr'), { lastSeq: 0, tokensTotal: 0, tokensCached: 0, tokensOutput: 0 });
+  assert.deepEqual(store.lessons('BIG'), []);
+});

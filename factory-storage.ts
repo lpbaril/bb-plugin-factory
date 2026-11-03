@@ -1,6 +1,40 @@
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import type { Factory } from "./server";
 
+/** One finished agent turn. Tokens are the thread's growth since the previous row, so they sum correctly. */
+export type RunRow = {
+  threadId: string;
+  endSeq: number;
+  prefix: string;
+  taskKey: string | null;
+  role: string;
+  providerId: string;
+  model: string | null;
+  reasoning: string | null;
+  outcome: "completed" | "failed" | "interrupted";
+  error: string | null;
+  startedAt: number;
+  endedAt: number;
+  tokensTotal: number | null;
+  tokensCached: number | null;
+  tokensOutput: number | null;
+};
+/** How far a thread has been read, and its cumulative tokens at that point. */
+export type RunCursor = { lastSeq: number; tokensTotal: number; tokensCached: number; tokensOutput: number };
+export type RunGroup = {
+  role: string;
+  providerId: string;
+  model: string | null;
+  runs: number;
+  failed: number;
+  interrupted: number;
+  durationMs: number;
+  tokensTotal: number;
+  tokensCached: number;
+  tokensOutput: number;
+};
+export type Lesson = { id: number; rule: string; createdAt: string; notifiedAt: string | null; tasks: string[] };
+
 /** KV is only a fixed-size locator. Histories grow as rows, never as KV values
  * (or as a task-sized JSON blob). Array positions preserve the original order. */
 export function createFactoryStorage(storage: BbPluginApi["storage"], parse: (value: unknown) => Factory) {
@@ -16,6 +50,24 @@ export function createFactoryStorage(storage: BbPluginApi["storage"], parse: (va
     `CREATE TABLE factory_trials (id INTEGER PRIMARY KEY, payload TEXT NOT NULL);
      CREATE TABLE factory_trial_runs (trial_id INTEGER NOT NULL, position INTEGER NOT NULL, payload TEXT NOT NULL,
        PRIMARY KEY (trial_id, position));`,
+    `CREATE TABLE factory_runs (
+       thread_id TEXT NOT NULL, end_seq INTEGER NOT NULL, prefix TEXT NOT NULL, task_key TEXT, role TEXT NOT NULL,
+       provider_id TEXT NOT NULL, model TEXT, reasoning TEXT, outcome TEXT NOT NULL, error TEXT,
+       started_at INTEGER NOT NULL, ended_at INTEGER NOT NULL,
+       tokens_total INTEGER, tokens_cached INTEGER, tokens_output INTEGER,
+       PRIMARY KEY (thread_id, end_seq));
+     CREATE INDEX factory_runs_prefix ON factory_runs(prefix, ended_at);
+     CREATE TABLE factory_run_cursors (
+       thread_id TEXT PRIMARY KEY, last_seq INTEGER NOT NULL,
+       tokens_total INTEGER NOT NULL, tokens_cached INTEGER NOT NULL, tokens_output INTEGER NOT NULL);
+     CREATE TABLE factory_lessons (
+       id INTEGER PRIMARY KEY AUTOINCREMENT, prefix TEXT NOT NULL, rule TEXT NOT NULL,
+       created_at TEXT NOT NULL, notified_at TEXT);
+     CREATE INDEX factory_lessons_prefix ON factory_lessons(prefix);
+     CREATE TABLE factory_lesson_hits (
+       lesson_id INTEGER NOT NULL REFERENCES factory_lessons(id) ON DELETE CASCADE, task_key TEXT NOT NULL,
+       thread_id TEXT NOT NULL, created_at TEXT NOT NULL,
+       PRIMARY KEY (lesson_id, task_key));`,
   ]);
   const metadata = db.prepare("SELECT payload FROM factory_metadata WHERE prefix = ?");
   const records = db.prepare("SELECT kind, position, parent, payload FROM factory_records WHERE prefix = ? ORDER BY parent, position");
@@ -92,6 +144,10 @@ export function createFactoryStorage(storage: BbPluginApi["storage"], parse: (va
     db.transaction(() => {
       clearRecords.run(prefix);
       db.prepare("DELETE FROM factory_metadata WHERE prefix = ?").run(prefix);
+      db.prepare("DELETE FROM factory_run_cursors WHERE thread_id IN (SELECT thread_id FROM factory_runs WHERE prefix = ?)").run(prefix);
+      db.prepare("DELETE FROM factory_runs WHERE prefix = ?").run(prefix);
+      db.prepare("DELETE FROM factory_lesson_hits WHERE lesson_id IN (SELECT id FROM factory_lessons WHERE prefix = ?)").run(prefix);
+      db.prepare("DELETE FROM factory_lessons WHERE prefix = ?").run(prefix);
     })();
     // Immutable pre-migration backups are deliberately retained.
   }
@@ -150,5 +206,75 @@ export function createFactoryStorage(storage: BbPluginApi["storage"], parse: (va
   function prefixes(): string[] {
     return (db.prepare("SELECT prefix FROM factory_metadata").all() as { prefix: string }[]).map(row => row.prefix);
   }
-  return { read, write, remove, readTrial, writeTrial, retireTrial, prefixes };
+
+  // ----- Run ledger: append-only, and separate from the factory rows that writeRows rewrites. -----
+  function runCursor(threadId: string): RunCursor {
+    const row = db.prepare("SELECT last_seq, tokens_total, tokens_cached, tokens_output FROM factory_run_cursors WHERE thread_id = ?").get(threadId) as
+      | { last_seq: number; tokens_total: number; tokens_cached: number; tokens_output: number }
+      | undefined;
+    return row === undefined
+      ? { lastSeq: 0, tokensTotal: 0, tokensCached: 0, tokensOutput: 0 }
+      : { lastSeq: row.last_seq, tokensTotal: row.tokens_total, tokensCached: row.tokens_cached, tokensOutput: row.tokens_output };
+  }
+  /** Rows and the cursor commit together, so a crash can neither lose nor double-count a turn. */
+  const appendRuns = db.transaction((threadId: string, rows: RunRow[], cursor: RunCursor) => {
+    const insert = db.prepare("INSERT OR IGNORE INTO factory_runs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+    for (const r of rows) {
+      insert.run(r.threadId, r.endSeq, r.prefix, r.taskKey, r.role, r.providerId, r.model, r.reasoning, r.outcome, r.error, r.startedAt, r.endedAt, r.tokensTotal, r.tokensCached, r.tokensOutput);
+    }
+    db.prepare(
+      `INSERT INTO factory_run_cursors VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(thread_id) DO UPDATE SET last_seq=excluded.last_seq, tokens_total=excluded.tokens_total,
+         tokens_cached=excluded.tokens_cached, tokens_output=excluded.tokens_output`,
+    ).run(threadId, cursor.lastSeq, cursor.tokensTotal, cursor.tokensCached, cursor.tokensOutput);
+  });
+  function runGroups(prefix: string, taskKey: string | null): RunGroup[] {
+    return db.prepare(
+      `SELECT role, provider_id AS providerId, model, COUNT(*) AS runs,
+         SUM(outcome = 'failed') AS failed, SUM(outcome = 'interrupted') AS interrupted,
+         SUM(ended_at - started_at) AS durationMs,
+         COALESCE(SUM(tokens_total), 0) AS tokensTotal, COALESCE(SUM(tokens_cached), 0) AS tokensCached, COALESCE(SUM(tokens_output), 0) AS tokensOutput
+       FROM factory_runs WHERE prefix = @prefix AND (@taskKey IS NULL OR task_key = @taskKey)
+       GROUP BY role, provider_id, model ORDER BY tokensTotal DESC`,
+    ).all({ prefix, taskKey }) as RunGroup[];
+  }
+  function recentRuns(prefix: string, taskKey: string | null, limit: number): RunRow[] {
+    return db.prepare(
+      `SELECT thread_id AS threadId, end_seq AS endSeq, prefix, task_key AS taskKey, role, provider_id AS providerId, model, reasoning, outcome, error,
+         started_at AS startedAt, ended_at AS endedAt, tokens_total AS tokensTotal, tokens_cached AS tokensCached, tokens_output AS tokensOutput
+       FROM factory_runs WHERE prefix = @prefix AND (@taskKey IS NULL OR task_key = @taskKey)
+       ORDER BY ended_at DESC, end_seq DESC LIMIT @limit`,
+    ).all({ prefix, taskKey, limit }) as RunRow[];
+  }
+  /** The model each review thread last ran on, to join verdicts to models. */
+  function threadModels(prefix: string): Map<string, string | null> {
+    const rows = db.prepare("SELECT thread_id AS threadId, model FROM factory_runs WHERE prefix = ? ORDER BY ended_at, end_seq").all(prefix) as { threadId: string; model: string | null }[];
+    return new Map(rows.map((row) => [row.threadId, row.model]));
+  }
+
+  // ----- Recurring review findings -----
+  function lessons(prefix: string): Lesson[] {
+    const rows = db.prepare("SELECT id, rule, created_at AS createdAt, notified_at AS notifiedAt FROM factory_lessons WHERE prefix = ? ORDER BY id").all(prefix) as Omit<Lesson, "tasks">[];
+    const hits = db.prepare("SELECT task_key AS taskKey FROM factory_lesson_hits WHERE lesson_id = ? ORDER BY created_at, task_key");
+    return rows.map((row) => ({ ...row, tasks: (hits.all(row.id) as { taskKey: string }[]).map((hit) => hit.taskKey) }));
+  }
+  /** Adds a task to a lesson (new when `lesson` has a rule). A task counts once, however many reviewers flag it. */
+  const recordLesson = db.transaction((prefix: string, lesson: { rule: string } | { id: number }, taskKey: string, threadId: string): Lesson | null => {
+    const now = new Date().toISOString();
+    const id = "rule" in lesson
+      ? Number(db.prepare("INSERT INTO factory_lessons (prefix, rule, created_at) VALUES (?, ?, ?)").run(prefix, lesson.rule, now).lastInsertRowid)
+      : lesson.id;
+    if (!db.prepare("SELECT 1 FROM factory_lessons WHERE id = ? AND prefix = ?").get(id, prefix)) return null;
+    db.prepare("INSERT OR IGNORE INTO factory_lesson_hits VALUES (?, ?, ?, ?)").run(id, taskKey, threadId, now);
+    return lessons(prefix).find((entry) => entry.id === id) ?? null;
+  });
+  function markLessonNotified(id: number): void {
+    db.prepare("UPDATE factory_lessons SET notified_at = ? WHERE id = ?").run(new Date().toISOString(), id);
+  }
+
+  return {
+    read, write, remove, readTrial, writeTrial, retireTrial, prefixes,
+    runCursor, appendRuns, runGroups, recentRuns, threadModels,
+    lessons, recordLesson, markLessonNotified,
+  };
 }
