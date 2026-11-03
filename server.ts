@@ -491,7 +491,7 @@ export function supervisorAction(
 
 /** The fields of a thread event the run ledger reads. */
 type RunEvent = { seq: number | string; type: string; createdAt: number; data: unknown };
-export type LedgerTurn = Pick<RunRow, "endSeq" | "model" | "reasoning" | "outcome" | "error" | "startedAt" | "endedAt">;
+export type LedgerTurn = Pick<RunRow, "endSeq" | "model" | "reasoning" | "outcome" | "error" | "startedAt" | "endedAt"> & { startSeq: number };
 const turnRequestedData = z.object({
   execution: z.object({ model: z.string().nullish(), reasoningLevel: z.string().nullish() }).nullish(),
 });
@@ -504,10 +504,10 @@ const turnCompletedData = z.object({
  * to skip next time. A turn still running stays unread, so it is recorded when
  * it ends, unless `failure` says the thread already landed in error.
  */
-export function turnsFromEvents(events: readonly RunEvent[], failure: string | null = null): { turns: LedgerTurn[]; closedSeq: number | null } {
+export function turnsFromEvents(events: readonly RunEvent[], failure: string | null = null): { turns: LedgerTurn[]; closedSeq: number | null; openStartSeq: number | null } {
   const turns: LedgerTurn[] = [];
   let requested = { model: null as string | null, reasoning: null as string | null };
-  let open: { startedAt: number; model: string | null; reasoning: string | null } | null = null;
+  let open: { startSeq: number; startedAt: number; model: string | null; reasoning: string | null } | null = null;
   let closedSeq: number | null = null;
   let previous: { seq: number; createdAt: number } | null = null;
   const close = (outcome: LedgerTurn["outcome"], error: string | null, endSeq: number, endedAt: number) => {
@@ -524,7 +524,7 @@ export function turnsFromEvents(events: readonly RunEvent[], failure: string | n
     } else if (event.type === "turn/started") {
       // A new turn started without the last one reporting an end: it was cut off.
       if (previous !== null) close("interrupted", null, previous.seq, previous.createdAt);
-      open = { startedAt: event.createdAt, ...requested };
+      open = { startSeq: seq, startedAt: event.createdAt, ...requested };
     } else if (event.type === "turn/completed") {
       const parsed = turnCompletedData.safeParse(event.data).data;
       close(parsed?.status ?? "completed", parsed?.error?.message ?? (parsed?.status === "failed" ? failure : null), seq, event.createdAt);
@@ -533,11 +533,50 @@ export function turnsFromEvents(events: readonly RunEvent[], failure: string | n
     previous = { seq, createdAt: event.createdAt };
   }
   if (failure !== null && previous !== null) close("failed", failure, previous.seq, previous.createdAt);
-  return { turns, closedSeq };
+  return { turns, closedSeq, openStartSeq: (open as { startSeq: number } | null)?.startSeq ?? null };
 }
 const tokenUsageData = z.object({
   tokenUsage: z.object({ total: z.object({ totalTokens: z.number(), cachedInputTokens: z.number(), outputTokens: z.number() }) }),
 });
+type TokenCount = Pick<RunRow, "tokensTotal" | "tokensCached" | "tokensOutput"> & { tokensTotal: number; tokensCached: number; tokensOutput: number };
+/**
+ * Credits usage events to the turn running when each was reported. Providers
+ * report running totals that restart with each session, so a smaller total
+ * means everything in it is new. Events from a turn still running stay unread.
+ */
+export function creditUsage(
+  turns: readonly LedgerTurn[],
+  openStartSeq: number | null,
+  usage: readonly RunEvent[],
+  base: TokenCount,
+): { credits: Map<number, TokenCount>; totals: TokenCount; lastSeq: number | null } {
+  const credits = new Map<number, TokenCount>();
+  let totals: TokenCount = { tokensTotal: base.tokensTotal, tokensCached: base.tokensCached, tokensOutput: base.tokensOutput };
+  let lastSeq: number | null = null;
+  if (turns.length === 0) return { credits, totals, lastSeq };
+  for (const event of usage) {
+    const seq = Number(event.seq);
+    if (openStartSeq !== null && seq >= openStartSeq) break;
+    lastSeq = seq;
+    const total = tokenUsageData.safeParse(event.data).data?.tokenUsage.total;
+    if (total === undefined) continue;
+    const next: TokenCount = { tokensTotal: total.totalTokens, tokensCached: total.cachedInputTokens, tokensOutput: total.outputTokens };
+    const from: TokenCount = next.tokensTotal < totals.tokensTotal ? { tokensTotal: 0, tokensCached: 0, tokensOutput: 0 } : totals;
+    totals = next;
+    if (next.tokensTotal <= from.tokensTotal) continue;
+    // The latest turn started by then; an event older than them all goes on the first.
+    let index = 0;
+    turns.forEach((turn, position) => {
+      if (turn.startSeq <= seq) index = position;
+    });
+    const credit = credits.get(index) ?? { tokensTotal: 0, tokensCached: 0, tokensOutput: 0 };
+    credit.tokensTotal += next.tokensTotal - from.tokensTotal;
+    credit.tokensCached += Math.max(0, next.tokensCached - from.tokensCached);
+    credit.tokensOutput += Math.max(0, next.tokensOutput - from.tokensOutput);
+    credits.set(index, credit);
+  }
+  return { credits, totals, lastSeq };
+}
 
 const AGENTS_KV = "agents";
 /** Set once the old per-role settings have been copied into AGENTS_KV. */
@@ -2650,6 +2689,7 @@ ${findings}`;
 
   // ----- Run ledger -----
 
+  type ThreadEventName = NonNullable<Parameters<typeof bb.sdk.threads.events.list>[0]["types"]>[number];
   const RUN_EVENT_TYPES = ["client/turn/requested", "turn/started", "turn/completed"] as const;
   /** The most events the server returns in one page. */
   const RUN_EVENT_PAGE = 100;
@@ -2662,51 +2702,32 @@ ${findings}`;
       if (runSyncs.get(agent.threadId) === next) runSyncs.delete(agent.threadId);
     });
   }
-  async function readRuns(prefix: string, agent: Agent, failure: string | null): Promise<void> {
-    const cursor = factoryStorage.runCursor(agent.threadId);
+  async function listThreadEvents(threadId: string, after: number, types: readonly [ThreadEventName, ...ThreadEventName[]]): Promise<RunEvent[]> {
     const events: RunEvent[] = [];
-    for (let afterSeq = cursor.lastSeq; ; ) {
-      const page = await bb.sdk.threads.events.list({
-        threadId: agent.threadId, afterSeq: String(afterSeq), types: RUN_EVENT_TYPES, order: "asc", limit: String(RUN_EVENT_PAGE),
-      });
+    for (let afterSeq = after; ; ) {
+      const page = await bb.sdk.threads.events.list({ threadId, afterSeq: String(afterSeq), types, order: "asc", limit: String(RUN_EVENT_PAGE) });
       events.push(...page);
       const last = page.at(-1);
-      if (last === undefined || page.length < RUN_EVENT_PAGE) break;
+      if (last === undefined || page.length < RUN_EVENT_PAGE) return events;
       afterSeq = Number(last.seq);
     }
-    const { turns, closedSeq } = turnsFromEvents(events, failure);
+  }
+  async function readRuns(prefix: string, agent: Agent, failure: string | null): Promise<void> {
+    const cursor = factoryStorage.runCursor(agent.threadId);
+    const { turns, closedSeq, openStartSeq } = turnsFromEvents(await listThreadEvents(agent.threadId, cursor.lastSeq, RUN_EVENT_TYPES), failure);
     if (closedSeq === null) return;
-    const next: RunCursor = { ...cursor, lastSeq: closedSeq };
-    let tokens = { tokensTotal: null as number | null, tokensCached: null as number | null, tokensOutput: null as number | null };
-    if (turns.length > 0) {
-      // Core keeps little token history, so the thread's growth goes on its newest turn; totals stay right.
-      const [latest] = await bb.sdk.threads.events.list({ threadId: agent.threadId, types: ["thread/tokenUsage/updated"], order: "desc", limit: "1" });
-      const total = tokenUsageData.safeParse(latest?.data).data?.tokenUsage.total;
-      if (total !== undefined) {
-        // A smaller total means the provider session restarted; everything in it is new.
-        const base = total.totalTokens >= cursor.tokensTotal ? cursor : { tokensTotal: 0, tokensCached: 0, tokensOutput: 0 };
-        if (total.totalTokens > base.tokensTotal) {
-          tokens = {
-            tokensTotal: total.totalTokens - base.tokensTotal,
-            tokensCached: Math.max(0, total.cachedInputTokens - base.tokensCached),
-            tokensOutput: Math.max(0, total.outputTokens - base.tokensOutput),
-          };
-        }
-        next.tokensTotal = total.totalTokens;
-        next.tokensCached = total.cachedInputTokens;
-        next.tokensOutput = total.outputTokens;
-      }
-    }
-    const rows: RunRow[] = turns.map((turn, index) => ({
+    const usage = turns.length === 0 ? [] : await listThreadEvents(agent.threadId, cursor.usageSeq, ["thread/tokenUsage/updated"]);
+    const { credits, totals, lastSeq } = creditUsage(turns, openStartSeq, usage, cursor);
+    const rows: RunRow[] = turns.map(({ startSeq: _startSeq, ...turn }, index) => ({
       ...turn,
       threadId: agent.threadId,
       prefix,
       taskKey: agent.taskKey,
       role: agent.role,
       providerId: agent.providerId,
-      ...(index === turns.length - 1 ? tokens : { tokensTotal: null, tokensCached: null, tokensOutput: null }),
+      ...(credits.get(index) ?? { tokensTotal: null, tokensCached: null, tokensOutput: null }),
     }));
-    factoryStorage.appendRuns(agent.threadId, rows, next);
+    factoryStorage.appendRuns(agent.threadId, rows, { ...totals, lastSeq: closedSeq, usageSeq: lastSeq ?? cursor.usageSeq });
   }
   /** Reads every agent's new turns, which also backfills threads older than the ledger. */
   async function syncFactoryRuns(factory: Factory): Promise<void> {
