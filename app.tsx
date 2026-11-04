@@ -25,6 +25,7 @@ import type {
   BoardTask,
   Column,
   FactoryDoctorReport,
+  FactoryHealth,
   FactorySummary,
   NightlyReport,
   PrSummary,
@@ -524,6 +525,7 @@ function FactoryView({ prefix }: { prefix: string }) {
   const [openTaskId, setOpenTaskId] = useState<string | null>(null);
   const [showAlignment, setShowAlignment] = useState(false);
   const [showRuns, setShowRuns] = useState(false);
+  const [showHealth, setShowHealth] = useState(false);
 
   const move = useCallback(
     (taskId: string, column: Column) => {
@@ -555,6 +557,9 @@ function FactoryView({ prefix }: { prefix: string }) {
         <div className="flex flex-wrap items-center justify-between gap-2">
           <Metrics tasks={board.tasks} live={live} />
           <div className="flex flex-wrap items-center gap-2">
+            <Button size="sm" variant="secondary" onClick={() => setShowHealth(true)}>
+              Health
+            </Button>
             <Button size="sm" variant="secondary" onClick={() => setShowRuns(true)}>
               Runs
             </Button>
@@ -582,6 +587,7 @@ function FactoryView({ prefix }: { prefix: string }) {
         onClose={() => setOpenTaskId(null)}
       />
       <RunsDialog open={showRuns} prefix={prefix} onClose={() => setShowRuns(false)} />
+      <HealthDialog open={showHealth} prefix={prefix} onClose={() => setShowHealth(false)} />
       <AlignmentDialog
         open={showAlignment}
         doctor={doctor}
@@ -636,6 +642,92 @@ function NightlyNotice({ prefix }: { prefix: string }) {
         Dismiss
       </Button>
     </div>
+  );
+}
+
+// ---------- Health ----------
+
+function HealthDialog({ open, prefix, onClose }: { open: boolean; prefix: string; onClose: () => void }) {
+  const rpc = useRpc<typeof rpcContract>();
+  const [health, setHealth] = useState<FactoryHealth | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    setError(null);
+    rpc.call("factory_health", { prefix }).then(
+      (next) => { if (!cancelled) setHealth(next); },
+      (cause) => { if (!cancelled) setError(errorText(cause)); },
+    );
+    return () => { cancelled = true; };
+  }, [rpc, open, prefix]);
+  const rows: { label: string; value: string; sample: string; note: string }[] =
+    health === null
+      ? []
+      : [
+          {
+            label: "Review rounds per merged PR",
+            value: health.roundsPerMergedPr.median === null ? "—" : String(health.roundsPerMergedPr.median),
+            sample: `${health.roundsPerMergedPr.sample} PRs`,
+            note: "Commits that reviewers gave a verdict on. One means it passed first time.",
+          },
+          {
+            label: "PRs with changes requested",
+            value: health.changesRequested.sample === 0 ? "—" : `${Math.round((health.changesRequested.prs / health.changesRequested.sample) * 100)}%`,
+            sample: `${health.changesRequested.sample} PRs`,
+            note: "How often review found something to fix.",
+          },
+          {
+            label: "Time from open to ready",
+            value: health.timeToReadyMs.median === null ? "—" : minutes(health.timeToReadyMs.median),
+            sample: `${health.timeToReadyMs.sample} PRs`,
+            note: "Older PRs use their last approval on the head as an estimate.",
+          },
+          {
+            label: "Tokens per merged task",
+            value: health.tokensPerMergedTask.median === null ? "—" : TOKENS.format(health.tokensPerMergedTask.median),
+            sample: `${health.tokensPerMergedTask.sample} tasks`,
+            note: "Excludes cached input. Tasks from before the run ledger may read low.",
+          },
+          {
+            label: "PRs closed without merging",
+            value: String(health.closedUnmerged),
+            sample: `${health.prs} PRs`,
+            note: "Work started and then abandoned.",
+          },
+        ];
+  return (
+    <Dialog open={open} onOpenChange={(next) => { if (!next) onClose(); }}>
+      <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-2xl">
+        <DialogHeader>
+          <DialogTitle>Health</DialogTitle>
+          <DialogDescription>
+            How much rework PRs take and what merged tasks cost. Numbers are medians, so check the sample size: with few PRs, one can move a number a lot.
+          </DialogDescription>
+        </DialogHeader>
+        {error === null ? null : <Alert>{error}</Alert>}
+        {health === null ? (
+          error === null ? <EmptyState>Loading health…</EmptyState> : null
+        ) : health.prs === 0 ? (
+          <EmptyState>No pull requests yet. Numbers appear as the factory reviews PRs.</EmptyState>
+        ) : (
+          <ul className="divide-y divide-border text-sm">
+            {rows.map((row) => (
+              <li key={row.label} className="flex items-baseline justify-between gap-4 py-2">
+                <div className="min-w-0">
+                  <div className="font-medium">{row.label}</div>
+                  <div className="text-xs text-muted-foreground">{row.note}</div>
+                </div>
+                <div className="shrink-0 text-right tabular-nums">
+                  <div className="font-semibold">{row.value}</div>
+                  <div className="text-xs text-muted-foreground">{row.sample}</div>
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
+      </DialogContent>
+    </Dialog>
   );
 }
 
@@ -1936,6 +2028,12 @@ function AgentsSettings() {
   }
   return (
     <div className="space-y-3">
+      {view.warnings.map((warning) => (
+        <div key={warning.id} className="rounded border border-border p-2.5 text-xs">
+          <div className="font-medium">{warning.title}</div>
+          <div className="text-muted-foreground">{warning.detail}</div>
+        </div>
+      ))}
       <div className="divide-y divide-border">
         {view.agents.map((row) => (
           <AgentSettingRow

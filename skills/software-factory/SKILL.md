@@ -70,14 +70,17 @@ needed. Do not paste full plans or logs into the Lead thread, or poll active wor
 4. When the round is complete, the factory tells the Lead once, and the Lead
    sends the builder PR/comment and reviewer-thread references in one handoff;
    the builder reads and addresses every finding directly, so fixes land in a
-   single push. New commits re-review only the delta, and only by the
-   reviewers who requested changes.
-5. When every required verdict is APPROVE, the factory marks the PR ready for
+   single push. New commits re-review only the delta, and only by Security and the
+   reviewers who requested changes. A push that makes a PR large or sensitive adds
+   Reviewer 2, and the PR stays that way even if a later push shrinks it.
+5. When every required verdict is APPROVE, reviewers who haven't seen the head
+   check the delta. Once all approvals cover it, the factory marks the PR ready for
    review (which also runs full CI) and, with Rafter, runs a final scan. If
    the PR touches files another open factory PR also touches, the Lead gets a
    merge-train note so it can suggest an order. The factory's merge policy says who
-   merges: the person, or under `when-green` the Lead with `bb factory merge`. The
-   factory then moves the task to Done.
+   merges: the person, or under `when-green` the Lead with `bb factory merge`, except
+   large or sensitive PRs, which only the person can merge. The factory then moves
+   the task to Done.
 
 ## Recurring review findings
 
@@ -95,7 +98,9 @@ whether to merge. Never add the rule directly or hold the current PR for it.
 ## Run ledger and nightly check
 
 `bb factory runs APP` shows finished turns by role and model: outcomes, time, tokens
-and review verdicts. It records tokens, not money.
+and review verdicts. It records tokens, not money. `bb factory health APP` shows review
+rounds per merged PR, how often changes are requested, time to ready, tokens per merged
+task and PRs closed without merging, each with its sample size.
 
 A nightly check updates the ledger, moves merged tasks to Done and looks for stalled
 work. It messages no agent; the person reads its findings on the Factory page or with
@@ -132,13 +137,14 @@ skip docs-only changes. PRs stay drafts until every reviewer approves, so
 | `bb factory assign APP-12 --role review1\|review2\|security --pr N` | Replace a reviewer that failed (dead provider, removed model) with a fresh one on the current roster, reviewing that PR. Retrying the old thread keeps the model it was spawned with, so it cannot recover from a provider that ran out. |
 | `bb factory plan-ready APP-12 --comment <id>` | Current Planner only: validate its READY planning comment and allow Builder assignments. |
 | `bb factory verdict APP-12 --role review1\|review2\|security\|shadow --verdict approve\|changes [--pr N]` | Record a reviewer's verdict on the task's PR, after posting it (as a PR comment; the shadow reviewer posts a task comment). Only the reviewer thread the factory started can record it. |
-| `bb factory merge APP-12 [--pr N]` | Lead under the `when-green` policy, or the person: squash-merge after checking approvals and CI on the exact head. Fix what it names if it refuses. |
+| `bb factory merge APP-12 [--pr N]` | Lead under the `when-green` policy, or the person: squash-merge after checking approvals and CI on the exact head. Large or sensitive PRs are the person's only. Fix what it names if it refuses. |
 | `bb factory merge-policy APP [person\|when-green]` | Show the policy. Only the person can set it, from outside an agent thread. |
 | `bb factory nightly [APP]` | Show the latest nightly check's findings. |
 | `bb factory task-kind APP-12 [coordination\|person\|work]` | Lead or person: stop reporting a task as stalled, or undo that with `work`. |
 | `bb factory lesson APP-12 --rule "..."\|--same-as <id>` | Task's reviewers only: record a blocking finding a repository rule would have prevented. |
 | `bb factory lessons APP` | List the factory's recurring review findings and their tasks. |
 | `bb factory runs APP [--task APP-12] [--sync]` | Show finished agent turns by role and model. `--sync` first reads every agent thread, including older ones. |
+| `bb factory health APP` | Show review rounds, changes requested, time to ready and tokens per merged task, with sample sizes. |
 | `bb factory dismiss APP-12 --reason "..."` | Dismiss the shadow Security reviewer's REQUEST CHANGES. Only the task's Security reviewer can run this; the person can also dismiss from the task on the Factory page. |
 | `bb factory rafter check` | Check the Rafter API key and show the scan quota (never prints the key). |
 | `bb factory rafter scan APP-12` | Rescan the task's open PR with Rafter and hand the results to its Security reviewer. |
@@ -174,7 +180,9 @@ Recovery commands:
 
 `bb factory agents` shows the provider, model and reasoning level each agent
 runs on (every role plus the reviewer-trial comparison); the person changes them
-in the Agents section of the plugin settings, or with `bb factory agents set`.
+in the Agents section of the plugin settings, or with `bb factory agents set`. It and
+`bb factory doctor` warn when the Builder, Reviewer 1 and Security share a provider, or
+a seat's provider isn't available.
 An unset level follows the model's default. A level the model's catalog doesn't
 list is still sent as the person set it — provider capabilities lag behind what
 a provider accepts — with a warning in the plugin log.
