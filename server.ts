@@ -132,6 +132,13 @@ const prSchema = z.object({
   readyAt: z.string().nullable().default(null),
   /** When the factory saw the PR merged or closed. */
   closedAt: z.string().nullable().default(null),
+  /** The head whose full set of approvals was last announced, so a ready PR that is approved again is announced too. */
+  approvedNotifiedSha: z.string().nullable().default(null),
+  /** Work a push still owes. It is saved with the new head, so a failure partway through is retried on the next pass. */
+  pushFollowUp: z.object({
+    notify: z.object({ comment: z.string(), lead: z.string() }).nullable(),
+    shadow: z.boolean(),
+  }).nullable().default(null),
   /** Touches paths the shadow reviewer covers in "sensitive" mode. */
   shadow: z.boolean().default(false),
   /** When the factory reported a shadow review that ended without a verdict. */
@@ -217,12 +224,12 @@ export function rosterWarnings(
     });
   }
   if (providers !== null) {
-    const seats = ROLE_IDS.filter((role) => role !== "shadow" || options.shadowOn);
+    const seats = AGENT_KEYS.filter((key) => options.shadowOn || (key !== "shadow" && key !== "comparison"));
     const unavailable = new Map<string, string[]>();
     for (const role of seats) {
       const providerId = roles[role]?.providerId;
       if (providerId === undefined || providers.some((provider) => provider.id === providerId && provider.available)) continue;
-      unavailable.set(providerId, [...(unavailable.get(providerId) ?? []), ROLES[role].label]);
+      unavailable.set(providerId, [...(unavailable.get(providerId) ?? []), AGENT_LABELS[role]]);
     }
     for (const [providerId, labels] of unavailable) {
       warnings.push({
@@ -912,7 +919,7 @@ export default async function plugin(bb: BbPluginApi) {
     // Reviewer 1 is on every PR, so it can't default to a provider this machine lacks. A person's
     // later choice is never changed, and the roster check warns about the shared provider.
     const providers = await listProviders();
-    if (providers !== null && !providers.some((provider) => provider.id === agents.roles.review1.providerId && provider.available)) {
+    if (providers === null || !providers.some((provider) => provider.id === agents.roles.review1.providerId && provider.available)) {
       agents.roles.review1.providerId = agents.roles.build.providerId;
     }
     await bb.storage.kv.set(AGENTS_KV, agentsConfigSchema.parse(agents));
@@ -1422,11 +1429,16 @@ export default async function plugin(bb: BbPluginApi) {
           const v = reviewFor(pr, r)?.verdict;
           return v === undefined || v === "pending";
         }).map((r) => ROLES[r].label);
+        const behindHead = roles.filter((r) => { const review = reviewFor(pr, r); return review !== null && review.sha !== pr.headSha; }).map((r) => ROLES[r].label);
         const summary =
           changes.length > 0
             ? `Changes requested by ${changes.join(", ")}`
             : pending.length > 0
             ? `Waiting on ${pending.join(", ")}`
+            : pr.scans.some((scan) => scan.status === "running")
+            ? "Waiting for a Rafter scan to finish"
+            : behindHead.length > 0
+            ? `Waiting on ${behindHead.join(", ")} to check the latest commit`
             : pr.isDraft
             ? "All required reviews approved (marking ready)"
             : leadMayMerge(factory, pr)
@@ -1827,7 +1839,7 @@ export default async function plugin(bb: BbPluginApi) {
         task,
         instructions: [
           args.instructions,
-          plan?.commentId == null ? null : `Canonical plan for ${task.key}: task comment ${plan.commentId}. Read it directly with bb tasks show ${task.key} (including comments); preserve its acceptance criteria.`,
+          plan?.commentId == null ? null : `Canonical plan for ${task.key}: task comment ${plan.commentId}. ${(PR_REVIEW_ROLES as readonly string[]).includes(args.role) ? `Read it with bb factory plan ${task.key}, which leaves out other reviewers' verdicts` : `Read it directly with bb tasks show ${task.key} (including comments)`}; preserve its acceptance criteria.`,
         ].filter((part) => part != null).join("\n\n") || null,
         builderThreadId: builder?.threadId ?? null,
         pr,
@@ -2336,6 +2348,8 @@ ${sections.join("\n\n---\n\n")}`;
         openedAt: new Date().toISOString(),
         readyAt: null,
         closedAt: null,
+        approvedNotifiedSha: null,
+        pushFollowUp: null,
         shadow,
         shadowStallNotifiedAt: null,
         roundNotifiedSha: null,
@@ -2414,53 +2428,85 @@ ${sections.join("\n\n---\n\n")}`;
 
   async function onPrPushed(factory: Factory, hostId: string, repo: string, gp: GhPr, pr: Pr): Promise<void> {
     const { deep, sensitive, shadow } = await classifyPr(hostId, repo, gp);
+    const lines = gp.additions + gp.deletions;
     // A push can only raise a PR's review depth: a later smaller diff doesn't undo what it touched.
-    const raised = await mutateFactory(factory.prefix, (current) => {
+    await mutateFactory(factory.prefix, (current) => {
       const target = current.prs.find((candidate) => candidate.number === pr.number);
-      if (target === undefined) return { deep: false, shadow: false };
+      if (target === undefined) return;
+      const raisedDeep = deep && !target.deep;
+      const raisedShadow = shadow && !target.shadow;
       target.headSha = gp.headRefOid;
-      const changed = { deep: deep && !target.deep, shadow: shadow && !target.shadow };
       target.deep ||= deep;
       target.shadow ||= shadow;
-      return changed;
+      target.pushFollowUp = {
+        notify: raisedDeep
+          ? {
+              comment: `[PR #${pr.number}](${pr.url}) now needs Reviewer 2: ${sensitive.length > 0 ? `sensitive paths (${safePaths(sensitive)})` : `${lines} changed lines, or files the factory couldn't list`}.`,
+              lead: `[factory] A push made PR #${pr.number} (${pr.taskKey}) large or sensitive (${sensitive.length} sensitive path(s), ${lines} changed lines). Reviewer 2 is starting and its approval is now required, and only the person can merge this PR.`,
+            }
+          : target.pushFollowUp?.notify ?? null,
+        shadow: raisedShadow || (target.pushFollowUp?.shadow ?? false),
+      };
     });
+    await finishPush(factory.prefix, pr.number);
+  }
+
+  /** Everything a push owes. Each step can run again safely, and whatever fails is retried on the next pass. */
+  async function finishPush(prefix: string, prNumber: number): Promise<void> {
+    const factory = await findFactory(prefix);
+    const pr = factory.prs.find((candidate) => candidate.number === prNumber);
+    if (pr === undefined || pr.pushFollowUp === null) return;
+    const sha = pr.headSha;
+    const updateFollowUp = (change: (followUp: NonNullable<Pr["pushFollowUp"]>) => void) =>
+      mutateFactory(prefix, (current) => {
+        const target = current.prs.find((candidate) => candidate.number === prNumber);
+        if (target?.pushFollowUp != null) change(target.pushFollowUp);
+      });
+
+    // Telling people comes first, so a reviewer that can't start doesn't hold back the message.
+    const { notify } = pr.pushFollowUp;
+    if (notify !== null) {
+      const task = await getTaskByKey(pr.taskKey);
+      await comment(task.id, notify.comment);
+      await tellLead(factory, notify.lead);
+      // The watcher starts the now-required Reviewer 2 on this same pass.
+      await updateFollowUp((followUp) => { followUp.notify = null; });
+    }
     for (const role of PR_REVIEW_ROLES) {
       const review = reviewFor(pr, role);
-      if (review === null) continue;
+      if (review === null || review.sha === sha) continue;
       if (role === "shadow") {
         // The shadow re-reviews every push, not only after REQUEST CHANGES, so its verdict never
         // stands on an older commit. A dismissed shadow is left alone so it can't re-block.
-        if (review.verdict === "dismissed" || review.threadId === null || review.sha === gp.headRefOid) continue;
-        const message = reReviewMessage({ role, taskKey: pr.taskKey, prNumber: pr.number, sha: gp.headRefOid, findings: null });
+        if (review.verdict === "dismissed" || review.threadId === null) continue;
+        const message = reReviewMessage({ role, taskKey: pr.taskKey, prNumber: pr.number, sha, findings: null });
         if (await tellThread(review.threadId, message)) {
-          await mutateFactory(factory.prefix, (current) => {
+          await mutateFactory(prefix, (current) => {
             const target = current.prs.find((candidate) => candidate.number === pr.number);
             if (target === undefined) return;
-            target.reviews.push({ role, threadId: review.threadId, sha: gp.headRefOid, verdict: "pending", at: new Date().toISOString() });
+            target.reviews.push({ role, threadId: review.threadId, sha, verdict: "pending", at: new Date().toISOString() });
             // A new pending review can stall again; let it be reported again.
             target.shadowStallNotifiedAt = null;
           });
         } else {
-          bb.log.warn(`could not ask the shadow reviewer to re-review PR #${pr.number} at ${gp.headRefOid.slice(0, 7)}`);
+          bb.log.warn(`could not ask the shadow reviewer to re-review PR #${pr.number} at ${sha.slice(0, 7)}`);
         }
         continue;
       }
       // Security also re-reviews after an approval, so the approval that counts for merging never
       // stands on an older commit. Reviewers 1 and 2 re-review only after REQUEST CHANGES.
-      const securityApprovedOlder = role === "security" && review.verdict === "approve" && review.sha !== gp.headRefOid;
+      const securityApprovedOlder = role === "security" && review.verdict === "approve";
       if (review.verdict !== "changes" && !securityApprovedOlder) continue;
-      await requestReReview(factory, pr, role, review, gp.headRefOid);
-    }
-    if (raised.deep) {
-      const task = await getTaskByKey(pr.taskKey);
-      await comment(task.id, `[PR #${pr.number}](${pr.url}) now needs Reviewer 2: ${sensitive.length > 0 ? `sensitive paths (${safePaths(sensitive)})` : `${gp.additions + gp.deletions} changed lines, or files the factory couldn't list`}.`);
-      await tellLead(factory, `[factory] A push made PR #${pr.number} (${pr.taskKey}) large or sensitive (${sensitive.length} sensitive path(s), ${gp.additions + gp.deletions} changed lines). Reviewer 2 is starting and its approval is now required, and only the person can merge this PR.`);
-      // The watcher starts the now-required Reviewer 2 on this same pass.
+      await requestReReview(factory, pr, role, review, sha);
     }
     const security = reviewFor(pr, "security");
-    if (raised.shadow && (await settings.get()).shadowMode === "sensitive" && reviewFor(pr, "shadow") === null && security?.threadId != null) {
-      await maybeStartShadow(factory.prefix, { ...pr, shadow: true }, security.threadId, null, null);
+    if (pr.pushFollowUp.shadow && (await settings.get()).shadowMode === "sensitive" && reviewFor(pr, "shadow") === null && security?.threadId != null) {
+      await maybeStartShadow(prefix, pr, security.threadId, null, null);
     }
+    await mutateFactory(prefix, (current) => {
+      const target = current.prs.find((candidate) => candidate.number === prNumber);
+      if (target !== undefined) target.pushFollowUp = null;
+    });
   }
 
   async function onScanFinished(factory: Factory, hostId: string, repo: string, pr: Pr, scan: Pr["scans"][number]): Promise<void> {
@@ -2609,6 +2655,7 @@ ${sections.join("\n\n---\n\n")}`;
       if (target !== undefined) {
         target.readyRequested = true;
         target.readyAt = new Date().toISOString();
+        target.approvedNotifiedSha = pr.headSha;
         // Show "ready" now rather than after the next poll.
         target.isDraft = false;
       }
@@ -2622,6 +2669,35 @@ ${sections.join("\n\n---\n\n")}`;
     await comment(task.id, `[PR #${pr.number}](${pr.url}) approved by ${labels} and marked ready for review.`);
     await tellLead(factory, `[factory] PR #${pr.number} (${pr.taskKey}) has every approval and is marked ready for review. ${leadMayMerge(factory, pr) ? `Merge it with \`bb factory merge ${pr.taskKey}\` once CI is green and every approval covers the head.` : `${factory.mergePolicy === "when-green" ? "It's large or sensitive, so only the person can merge it. " : ""}Tell the person it's ready for them to merge.`}`);
     await warnMergeOverlap(factory, hostId, repo, pr);
+  }
+
+  /**
+   * The ready gate announces a PR once, as it marks it ready. A ready PR that then gets new commits
+   * or a blocking verdict and is approved again has no other way to reach the Lead or the person.
+   */
+  async function maybeAnnounceReapproval(factory: Factory, pr: Pr): Promise<void> {
+    if (pr.state !== "open" || pr.isDraft) return;
+    // A running scan decides nothing yet. If it finds something, Security's verdict will say so.
+    if (pr.scans.some((scan) => scan.status === "running")) return;
+    const shadow = reviewFor(pr, "shadow");
+    const blockedByShadow = (await settings.get()).shadowBlocks && shadow !== null && shadow.verdict !== "approve" && shadow.verdict !== "dismissed";
+    const covered =
+      !blockedByShadow &&
+      requiredRoles(pr).every((role) => { const review = reviewFor(pr, role); return review?.verdict === "approve" && review.sha === pr.headSha; });
+    const setNotified = (sha: string | null) =>
+      mutateFactory(factory.prefix, (current) => {
+        const target = current.prs.find((candidate) => candidate.number === pr.number);
+        if (target !== undefined) target.approvedNotifiedSha = sha;
+      });
+    if (!covered) {
+      if (pr.approvedNotifiedSha !== null) await setNotified(null);
+      return;
+    }
+    if (pr.approvedNotifiedSha === pr.headSha) return;
+    await setNotified(pr.headSha);
+    const task = await getTaskByKey(pr.taskKey);
+    await comment(task.id, `[PR #${pr.number}](${pr.url}) is approved again at \`${pr.headSha.slice(0, 7)}\`: every required reviewer has seen this commit.`);
+    await tellLead(factory, `[factory] PR #${pr.number} (${pr.taskKey}) has every approval on its latest commit \`${pr.headSha.slice(0, 7)}\`. ${leadMayMerge(factory, pr) ? `Merge it with \`bb factory merge ${pr.taskKey}\` once CI is green.` : `${factory.mergePolicy === "when-green" ? "It's large or sensitive, so only the person can merge it. " : ""}Tell the person it's ready for them to merge.`}`);
   }
 
   async function onPrClosed(factory: Factory, hostId: string, repo: string, pr: Pr): Promise<void> {
@@ -2652,6 +2728,9 @@ ${sections.join("\n\n---\n\n")}`;
     }
   }
 
+  const PR_FAILURE_ALERT_PASSES = 5;
+  const prFailureStreaks = new Map<string, number>();
+
   async function watchPrs(prefix: string): Promise<void> {
     let factory = await findFactory(prefix);
     const { hostId, repo } = await projectHost(factory);
@@ -2679,47 +2758,83 @@ ${sections.join("\n\n---\n\n")}`;
     // Never review a PR from a fork: its branch name can collide with a builder's
     // branch, and its code would reach full-access agents.
     const sameRepo = open.filter((gp) => !gp.isCrossRepository);
+
+    // One PR's failure must not stop the others getting push handling, closed-PR detection or the
+    // ready gate. It's retried next pass, and the Lead hears if it keeps failing.
+    const failed = new Set<number>();
+    const forPr = async (number: number, work: () => Promise<void>) => {
+      try {
+        await work();
+      } catch (error) {
+        failed.add(number);
+        bb.log.warn(`PR watch failed for ${prefix} PR #${number}: ${String(error)}`);
+      }
+    };
+
     for (const gp of sameRepo) {
-      const known = factory.prs.find((pr) => pr.number === gp.number);
-      if (known === undefined) {
-        const taskKey = taskByBranch.get(gp.headRefName);
-        if (taskKey !== undefined) await onPrOpened(factory, hostId, repo, gp, taskKey);
-        continue;
-      }
-      if (known.headSha !== gp.headRefOid) await onPrPushed(factory, hostId, repo, gp, known);
-      if (known.isDraft !== gp.isDraft) {
-        await mutateFactory(prefix, (current) => {
-          const target = current.prs.find((pr) => pr.number === gp.number);
-          if (target !== undefined) target.isDraft = gp.isDraft;
-        });
-        if (!gp.isDraft && (await rafterKey()) !== null && !known.scans.some((scan) => scan.phase === "ready" && scan.sha === gp.headRefOid)) {
-          await startScan(prefix, repo, gp.number, "ready");
+      await forPr(gp.number, async () => {
+        const known = factory.prs.find((pr) => pr.number === gp.number);
+        if (known === undefined) {
+          const taskKey = taskByBranch.get(gp.headRefName);
+          if (taskKey !== undefined) await onPrOpened(factory, hostId, repo, gp, taskKey);
+          return;
         }
-      }
+        if (known.headSha !== gp.headRefOid) await onPrPushed(factory, hostId, repo, gp, known);
+        else if (known.pushFollowUp !== null) await finishPush(prefix, known.number);
+        if (known.isDraft !== gp.isDraft) {
+          await mutateFactory(prefix, (current) => {
+            const target = current.prs.find((pr) => pr.number === gp.number);
+            if (target !== undefined) target.isDraft = gp.isDraft;
+          });
+          if (!gp.isDraft && (await rafterKey()) !== null && !known.scans.some((scan) => scan.phase === "ready" && scan.sha === gp.headRefOid)) {
+            await startScan(prefix, repo, gp.number, "ready");
+          }
+        }
+      });
     }
     factory = await findFactory(prefix);
     for (const pr of factory.prs.filter((candidate) => candidate.state === "open")) {
-      if (!sameRepo.some((gp) => gp.number === pr.number)) await onPrClosed(factory, hostId, repo, pr);
+      if (!sameRepo.some((gp) => gp.number === pr.number)) await forPr(pr.number, () => onPrClosed(factory, hostId, repo, pr));
     }
     factory = await findFactory(prefix);
     for (const pr of factory.prs.filter((candidate) => candidate.state === "open")) {
-      for (const scan of pr.scans.filter((candidate) => candidate.status === "running" || (candidate.status === "failed" && candidate.scanId === null && !pr.reviews.some((review) => review.role === "security")))) {
-        await onScanFinished(factory, hostId, repo, pr, scan);
-      }
+      await forPr(pr.number, async () => {
+        for (const scan of pr.scans.filter((candidate) => candidate.status === "running" || (candidate.status === "failed" && candidate.scanId === null && !pr.reviews.some((review) => review.role === "security")))) {
+          await onScanFinished(factory, hostId, repo, pr, scan);
+        }
+      });
     }
     factory = await findFactory(prefix);
     for (const pr of factory.prs) {
-      if (pr.state === "open") {
-        // Tracking commits before spawning. Resume any reviewers that never
-        // started (a failed write/spawn or a deliberate --track-only recovery).
-        for (const role of requiredRoles(pr)) {
-          if (reviewFor(pr, role) !== null) continue;
-          if (role === "security" && pr.scans.some(scan => scan.status === "running")) continue;
-          await startPrReviewer(prefix, pr.number, role, null, null);
+      await forPr(pr.number, async () => {
+        if (pr.state === "open") {
+          // Tracking commits before spawning. Resume any reviewers that never
+          // started (a failed write/spawn or a deliberate --track-only recovery).
+          for (const role of requiredRoles(pr)) {
+            if (reviewFor(pr, role) !== null) continue;
+            if (role === "security" && pr.scans.some(scan => scan.status === "running")) continue;
+            await startPrReviewer(prefix, pr.number, role, null, null);
+          }
+          await refreshStaleApprovals(factory, pr);
+          await maybeAnnounceReapproval(factory, pr);
         }
-        await refreshStaleApprovals(factory, pr);
+        await maybeMarkReady(factory, hostId, repo, pr);
+      });
+    }
+
+    const tracked = new Set([...sameRepo.map((gp) => gp.number), ...factory.prs.map((pr) => pr.number)]);
+    for (const number of tracked) {
+      const key = `${prefix}#${number}`;
+      if (!failed.has(number)) {
+        prFailureStreaks.delete(key);
+        continue;
       }
-      await maybeMarkReady(factory, hostId, repo, pr);
+      const streak = (prFailureStreaks.get(key) ?? 0) + 1;
+      prFailureStreaks.set(key, streak);
+      // The error text isn't included: it can quote PR content, and the plugin log has it.
+      if (streak === PR_FAILURE_ALERT_PASSES) {
+        await tellLead(factory, `[factory] Automatic handling of PR #${number} has failed ${streak} passes in a row, so its reviews and gates aren't moving. The factory keeps retrying. Tell the person: \`bb plugin logs factory\` has the error.`);
+      }
     }
   }
 
@@ -2733,12 +2848,16 @@ ${sections.join("\n\n---\n\n")}`;
     const round = await mutateFactory(factory.prefix, (current) => {
       const target = current.prs.find((candidate) => candidate.number === prNumber);
       if (target === undefined || target.state !== "open") return null;
-      if (target.roundNotifiedSha === target.headSha) return null;
       const verdicts = requiredRoles(target).map((role) => ({ role, review: reviewFor(target, role) }));
       if (!verdicts.every(({ review }) => review !== null && (review.verdict === "approve" || review.verdict === "changes"))) return null;
       // All approvals are announced by the ready gate instead.
       if (verdicts.every(({ review }) => review!.verdict === "approve")) return null;
-      target.roundNotifiedSha = target.headSha;
+      // Verdicts can cover an older commit if a push landed mid-review. That round mustn't count as
+      // the head's own, or the head's real round would look already reported and be dropped.
+      const stale = verdicts.map(({ review }) => review!.sha).filter((sha) => sha !== target.headSha);
+      const round = stale.length === 0 ? target.headSha : `${target.headSha}|${stale.join(",")}`;
+      if (target.roundNotifiedSha === round) return null;
+      target.roundNotifiedSha = round;
       return {
         headSha: target.headSha,
         taskKey: target.taskKey,
@@ -2813,7 +2932,7 @@ ${sections.join("\n\n---\n\n")}`;
     if (blockers.length > 0) {
       throw new PluginCliError(`PR #${pr.number} can't merge yet: ${blockers.join("; ")}.`, {
         code: "merge_blocked",
-        hint: "For an approval on an older head, ask that reviewer's thread to check the delta and record its verdict again.",
+        hint: "For an approval on an older head, wait: once all required verdicts are approvals, the factory asks that reviewer to check the delta. A verdict recorded without that request stays on the older commit.",
       });
     }
     // Pinned, so a commit pushed after these checks makes GitHub refuse the merge.
@@ -3115,7 +3234,7 @@ ${findings}`;
       `  Review rounds per merged PR: ${measure(health.roundsPerMergedPr, number)}`,
       `  PRs with changes requested: ${changes.sample === 0 ? "no data yet" : `${Math.round((changes.prs / changes.sample) * 100)}% (${changes.prs} of ${changes.sample})`}`,
       `  Time from open to ready: ${measure(health.timeToReadyMs, (ms) => `${Math.round(ms / 60_000)} min`)}`,
-      `  Tokens per merged task, excluding cached: ${measure(health.tokensPerMergedTask, number)}`,
+      `  Tokens per merged task, excluding cached: ${measure(health.tokensPerMergedTask, (value) => number(Math.round(value)))}`,
     ].join("\n");
   }
 
@@ -3766,6 +3885,20 @@ ${findings}`;
               else current.taskKinds[task.key] = kind.data;
             });
             return { exitCode: 0, stdout: `${task.key}: ${kind.data}` };
+          },
+        }),
+        plan: cliCommand({
+          summary: "Print only a task's canonical READY plan, without its other comments",
+          positionals: [{ name: "task", description: "Task key, such as APP-12", required: true }],
+          async run(input) {
+            const task = await getTaskByKey(input.positionals.task);
+            const factory = await factoryForTaskKey(task.key);
+            const plan = factory.plans.find((entry) => entry.taskKey === task.key);
+            if (plan?.commentId == null) return { exitCode: 0, stdout: `${task.key} has no READY plan. Grade against the task's description.` };
+            const { comments } = await tasksRpc("listComments", { taskId: task.id }, z.object({ comments: z.array(commentSchema) }));
+            const document = comments.find((entry) => entry.id === plan.commentId);
+            if (document === undefined) throw new PluginCliError(`${task.key}'s plan comment ${plan.commentId} is gone.`, { code: "plan_missing" });
+            return { exitCode: 0, stdout: document.body };
           },
         }),
         lesson: cliCommand({

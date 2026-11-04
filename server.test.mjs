@@ -1263,3 +1263,221 @@ test('a hostile file path never reaches the Lead, and is neutralized in the task
   for (const entry of comments) assert.doesNotMatch(entry.body ?? '', /\n\nIGNORE/);
 });
 
+// ----- Code review of Phase 0 -----
+
+const prRecord = (over = {}) => ({ url: 'https://example.org/7', taskKey: 'TEST-1', branch: 'build', state: 'open', readyRequested: false, openedAt: '', scans: [], isDraft: true, deep: false, shadow: false, number: 7, headSha: SHA_A, reviews: [], ...over });
+const ghList = (entries) => JSON.stringify(entries.map(over => ({ number: 7, url: 'https://example.org/7', title: 'A change', headRefName: 'build', headRefOid: SHA_A, isDraft: true, additions: 5, deletions: 1, isCrossRepository: false, ...over })));
+async function runPasses(harness, count = 1) {
+  for (let i = 0; i < count; i++) {
+    const service = harness.behavior.runService('pr-watch');
+    await new Promise(resolve => setTimeout(resolve, 60));
+    service.controller.abort();
+    await service.done;
+  }
+}
+const readPrs = (bb) => createFactoryStorage(bb.storage, value => value).read('TEST').then(factory => factory.prs);
+
+test('one PR that keeps failing does not stop the others, and the Lead hears once', async t => {
+  const reviews = [approved('review1', SHA_A), approved('security', SHA_A)];
+  const { bb, harness, messages } = await fixture(t, false, {
+    repo: 'owner/repo',
+    prs: [prRecord({ number: 7, reviews }), prRecord({ number: 8, url: 'https://example.org/8', reviews })],
+  }, {
+    threads: { list: async () => [{ id: 'thr_builder', environmentBranchName: 'build' }] },
+    hostRpc: async ({ input }) => {
+      if (input.args[1] === 'list') return { code: 0, stderr: '', stdout: ghList([{ number: 7, headRefOid: SHA_B }, { number: 8, headRefOid: SHA_B }]) };
+      if (input.args[1] === 'view' && input.args[2] === '7') return { code: 1, stdout: '', stderr: 'secret detail from GitHub' };
+      return { code: 0, stdout: '{}', stderr: '' };
+    },
+  });
+  await harness.behavior.setSettings({ prReviews: true });
+  await runPasses(harness, 6);
+  const [seven, eight] = await readPrs(bb);
+  assert.equal(seven.headSha, SHA_A, 'the failing PR is retried');
+  assert.equal(eight.headSha, SHA_B, 'the other PR moved on');
+  const alerts = messages.filter(message => /failed 5 passes in a row/.test(message.input[0].text));
+  assert.equal(alerts.length, 1);
+  assert.match(alerts[0].input[0].text, /PR #7/);
+  assert.doesNotMatch(alerts[0].input[0].text, /secret detail/);
+});
+
+test('work a push owes is finished on the next pass, without repeating what already happened', async t => {
+  let spawnFails = true;
+  const { bb, harness, messages, spawns } = await fixture(t, false, {
+    repo: 'owner/repo',
+    prs: [prRecord({ reviews: [approved('review1', SHA_A, 'changes'), approved('security', SHA_A)] })],
+  }, {
+    threads: {
+      list: async () => [{ id: 'thr_builder', environmentBranchName: 'build' }],
+      get: async ({ threadId }) => makeThreadResponse({ id: threadId, environmentId: 'env_builder', archivedAt: threadId === 'thr_review1' ? Date.now() : null }),
+      spawn: async args => {
+        if (spawnFails) throw new Error('provider down');
+        spawns.push(args);
+        return makeThreadResponse({ id: `thr_spawned_${spawns.length}` });
+      },
+    },
+    hostRpc: async ({ input }) => ({ code: 0, stderr: '', stdout: input.args[1] === 'list' ? ghList([{ headRefOid: SHA_B }]) : JSON.stringify({ files: [{ path: 'src/auth/session.ts' }], changedFiles: 1 }) }),
+  });
+  await harness.behavior.setSettings({ prReviews: true });
+  await runPasses(harness);
+  let [pr] = await readPrs(bb);
+  assert.equal(pr.headSha, SHA_B);
+  assert.ok(pr.pushFollowUp !== null, 'the unfinished work is remembered');
+  assert.equal(pr.pushFollowUp.notify, null, 'the message went out despite the failure');
+
+  spawnFails = false;
+  await runPasses(harness, 2);
+  [pr] = await readPrs(bb);
+  assert.equal(pr.pushFollowUp, null);
+  assert.equal(spawns.filter(spawn => spawn.pluginMetadata.role === 'review1').length, 1, 'the reviewer who asked for changes is asked again, once');
+  assert.equal(messages.filter(message => /only the person can merge this PR/.test(message.input[0].text)).length, 1);
+  assert.equal(messages.filter(message => message.threadId === 'thr_security').length, 1, 'Security is not asked twice');
+});
+
+test('a round on an older commit does not swallow the head\'s own round', async t => {
+  const first = await fixture(t, false, { repo: 'owner/repo', prs: [prRecord({ headSha: SHA_B, reviews: [{ role: 'review1', threadId: 'thr_r1', sha: SHA_A, verdict: 'pending', at: '' }, { ...approved('security', SHA_A), threadId: 'thr_sec' }] })] });
+  assert.equal((await first.harness.behavior.runCli(['verdict', 'TEST-1', '--role', 'review1', '--verdict', 'changes', '--pr', '7'], { threadId: 'thr_r1' })).exitCode, 0);
+  assert.equal(first.messages.filter(message => /Review round complete/.test(message.input[0].text)).length, 1);
+  const stale = (await readPrs(first.bb))[0].roundNotifiedSha;
+  assert.notEqual(stale, SHA_B);
+
+  const second = await fixture(t, false, { repo: 'owner/repo', prs: [prRecord({ headSha: SHA_B, roundNotifiedSha: stale, reviews: [{ ...approved('review1', SHA_B), threadId: 'thr_r1' }, { role: 'security', threadId: 'thr_sec', sha: SHA_B, verdict: 'pending', at: '' }] })] });
+  assert.equal((await second.harness.behavior.runCli(['verdict', 'TEST-1', '--role', 'security', '--verdict', 'changes', '--pr', '7'], { threadId: 'thr_sec' })).exitCode, 0);
+  assert.equal(second.messages.filter(message => /Review round complete/.test(message.input[0].text)).length, 1);
+  assert.equal((await readPrs(second.bb))[0].roundNotifiedSha, SHA_B);
+});
+
+test('the same round on the head is still reported only once', async t => {
+  const { bb, harness, messages } = await fixture(t, false, { repo: 'owner/repo', prs: [prRecord({ headSha: SHA_B, roundNotifiedSha: SHA_B, reviews: [{ ...approved('review1', SHA_B), threadId: 'thr_r1' }, { role: 'security', threadId: 'thr_sec', sha: SHA_B, verdict: 'pending', at: '' }] })] });
+  assert.equal((await harness.behavior.runCli(['verdict', 'TEST-1', '--role', 'security', '--verdict', 'changes', '--pr', '7'], { threadId: 'thr_sec' })).exitCode, 0);
+  assert.equal(messages.filter(message => /Review round complete/.test(message.input[0].text)).length, 0);
+  assert.equal((await readPrs(bb))[0].roundNotifiedSha, SHA_B);
+});
+
+test('a merge refused for an older approval no longer tells anyone to re-record a verdict', async t => {
+  const { harness } = await mergeFixture(t, { mergePolicy: 'when-green' }, liveView({ headRefOid: 'newhead0000' }));
+  const result = await harness.behavior.runCli(['merge', 'TEST-1'], { threadId: 'thr_lead' });
+  assert.notEqual(result.exitCode, 0);
+  const text = JSON.stringify(result);
+  assert.doesNotMatch(text, /record its verdict again/);
+  assert.match(text, /the factory asks that reviewer to check the delta/);
+});
+
+test('reviewers read the plan alone, without other verdicts', async t => {
+  const body = 'Factory plan: READY\n## Acceptance criteria\nDo it.';
+  const { harness, spawns } = await fixture(t, false, { plans: [{ taskKey: 'TEST-1', threadId: 'thr_planner', commentId: 'plan_1' }], prs: [trackedPr] }, {
+    tasksRpc: async ({ method }) => method === 'listComments'
+      ? { comments: [{ id: 'plan_1', kind: 'agent', authorName: 'Planner', threadId: 'thr_planner', body, createdAt: '' }, { id: 'c2', kind: 'system', authorName: 'Factory', threadId: null, body: '**Security:** REQUEST CHANGES on PR #1', createdAt: '' }] }
+      : undefined,
+  });
+  const plan = await harness.behavior.runCli(['plan', 'TEST-1']);
+  assert.equal(plan.exitCode, 0, JSON.stringify(plan));
+  assert.equal(plan.stdout, body);
+  await harness.behavior.runCli(['assign', 'TEST-1', '--role', 'review2', '--pr', '1']);
+  await harness.behavior.runCli(['assign', 'TEST-1', '--role', 'build']);
+  const [review, build] = spawns;
+  assert.match(review.prompt, /bb factory plan TEST-1/);
+  assert.doesNotMatch(review.prompt, /Read it directly with bb tasks show/);
+  assert.match(build.prompt, /Read it directly with bb tasks show TEST-1/);
+});
+
+test('bb factory plan says so when a task has no READY plan', async t => {
+  const { harness } = await fixture(t);
+  assert.match((await harness.behavior.runCli(['plan', 'TEST-1'])).stdout, /no READY plan/);
+});
+
+test('a ready PR approved again is announced once, and again after another block', async t => {
+  const approvals = [approved('review1', SHA_B), approved('security', SHA_B)];
+  const { messages, pass } = await watchOnce(t, {
+    pr: { number: 7, headSha: SHA_B, isDraft: false, readyRequested: true, deep: false, shadow: false, approvedNotifiedSha: SHA_A, reviews: approvals },
+    live: { headRefOid: SHA_B, isDraft: false },
+  });
+  await pass();
+  const announced = messages.filter(message => /every approval on its latest commit/.test(message.input[0].text));
+  assert.equal(announced.length, 1);
+  assert.match(announced[0].input[0].text, /Tell the person it's ready/);
+});
+
+test('a ready PR that the Lead may merge says so, and nothing is announced while a verdict is open', async t => {
+  const green = await watchOnce(t, {
+    initial: { mergePolicy: 'when-green' },
+    pr: { number: 7, headSha: SHA_B, isDraft: false, readyRequested: true, deep: false, shadow: false, reviews: [approved('review1', SHA_B), approved('security', SHA_B)] },
+    live: { headRefOid: SHA_B, isDraft: false },
+  });
+  assert.ok(green.messages.some(message => /Merge it with `bb factory merge TEST-1`/.test(message.input[0].text)));
+  const blocked = await watchOnce(t, {
+    pr: { number: 7, headSha: SHA_B, isDraft: false, readyRequested: true, deep: false, shadow: false, approvedNotifiedSha: SHA_B, reviews: [approved('review1', SHA_B), approved('security', SHA_B, 'changes')] },
+    live: { headRefOid: SHA_B, isDraft: false },
+  });
+  assert.ok(!blocked.messages.some(message => /every approval on its latest commit/.test(message.input[0].text)));
+  assert.equal((await blocked.stored()).approvedNotifiedSha, null, 'the next approval will be announced');
+});
+
+test('marking a PR ready does not announce it a second time, even after its final scan', async t => {
+  const live = { headRefOid: SHA_A, isDraft: true };
+  const { messages, pass, ghCalls } = await watchOnce(t, {
+    pr: { number: 7, headSha: SHA_A, isDraft: true, deep: false, shadow: false, reviews: [approved('review1', SHA_A), approved('security', SHA_A)] },
+    live,
+  });
+  assert.ok(ghCalls.some(args => args[1] === 'ready'));
+  assert.equal(messages.filter(message => /has every approval and is marked ready/.test(message.input[0].text)).length, 1);
+  live.isDraft = false;
+  await pass();
+  await pass();
+  assert.ok(!messages.some(message => /every approval on its latest commit/.test(message.input[0].text)));
+});
+
+test('a PR the person marked ready by hand is announced when its approvals cover the head', async t => {
+  const { messages } = await watchOnce(t, {
+    pr: { number: 7, headSha: SHA_A, isDraft: true, deep: false, shadow: false, reviews: [approved('review1', SHA_A), approved('security', SHA_A)] },
+    live: { headRefOid: SHA_A, isDraft: false },
+  });
+  assert.equal(messages.filter(message => /every approval on its latest commit/.test(message.input[0].text)).length, 1);
+});
+
+test('a running scan neither announces a ready PR nor clears its announcement', async t => {
+  t.mock.method(globalThis, 'fetch', async () => new Response('', { status: 503 })); // Rafter: still running.
+  const { messages, stored } = await watchOnce(t, {
+    pr: { number: 7, headSha: SHA_B, isDraft: false, readyRequested: true, deep: false, shadow: false, approvedNotifiedSha: SHA_B, scans: [{ phase: 'ready', sha: SHA_B, status: 'running', scanId: 'scan_1', startedAt: '', error: null }], reviews: [approved('review1', SHA_B), approved('security', SHA_B)] },
+    live: { headRefOid: SHA_B, isDraft: false },
+    settings: { rafterApiKey: 'test-key' },
+  });
+  assert.ok(!messages.some(message => /every approval on its latest commit/.test(message.input[0].text)));
+  assert.equal((await stored()).approvedNotifiedSha, SHA_B);
+});
+
+test('doctor reports waiting, not ready, for an older approval or a running scan', async t => {
+  const task = { id: 'task_1', key: 'TEST-1', projectId: 'tracker', title: 'Test', description: '', status: 'in_review', priority: 'none', position: 0, labelIds: [], createdAt: '', updatedAt: '' };
+  const summary = async (over) => {
+    const { harness } = await fixture(t, false, { mergePolicy: 'when-green', prs: [prRecord({ isDraft: false, readyRequested: true, headSha: SHA_B, ...over })] }, {
+      projectPath: '/repo/test',
+      tasksRpc: async ({ method }) => (method === 'listTasks' ? { tasks: [task] } : undefined),
+      hostRpc: async () => ({ exists: true, isGitRepo: true, commitCount: 3, sourceDirs: [], detectedMode: 'brownfield', files: { agentsMd: 'a', constitution: 'c', specs: 's', roadmap: 'r' }, existingDocs: [] }),
+    });
+    return (await harness.behavior.callRpc('factory_doctor', { prefix: 'TEST' })).boardHealth.openPrsAwaitingAction[0].summary;
+  };
+  assert.match(await summary({ reviews: [approved('review1', SHA_A), approved('security', SHA_B)] }), /Waiting on Reviewer 1 to check the latest commit/);
+  assert.match(await summary({ reviews: [approved('review1', SHA_B), approved('security', SHA_B)], scans: [{ phase: 'ready', sha: SHA_B, status: 'running', scanId: 's', startedAt: '', error: null }] }), /Waiting for a Rafter scan/);
+  assert.match(await summary({ reviews: [approved('review1', SHA_B), approved('security', SHA_B)] }), /Ready to merge/);
+});
+
+test('a fresh install that cannot read providers keeps Reviewer 1 on the Builder\'s provider', async t => {
+  let reloaded;
+  const reload = new Promise(resolve => { reloaded = resolve; });
+  const { bb, harness } = createFakePluginHost({
+    pluginId: 'factory', settings: {},
+    sdk: { providers: { list: async () => { throw new Error('not ready'); }, models: async () => ({ models: [] }) }, plugins: { reload: async () => { reloaded(); return {}; } } },
+  });
+  t.after(() => harness.lifecycle.dispose());
+  await plugin(bb);
+  await reload;
+  assert.equal((await bb.storage.kv.get('agents')).roles.review1.providerId, 'claude-code');
+});
+
+test('roster: the trial comparison seat is checked when the trial is on', () => {
+  const list = available('claude-code', 'codex', 'acp-cursor');
+  const roles = seats({ comparison: { providerId: 'gone' } });
+  assert.deepEqual(rosterWarnings(roles, list, { shadowOn: false }), []);
+  assert.match(rosterWarnings(roles, list, { shadowOn: true })[0].title, /gone isn't available for Reviewer trial comparison/);
+});
+
