@@ -177,10 +177,18 @@ function approvalsCover(pr: Pick<Pr, "deep" | "reviews">, sha: string): boolean 
     return review?.verdict === "approve" && review.sha === sha;
   });
 }
-/** Fail closed: with blocking on, only an explicit approve or dismissal clears a shadow review, and one still owed holds too. */
-function shadowHolds(pr: Pick<Pr, "reviews"> & { pushFollowUp?: Pr["pushFollowUp"] }, shadowBlocks: boolean): boolean {
+/** Whether a PR that already has a shadow review should keep getting one. Turning the trial off stops it. */
+function shadowContinues(pr: Pick<Pr, "shadow">, shadowMode: string): boolean {
+  return shadowMode !== "off" && (shadowMode !== "sensitive" || pr.shadow);
+}
+/** Sensitive mode with blocking requires a shadow review on this PR, and it doesn't have one yet. */
+function shadowMissing(pr: Pick<Pr, "reviews" | "shadow">, shadowBlocks: boolean, shadowMode: string): boolean {
+  return shadowBlocks && shadowMode === "sensitive" && pr.shadow && latestReview(pr, "shadow") === null;
+}
+/** Fail closed: with blocking on, a shadow review that's required or owed holds, and only an explicit approve or dismissal clears one. */
+function shadowHolds(pr: Pick<Pr, "reviews" | "shadow"> & { pushFollowUp?: Pr["pushFollowUp"] }, shadowBlocks: boolean, shadowMode: string): boolean {
   if (!shadowBlocks) return false;
-  if (pr.pushFollowUp?.shadow === true) return true;
+  if (pr.pushFollowUp?.shadow === true || shadowMissing(pr, shadowBlocks, shadowMode)) return true;
   const shadow = latestReview(pr, "shadow");
   return shadow !== null && shadow.verdict !== "approve" && shadow.verdict !== "dismissed";
 }
@@ -191,9 +199,10 @@ function shadowHolds(pr: Pick<Pr, "reviews"> & { pushFollowUp?: Pr["pushFollowUp
  * promise that, because new commits re-request only some reviewers.
  */
 export function mergeBlockers(
-  pr: Pick<Pr, "deep" | "reviews" | "scans"> & { pushFollowUp?: Pr["pushFollowUp"] },
+  pr: Pick<Pr, "deep" | "reviews" | "scans" | "shadow"> & { pushFollowUp?: Pr["pushFollowUp"] },
   view: z.infer<typeof prMergeViewSchema>,
   shadowBlocks: boolean,
+  shadowMode = "off",
 ): string[] {
   const blockers: string[] = [];
   if (view.state !== "OPEN") blockers.push(`it is ${view.state.toLowerCase()}`);
@@ -204,7 +213,7 @@ export function mergeBlockers(
     if (review?.verdict !== "approve") blockers.push(`${ROLES[role].label} has not approved`);
     else if (review.sha !== view.headRefOid) blockers.push(`${ROLES[role].label} approved ${review.sha.slice(0, 7)}, not the head ${view.headRefOid.slice(0, 7)}`);
   }
-  if (shadowHolds(pr, shadowBlocks)) blockers.push("the shadow reviewer's block is open");
+  if (shadowHolds(pr, shadowBlocks, shadowMode)) blockers.push("the shadow reviewer's block is open");
   if (pr.scans.some((scan) => scan.status === "running")) blockers.push("a Rafter scan is still running");
   const checks = view.statusCheckRollup ?? [];
   // A head just pushed has no checks yet, so none is not the same as green.
@@ -2488,6 +2497,25 @@ ${sections.join("\n\n---\n\n")}`;
     await finishPush(factory.prefix, pr.number);
   }
 
+  /** Holding a PR for a shadow that can't start must not be silent. Once per stall. */
+  async function reportShadowCantStart(factory: Factory, pr: Pr): Promise<void> {
+    if (pr.shadowStallNotifiedAt !== null) return;
+    await deliverThenMark(factory, pr.number, `[factory] The shadow reviewer can't start on PR #${pr.number} (${pr.taskKey}), and its review is required before this PR can be ready. The factory keeps retrying. Tell the person: fix the shadow's provider, or turn off shadow blocking in the plugin settings.`, (target) => {
+      target.shadowStallNotifiedAt = new Date().toISOString();
+    });
+  }
+
+  /** A required shadow review that hasn't started, whichever start failed: retried here, and its gate stays closed meanwhile. */
+  async function retryMissingShadow(factory: Factory, pr: Pr): Promise<void> {
+    const { shadowBlocks, shadowMode } = await settings.get();
+    if (!shadowMissing(pr, shadowBlocks, shadowMode)) return;
+    const security = latestReview(pr, "security");
+    if (security?.threadId == null) return; // It starts with the first Security reviewer.
+    await maybeStartShadow(factory.prefix, pr, security.threadId, null, null);
+    const started = (await findFactory(factory.prefix)).prs.find((candidate) => candidate.number === pr.number);
+    if (started !== undefined && latestReview(started, "shadow") === null) await reportShadowCantStart(factory, pr);
+  }
+
   /**
    * Everything a push owes. Each step can run again safely, and whatever isn't done stays owed for the
    * next pass. Shadow work never fails the PR: it only holds the shadow's own gate, so required
@@ -2520,8 +2548,9 @@ ${sections.join("\n\n---\n\n")}`;
       if (review === null || review.sha === sha) continue;
       if (role === "shadow") {
         // The shadow re-reviews every push, not only after REQUEST CHANGES, so its verdict never
-        // stands on an older commit. A dismissed shadow is left alone so it can't re-block.
-        if (review.verdict === "dismissed" || review.threadId === null) continue;
+        // stands on an older commit. A dismissed shadow is left alone so it can't re-block, and a
+        // trial that's been turned off gets no more of the PR's code.
+        if (review.verdict === "dismissed" || review.threadId === null || !shadowContinues(pr, shadowMode)) continue;
         const message = reReviewMessage({ role, taskKey: pr.taskKey, prNumber: pr.number, sha, findings: null });
         if (await tellThread(review.threadId, message)) {
           await mutateFactory(prefix, (current) => {
@@ -2551,17 +2580,12 @@ ${sections.join("\n\n---\n\n")}`;
 
     const security = latestReview(pr, "security");
     if (pr.pushFollowUp.shadow && shadowMode === "sensitive" && latestReview(pr, "shadow") === null && security?.threadId != null) {
-      await maybeStartShadow(prefix, pr, security.threadId, null, null); // Logs its own failures.
-      const started = (await findFactory(prefix)).prs.find((candidate) => candidate.number === prNumber);
-      if (started !== undefined && latestReview(started, "shadow") === null) shadowOwed = true;
+      // Logs its own failures. With blocking on, the watcher retries a shadow that's still missing.
+      await maybeStartShadow(prefix, pr, security.threadId, null, null);
     }
     // A trial that can't block can simply be skipped. One that can block keeps its gate closed until it runs.
     const holdForShadow = shadowOwed && shadowBlocks;
-    if (holdForShadow && pr.shadowStallNotifiedAt === null) {
-      await deliverThenMark(factory, prNumber, `[factory] The shadow reviewer can't start on PR #${pr.number} (${pr.taskKey}), and its review is required before this PR can be ready. The factory keeps retrying. Tell the person: fix the shadow's provider, or turn off shadow blocking in the plugin settings.`, (target) => {
-        target.shadowStallNotifiedAt = new Date().toISOString();
-      });
-    }
+    if (holdForShadow) await reportShadowCantStart(factory, pr);
     await mutateFactory(prefix, (current) => {
       const target = current.prs.find((candidate) => candidate.number === prNumber);
       if (target === undefined) return;
@@ -2706,7 +2730,8 @@ ${sections.join("\n\n---\n\n")}`;
     if (pr.scans.some((scan) => scan.status === "running")) return;
     const roles = requiredReviewRoles(pr);
     if (!approvalsCover(pr, pr.headSha)) return;
-    if (shadowHolds(pr, (await settings.get()).shadowBlocks)) {
+    const { shadowBlocks, shadowMode } = await settings.get();
+    if (shadowHolds(pr, shadowBlocks, shadowMode)) {
       const shadow = latestReview(pr, "shadow");
       if (shadow?.verdict === "pending") await maybeReportShadowStall(factory, hostId, repo, pr, shadow);
       return;
@@ -2750,7 +2775,8 @@ ${sections.join("\n\n---\n\n")}`;
     if (pr.isDraft) return;
     // A running scan decides nothing yet. If it finds something, Security's verdict will say so.
     if (pr.scans.some((scan) => scan.status === "running")) return;
-    const blocked = shadowHolds(pr, (await settings.get()).shadowBlocks) || requiredReviewRoles(pr).some((role) => latestReview(pr, role)?.verdict === "changes");
+    const { shadowBlocks, shadowMode } = await settings.get();
+    const blocked = shadowHolds(pr, shadowBlocks, shadowMode) || requiredReviewRoles(pr).some((role) => latestReview(pr, role)?.verdict === "changes");
     if (blocked) {
       if (pr.approvedNotifiedSha !== null) {
         await mutateFactory(factory.prefix, (current) => {
@@ -2769,16 +2795,24 @@ ${sections.join("\n\n---\n\n")}`;
     await comment(task.id, `[PR #${pr.number}](${pr.url}) is approved at \`${pr.headSha.slice(0, 7)}\`: every required reviewer has seen this commit.`);
   }
 
-  async function onPrClosed(factory: Factory, hostId: string, repo: string, pr: Pr): Promise<void> {
-    let state: "merged" | "closed" | "open" = "open";
-    try {
-      const view = JSON.parse(await gh(hostId, ["pr", "view", String(pr.number), "--repo", repo, "--json", "state"])) as { state?: string };
-      state = view.state === "MERGED" ? "merged" : view.state === "CLOSED" ? "closed" : "open";
-    } catch (error) {
-      bb.log.warn(`could not read PR #${pr.number}: ${String(error)}`);
-      return;
+  /**
+   * A tracked PR that GitHub's open list left out: closed, or open but past the list's limit or by
+   * another author. Returns its live head if it's still open, after processing any new push, because
+   * the gates must not trust a stored head nobody has checked. A failed read propagates, so the gates
+   * skip this PR and it counts toward the failure alert.
+   */
+  async function onPrUnlisted(factory: Factory, hostId: string, repo: string, pr: Pr): Promise<string | null> {
+    const view = JSON.parse(await gh(hostId, ["pr", "view", String(pr.number), "--repo", repo, "--json", "state,number,url,title,headRefName,headRefOid,isDraft,additions,deletions"])) as Partial<GhPr> & { state?: string };
+    const state = view.state === "MERGED" ? "merged" : view.state === "CLOSED" ? "closed" : "open";
+    if (state === "open") {
+      if (typeof view.headRefOid !== "string" || view.headRefOid === "") throw new Error(`GitHub didn't report a head for PR #${pr.number}`);
+      if (view.headRefOid !== pr.headSha) {
+        await onPrPushed(factory, hostId, repo, { number: pr.number, url: pr.url, title: view.title ?? "", headRefName: view.headRefName ?? pr.branch, headRefOid: view.headRefOid, isDraft: view.isDraft ?? pr.isDraft, additions: view.additions ?? 0, deletions: view.deletions ?? 0 }, pr);
+      } else if (pr.pushFollowUp !== null) {
+        await finishPush(factory.prefix, pr.number);
+      }
+      return view.headRefOid;
     }
-    if (state === "open") return;
     await mutateFactory(factory.prefix, (current) => {
       const target = current.prs.find((candidate) => candidate.number === pr.number);
       if (target !== undefined) {
@@ -2795,6 +2829,7 @@ ${sections.join("\n\n---\n\n")}`;
       await comment(task.id, `[PR #${pr.number}](${pr.url}) was closed without merging.`);
       await tellLead(factory, `[factory] PR #${pr.number} (${pr.taskKey}) was closed without merging. Decide with the person what happens to the task.`);
     }
+    return null;
   }
 
   const PR_FAILURE_ALERT_PASSES = 5;
@@ -2862,8 +2897,12 @@ ${sections.join("\n\n---\n\n")}`;
       });
     }
     factory = await findFactory(prefix);
-    for (const pr of factory.prs.filter((candidate) => candidate.state === "open")) {
-      if (!sameRepo.some((gp) => gp.number === pr.number)) await forPr(pr.number, () => onPrClosed(factory, hostId, repo, pr));
+    const liveHeads = new Map(sameRepo.map((gp) => [gp.number, gp.headRefOid]));
+    for (const pr of factory.prs.filter((candidate) => candidate.state === "open" && !liveHeads.has(candidate.number))) {
+      await forPr(pr.number, async () => {
+        const head = await onPrUnlisted(factory, hostId, repo, pr);
+        if (head !== null) liveHeads.set(pr.number, head);
+      });
     }
     factory = await findFactory(prefix);
     for (const pr of factory.prs.filter((candidate) => candidate.state === "open" && !failed.has(candidate.number))) {
@@ -2875,10 +2914,9 @@ ${sections.join("\n\n---\n\n")}`;
     }
     factory = await findFactory(prefix);
     for (const pr of factory.prs.filter((candidate) => candidate.state === "open")) {
-      // Gates run only on the commit GitHub says is the head. If this PR failed earlier in the pass,
-      // its stored head can be behind, and its approvals would vouch for code nobody reviewed.
-      const live = sameRepo.find((gp) => gp.number === pr.number);
-      if (failed.has(pr.number) || (live !== undefined && live.headRefOid !== pr.headSha)) continue;
+      // Gates run only on the commit GitHub says is the head. Otherwise the stored head can be
+      // behind, and its approvals would vouch for code nobody reviewed.
+      if (failed.has(pr.number) || liveHeads.get(pr.number) !== pr.headSha) continue;
       await forPr(pr.number, async () => {
         // Tracking commits before spawning. Resume any reviewers that never
         // started (a failed write/spawn or a deliberate --track-only recovery).
@@ -2887,6 +2925,7 @@ ${sections.join("\n\n---\n\n")}`;
           if (role === "security" && pr.scans.some(scan => scan.status === "running")) continue;
           await startPrReviewer(prefix, pr.number, role, null, null);
         }
+        await retryMissingShadow(factory, pr);
         await refreshStaleVerdicts(factory, pr);
         await maybeReportRound(factory, pr.number);
         await maybeAnnounceReapproval(factory, pr);
@@ -3012,7 +3051,8 @@ ${sections.join("\n\n---\n\n")}`;
     const { hostId, repo } = await projectHost(factory);
     if (repo === null) throw new PluginCliError(`Factory ${factory.prefix} has no GitHub repository.`, { code: "no_repo" });
     const view = prMergeViewSchema.parse(JSON.parse(await gh(hostId, ["pr", "view", String(pr.number), "--repo", repo, "--json", "state,isDraft,headRefOid,mergeable,statusCheckRollup"])));
-    const blockers = mergeBlockers(pr, view, (await settings.get()).shadowBlocks);
+    const { shadowBlocks, shadowMode } = await settings.get();
+    const blockers = mergeBlockers(pr, view, shadowBlocks, shadowMode);
     if (blockers.length > 0) {
       throw new PluginCliError(`PR #${pr.number} can't merge yet: ${blockers.join("; ")}.`, {
         code: "merge_blocked",
