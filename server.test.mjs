@@ -1565,7 +1565,7 @@ test('with blocking on, a shadow that cannot start is retried and holds the gate
   const { bb, harness, state } = await shadowPushFixture(t, { shadowBlocks: true, spawnFails: true });
   await runPasses(harness);
   let [pr] = await readPrs(bb);
-  assert.equal(pr.pushFollowUp?.shadow, true, 'still owed');
+  assert.equal(pr.shadow, true);
   assert.equal(pr.readyRequested, false);
   state.spawnFails = false;
   await runPasses(harness);
@@ -1705,7 +1705,7 @@ test('a PR missing from the GitHub list still gets its gates', async t => {
     hostRpc: async ({ input }) => {
       calls.push(input.args);
       if (input.args[1] === 'list') return { code: 0, stderr: '', stdout: '[]' };
-      if (input.args[1] === 'view') return { code: 0, stderr: '', stdout: JSON.stringify({ state: 'OPEN' }) };
+      if (input.args[1] === 'view') return { code: 0, stderr: '', stdout: JSON.stringify({ state: 'OPEN', headRefOid: SHA_A }) };
       return { code: 0, stderr: '', stdout: '' };
     },
   });
@@ -1733,11 +1733,11 @@ test('a shadow that cannot start holds only its own gate: Reviewer 2 still start
   await runPasses(harness, 3);
   const [pr] = await readPrs(bb);
   assert.ok(started.includes('review2'));
-  assert.equal(pr.pushFollowUp?.shadow, true);
   assert.equal(pr.readyRequested, false);
   assert.equal(messages.filter(message => /shadow reviewer can't start/.test(message.input[0].text)).length, 1);
-  assert.match(mergeBlockers({ ...pr, headSha: SHA_B, scans: [] }, liveView({ headRefOid: SHA_B }), true).join('; '), /shadow/);
-  assert.doesNotMatch(mergeBlockers({ ...pr, scans: [] }, liveView(), false).join('; '), /shadow/);
+  assert.match(mergeBlockers({ ...pr, scans: [] }, liveView({ headRefOid: SHA_B }), true, 'sensitive').join('; '), /shadow/);
+  assert.doesNotMatch(mergeBlockers({ ...pr, scans: [] }, liveView(), true, 'off').join('; '), /shadow/);
+  assert.doesNotMatch(mergeBlockers({ ...pr, scans: [] }, liveView(), false, 'sensitive').join('; '), /shadow/);
 });
 
 test('a shadow whose thread is gone gets a replacement instead of being stuck', async t => {
@@ -1750,7 +1750,7 @@ test('a shadow whose thread is gone gets a replacement instead of being stuck', 
     },
     hostRpc: ghFor([{ headRefOid: SHA_B }], JSON.stringify({ files: [], changedFiles: 0 })),
   });
-  await harness.behavior.setSettings({ prReviews: true, shadowBlocks: true });
+  await harness.behavior.setSettings({ prReviews: true, shadowMode: 'next', shadowBlocks: true });
   await runPasses(harness, 2);
   const [pr] = await readPrs(bb);
   assert.equal(spawned.filter(role => role === 'shadow').length, 1);
@@ -1833,5 +1833,111 @@ test('a saved Reviewer 1 is kept on an old install with no factories left', asyn
   await plugin(bb);
   await reload;
   assert.equal((await bb.storage.kv.get('agents')).roles.review1.providerId, 'acp-cursor');
+});
+
+// ----- Security check of the shadow and head gates -----
+
+test('turning the trial off stops shadow work: no replacement, no message, nothing owed', async t => {
+  for (const gone of [true, false]) {
+    const spawned = [];
+    const told = [];
+    const { bb, harness } = await fixture(t, false, { repo: 'owner/repo', prs: [prRecord({ reviews: [approved('review1', SHA_A), approved('security', SHA_A), approved('shadow', SHA_A)] })] }, {
+      threads: {
+        list: threadList,
+        get: async ({ threadId }) => makeThreadResponse({ id: threadId, environmentId: 'env_builder', archivedAt: gone && threadId === 'thr_shadow' ? Date.now() : null }),
+        spawn: async args => { spawned.push(args.pluginMetadata.role); return makeThreadResponse({ id: `thr_${args.pluginMetadata.role}_new` }); },
+        send: async args => { told.push(args.threadId); return {}; },
+      },
+      hostRpc: ghFor([{ headRefOid: SHA_B }], JSON.stringify({ files: [], changedFiles: 0 })),
+    });
+    await harness.behavior.setSettings({ prReviews: true, shadowMode: 'off', shadowBlocks: true });
+    await runPasses(harness, 2);
+    assert.ok(!spawned.includes('shadow'), 'no new shadow');
+    assert.ok(!told.includes('thr_shadow'), 'no message to the old one');
+    assert.equal((await readPrs(bb))[0].pushFollowUp, null);
+  }
+});
+
+const missingShadowFixture = async (t, settings, { spawnFails = true } = {}) => {
+  const state = { spawnFails, ghCalls: [] };
+  const result = await fixture(t, false, { repo: 'owner/repo', prs: [prRecord({ shadow: true, reviews: [approved('review1', SHA_A), approved('security', SHA_A)] })] }, {
+    threads: {
+      list: threadList,
+      get: async ({ threadId }) => makeThreadResponse({ id: threadId, environmentId: 'env_builder' }),
+      spawn: async args => {
+        if (state.spawnFails && args.pluginMetadata.role === 'shadow') throw new Error('provider down');
+        return makeThreadResponse({ id: `thr_${args.pluginMetadata.role}_new` });
+      },
+    },
+    hostRpc: async ({ input }) => { state.ghCalls.push(input.args); return { code: 0, stderr: '', stdout: input.args[1] === 'list' ? ghList([{ headRefOid: SHA_A }]) : '' }; },
+  });
+  await result.harness.behavior.setSettings({ prReviews: true, ...settings });
+  return { ...result, state };
+};
+
+test('a required shadow that never started holds the gate, is retried, and the Lead hears once', async t => {
+  const { bb, harness, messages, state } = await missingShadowFixture(t, { shadowMode: 'sensitive', shadowBlocks: true });
+  await runPasses(harness, 3);
+  assert.ok(!state.ghCalls.some(args => args[1] === 'ready'), 'not marked ready');
+  assert.equal(messages.filter(message => /shadow reviewer can't start/.test(message.input[0].text)).length, 1);
+  state.spawnFails = false;
+  await runPasses(harness);
+  const [pr] = await readPrs(bb);
+  assert.equal(pr.reviews.filter(review => review.role === 'shadow').at(-1).verdict, 'pending');
+  assert.ok(!state.ghCalls.some(args => args[1] === 'ready'), 'still waiting for its verdict');
+});
+
+test('a missing shadow holds nothing when the trial is off or blocking is off', async t => {
+  for (const settings of [{ shadowMode: 'off', shadowBlocks: true }, { shadowMode: 'sensitive', shadowBlocks: false }, { shadowMode: 'next', shadowPrs: 0, shadowBlocks: true }]) {
+    const { harness, messages, state } = await missingShadowFixture(t, settings);
+    await runPasses(harness);
+    assert.ok(state.ghCalls.some(args => args[1] === 'ready'), JSON.stringify(settings));
+    assert.ok(!messages.some(message => /shadow reviewer can't start/.test(message.input[0].text)));
+  }
+});
+
+const unlistedFixture = async (t, view) => {
+  const calls = [];
+  const result = await fixture(t, false, { repo: 'owner/repo', prs: [prRecord({ reviews: [approved('review1', SHA_A), approved('security', SHA_A)] })] }, {
+    threads: { list: threadList, get: async ({ threadId }) => makeThreadResponse({ id: threadId, environmentId: 'env_builder' }) },
+    hostRpc: async ({ input }) => {
+      calls.push(input.args);
+      if (input.args[1] === 'list') return { code: 0, stderr: '', stdout: '[]' };
+      if (input.args[1] === 'view') return view(input.args);
+      return { code: 0, stderr: '', stdout: '' };
+    },
+  });
+  await result.harness.behavior.setSettings({ prReviews: true });
+  return { ...result, calls };
+};
+
+test('an unlisted PR with a new push is processed like any other, not judged on its old head', async t => {
+  const { bb, harness, calls, messages } = await unlistedFixture(t, () => ({ code: 0, stderr: '', stdout: JSON.stringify({ state: 'OPEN', headRefOid: SHA_B, additions: 1, deletions: 1, title: 'c', headRefName: 'build', isDraft: true, files: [], changedFiles: 0 }) }));
+  await runPasses(harness);
+  const [pr] = await readPrs(bb);
+  assert.equal(pr.headSha, SHA_B);
+  assert.ok(!calls.some(args => args[1] === 'ready'));
+  assert.ok(messages.some(message => /Re-review what changed/.test(message.input[0].text)), 'Security was asked to review the new commit');
+});
+
+test('an unlisted PR whose head cannot be read gets no gates, and counts as failing', async t => {
+  for (const view of [() => ({ code: 1, stdout: '', stderr: 'HTTP 502' }), () => ({ code: 0, stderr: '', stdout: JSON.stringify({ state: 'OPEN' }) })]) {
+    const { harness, calls, messages } = await unlistedFixture(t, view);
+    await runPasses(harness, 5);
+    assert.ok(!calls.some(args => args[1] === 'ready'));
+    assert.equal(messages.filter(message => /failed 5 passes in a row/.test(message.input[0].text)).length, 1);
+  }
+});
+
+test('an unlisted PR still on its head gets gates, and a closed one is recorded', async t => {
+  const same = await unlistedFixture(t, () => ({ code: 0, stderr: '', stdout: JSON.stringify({ state: 'OPEN', headRefOid: SHA_A }) }));
+  await runPasses(same.harness);
+  assert.ok(same.calls.some(args => args[1] === 'ready'));
+  const merged = await unlistedFixture(t, () => ({ code: 0, stderr: '', stdout: JSON.stringify({ state: 'CLOSED' }) }));
+  await runPasses(merged.harness);
+  const [pr] = await readPrs(merged.bb);
+  assert.equal(pr.state, 'closed');
+  assert.ok(pr.closedAt !== null);
+  assert.ok(!merged.calls.some(args => args[1] === 'ready'));
 });
 
