@@ -80,7 +80,9 @@ needed. Do not paste full plans or logs into the Lead thread, or poll active wor
    merge-train note so it can suggest an order. The factory's merge policy says who
    merges: the person, or under `when-green` the Lead with `bb factory merge`, except
    large or sensitive PRs, which only the person can merge. The factory then moves
-   the task to Done.
+   the task to Done. A ready PR that gets new commits or a blocking verdict and is
+   approved again is announced again. If handling one PR keeps failing, the others
+   carry on and the Lead is told after five passes.
 
 ## Recurring review findings
 
@@ -136,6 +138,7 @@ skip docs-only changes. PRs stay drafts until every reviewer approves, so
 | `bb factory assign APP-12 --role plan\|build\|qa\|design\|review1\|review2\|security [--instructions "..."]` | Spawn a specialist for the task as the Lead's child. Planner uses the project checkout; Builder and Designer get a new worktree; QA and reviewers reuse the task's builder worktree. PR reviewers are normally started automatically instead. |
 | `bb factory assign APP-12 --role review1\|review2\|security --pr N` | Replace a reviewer that failed (dead provider, removed model) with a fresh one on the current roster, reviewing that PR. Retrying the old thread keeps the model it was spawned with, so it cannot recover from a provider that ran out. |
 | `bb factory plan-ready APP-12 --comment <id>` | Current Planner only: validate its READY planning comment and allow Builder assignments. |
+| `bb factory plan APP-12` | Print only the task's READY plan. Reviewers use this because `bb tasks show` also prints other reviewers' verdicts. |
 | `bb factory verdict APP-12 --role review1\|review2\|security\|shadow --verdict approve\|changes [--pr N]` | Record a reviewer's verdict on the task's PR, after posting it (as a PR comment; the shadow reviewer posts a task comment). Only the reviewer thread the factory started can record it. |
 | `bb factory merge APP-12 [--pr N]` | Lead under the `when-green` policy, or the person: squash-merge after checking approvals and CI on the exact head. Large or sensitive PRs are the person's only. Fix what it names if it refuses. |
 | `bb factory merge-policy APP [person\|when-green]` | Show the policy. Only the person can set it, from outside an agent thread. |

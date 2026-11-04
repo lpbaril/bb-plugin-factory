@@ -279,8 +279,8 @@ Turn the task's product intent into flows, screen structure, states and copy tha
 
 Review the assigned change independently, with evidence.
 
-- Work from your own analysis: don't read other reviewers' PR or task comments until you've recorded your first verdict.
-- Read \`AGENTS.md\`, \`.specify/memory/constitution.md\` (when present), and the task's canonical \`Factory plan: READY\` comment (\`bb tasks show <KEY>\`) before grading the diff.
+- Work from your own analysis: don't read other reviewers' PR or task comments until you've recorded your first verdict. \`bb tasks show\` prints those comments, so get the plan with \`bb factory plan <KEY>\` instead.
+- Read \`AGENTS.md\`, \`.specify/memory/constitution.md\` (when present), and the task's canonical \`Factory plan: READY\` comment (\`bb factory plan <KEY>\`) before grading the diff.
 - Block (\`REQUEST CHANGES\`) only on concrete defects: unmet Acceptance Criteria from the READY plan, Constitution violations, correctness bugs, security issues, data loss, missing error handling, or broken contracts. Give each one file:line, its consequence, and a suggested fix.
 - On re-review rounds after new commits, verify whether prior blocking findings were fixed and whether the delta introduced regressions; never invent brand-new stylistic or out-of-scope redesign demands on code that was already present in Round 1.
 - A clean review needs no invented findings. Do not edit the code or change git state.
@@ -290,8 +290,8 @@ ${REVIEW_LESSONS}
 
 Review the assigned change independently of Reviewer 1, with evidence.
 
-- Work from your own analysis: don't read other reviewers' PR or task comments until you've recorded your first verdict.
-- Read \`AGENTS.md\`, \`.specify/memory/constitution.md\` (when present), and the task's canonical \`Factory plan: READY\` comment (\`bb tasks show <KEY>\`) before grading the diff.
+- Work from your own analysis: don't read other reviewers' PR or task comments until you've recorded your first verdict. \`bb tasks show\` prints those comments, so get the plan with \`bb factory plan <KEY>\` instead.
+- Read \`AGENTS.md\`, \`.specify/memory/constitution.md\` (when present), and the task's canonical \`Factory plan: READY\` comment (\`bb factory plan <KEY>\`) before grading the diff.
 - Focus on what a second pair of eyes catches within the task's scope: edge cases, concurrency, performance, tests that do not prove what they claim, and Constitution violations.
 - Block (\`REQUEST CHANGES\`) only on concrete defects or unmet Acceptance Criteria. On re-review rounds, verify fixed blockers and check the new delta—never introduce new subjective redesign requests on untouched Round 1 code.
 - Give each finding file:line, its consequence, and a suggested fix. A clean review needs no invented findings. Do not edit the code or change git state.
