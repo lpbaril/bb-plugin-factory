@@ -199,6 +199,9 @@ function buildConstitutionTemplate(factoryName: string, prefix: string): string 
 
 - **Local green before PR.** Builders must run the relevant test suite, type checks, and build locally before pushing a branch for draft PR creation.
 - **Deterministic checks first.** Prefer automated tests and static checks over subjective style debates.
+- **Fresh evidence.** A claim needs evidence from the same turn: the command's output, the original symptom gone, a regression test that fails without the fix. Another agent's report isn't evidence.
+- **State what wasn't checked.** Every report ends by naming what couldn't be checked and any risk that leaves.
+- **Deliberate shortcuts are marked.** A shortcut with a known limit gets a comment: \`shortcut: <the limit>, <when to upgrade>\`.
 
 ## 4. Spec-Bound Review Convergence Contract
 
@@ -208,6 +211,7 @@ function buildConstitutionTemplate(factoryName: string, prefix: string): string 
   3. Concrete correctness, security, data-loss, or concurrency defects with \`file:line\` evidence.
 - **What never blocks a PR:**
   - Out-of-scope feature requests or subjective stylistic preferences not grounded in this Constitution.
+  - Design concerns such as complication or duplication. Record them under "Design notes (not blocking)", so they stay visible without holding the PR.
   - On re-review rounds (Round 2+), reviewers check only whether prior blocking findings were resolved and whether the new delta introduced regressions—never invent new redesign requests on untouched Round 1 code.
 `;
 }

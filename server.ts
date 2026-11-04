@@ -97,6 +97,8 @@ const VERDICTS = ["pending", "approve", "changes", "dismissed"] as const;
 type Verdict = (typeof VERDICTS)[number];
 
 const prReviewSchema = z.object({
+  /** Files this reviewer accounted for, as reviewed or skipped with a reason. Never sent to other agents. */
+  covered: z.array(z.string()).default([]),
   role: z.enum(PR_REVIEW_ROLES),
   threadId: z.string().nullable(),
   /** The head commit this verdict is about. */
@@ -134,6 +136,8 @@ const prSchema = z.object({
   closedAt: z.string().nullable().default(null),
   /** The head whose full set of approvals was last announced, so a ready PR that is approved again is announced too. */
   approvedNotifiedSha: z.string().nullable().default(null),
+  /** The head the Lead was last told about a QA hold on, so it hears once per commit. */
+  qaHoldNotifiedSha: z.string().nullable().default(null),
   /** Work a push still owes. It is saved with the new head, so a failure partway through is retried on the next pass. */
   pushFollowUp: z.object({
     notify: z.object({ comment: z.string().nullable(), lead: z.string() }).nullable(),
@@ -226,6 +230,74 @@ export function mergeBlockers(
 /** The factory's Lead merges only under `when-green`, and never a large or sensitive PR. */
 export function leadMayMerge(factory: Pick<Factory, "mergePolicy">, pr: Pick<Pr, "deep">): boolean {
   return factory.mergePolicy === "when-green" && !pr.deep;
+}
+
+type QaState = Pick<Factory, "evidenceContract" | "qaResults" | "agents">;
+/**
+ * Under the evidence contract, why QA stops this task's PR at this head from being ready or merged,
+ * if it does. A pass carries through later fix commits, because re-running QA on each is costly. A
+ * skip doesn't: its reason describes one change, so new commits need a new look.
+ */
+export function qaHold(factory: QaState, taskKey: string, headSha: string): string | null {
+  if (!factory.evidenceContract) return null;
+  const result = factory.qaResults[taskKey];
+  if (result?.verdict === "fail") return "QA failed";
+  if (result?.verdict === "skipped") return result.sha === headSha ? null : "QA was skipped for an earlier commit";
+  if (result !== undefined) return null;
+  return factory.agents.some((agent) => agent.role === "qa" && agent.taskKey === taskKey)
+    ? "QA hasn't recorded a verdict"
+    : "QA wasn't assigned, and no reason for skipping it was recorded";
+}
+
+/** What the Lead can actually do about a QA hold. */
+export function qaNextStep(factory: QaState, taskKey: string): string {
+  const skip = `\`bb factory qa-skip ${taskKey} --reason "<why>"\``;
+  const result = factory.qaResults[taskKey];
+  if (result?.verdict === "fail") return `Send the failure to the builder, then assign QA again with \`bb factory assign ${taskKey} --role qa\`. Only the person can skip QA that failed.`;
+  if (result === undefined && factory.agents.some((agent) => agent.role === "qa" && agent.taskKey === taskKey)) {
+    return `Wait for QA to finish. If its thread has stopped, assign QA again with \`bb factory assign ${taskKey} --role qa\`. Only the person can skip QA that's under way.`;
+  }
+  return `Assign QA with \`bb factory assign ${taskKey} --role qa\`, or if this commit doesn't need it, record why with ${skip}.`;
+}
+
+/**
+ * A reviewer's account of a PR's files, one per line: `reviewed <path>` or `skipped <path> -- <reason>`.
+ * A skip without a reason doesn't count, so skipping stays a decision someone can read later.
+ */
+export function parseCoverage(text: string): { covered: string[]; reviewed: number; skipped: number; invalid: string[] } {
+  const covered = new Set<string>();
+  const invalid: string[] = [];
+  let reviewed = 0;
+  let skipped = 0;
+  for (const raw of text.split("\n")) {
+    const line = raw.trim();
+    if (line === "") continue;
+    const review = /^reviewed\s+(.+)$/.exec(line);
+    const skip = /^skipped\s+(.+?)\s+--\s+(\S.*)$/.exec(line);
+    if (review !== null && !line.includes(" -- ")) {
+      covered.add(review[1]!);
+      reviewed += 1;
+    } else if (skip !== null) {
+      covered.add(skip[1]!);
+      skipped += 1;
+    } else {
+      invalid.push(line);
+    }
+  }
+  return { covered: [...covered], reviewed, skipped, invalid };
+}
+
+/** Rounds on a PR where reviewers asked for changes, one per commit. */
+export function changeRounds(pr: Pick<Pr, "reviews">): number {
+  return new Set(pr.reviews.filter((review) => review.verdict === "changes" && review.role !== "shadow").map((review) => review.sha)).size;
+}
+/** After this many rounds of changes the problem is probably the plan, and after the second, the person's to decide. */
+const PLANNER_AFTER_ROUNDS = 3;
+const PERSON_AFTER_ROUNDS = 5;
+export function fixLoopAdvice(rounds: number): string {
+  if (rounds >= PERSON_AFTER_ROUNDS) return ` This is round ${rounds} of requested changes on this PR. Don't send it back to the builder: tell the person, with the findings and what's been tried, and let them decide.`;
+  if (rounds >= PLANNER_AFTER_ROUNDS) return ` This is round ${rounds} of requested changes on this PR. Have the Planner look at the findings before the builder tries again: the plan may be the problem.`;
+  return "";
 }
 
 /** What to do with a PR whose approvals cover its head, for a message to the Lead. */
@@ -341,6 +413,15 @@ const factorySchema = z.object({
   /** Project mode override ("auto" detects Greenfield vs. Brownfield from the repository). */
   projectMode: z.enum(PROJECT_MODES).default("auto"),
   mergePolicy: z.enum(MERGE_POLICIES).default("person"),
+  /** The evidence and review contract: on for new factories, and a person's choice for existing ones. */
+  evidenceContract: z.boolean().default(false),
+  /** The latest QA outcome per task. Assigning QA again clears it. */
+  qaResults: z.record(z.string(), z.object({
+    verdict: z.enum(["pass", "fail", "skipped"]),
+    threadId: z.string().nullable(),
+    sha: z.string().nullable(),
+    at: z.string(),
+  })).default({}),
   /** Tasks marked as coordination or person-owned, which are never reported as stalled. */
   taskKinds: z.record(z.string(), z.enum(TASK_KINDS)).default({}),
 });
@@ -1281,9 +1362,9 @@ export default async function plugin(bb: BbPluginApi) {
     const entry = agentsByThread.get(threadId);
     if (entry === undefined || entry.factory.archivedAt !== null) return null;
     const { factory, agent } = entry;
-    if (agent.role === "lead") return leadCharter({ factoryName: factory.name, prefix: factory.prefix, mergePolicy: factory.mergePolicy });
+    if (agent.role === "lead") return leadCharter({ factoryName: factory.name, prefix: factory.prefix, mergePolicy: factory.mergePolicy, evidenceContract: factory.evidenceContract });
     if (agent.taskKey === null) return null;
-    return workerReminder({ role: agent.role, factoryName: factory.name, taskKey: agent.taskKey });
+    return workerReminder({ role: agent.role, factoryName: factory.name, taskKey: agent.taskKey, evidenceContract: factory.evidenceContract });
   });
   /** Serializes read-modify-write of one factory record; keep `change` free of slow I/O. */
   const factoryLocks = new Map<string, Promise<unknown>>();
@@ -1356,6 +1437,8 @@ export default async function plugin(bb: BbPluginApi) {
       trackerProjectId: tracker.id,
       blockedLabelId: blocked.id,
       mergePolicy: "person",
+      evidenceContract: true,
+      qaResults: {},
       taskKinds: {},
       leadThreadId: null,
       agents: [],
@@ -1476,6 +1559,8 @@ export default async function plugin(bb: BbPluginApi) {
             ? "Waiting for a Rafter scan to finish"
             : behindHead.length > 0
             ? `Waiting on ${behindHead.join(", ")} to check the latest commit`
+            : qaHold(factory, task.key, pr.headSha) !== null
+            ? `Held: ${qaHold(factory, task.key, pr.headSha)}`
             : pr.isDraft
             ? "All required reviews approved (marking ready)"
             : leadMayMerge(factory, pr)
@@ -1759,7 +1844,7 @@ export default async function plugin(bb: BbPluginApi) {
       permissionMode: await permissionModeFor(providerId),
       title: `${currentFactory.name} · Lead`,
       pinned: true,
-      prompt: leadPrompt({ factoryName: currentFactory.name, prefix: currentFactory.prefix, goal, alignment, mergePolicy: currentFactory.mergePolicy }),
+      prompt: leadPrompt({ evidenceContract: currentFactory.evidenceContract, factoryName: currentFactory.name, prefix: currentFactory.prefix, goal, alignment, mergePolicy: currentFactory.mergePolicy }),
       pluginMetadata: { factory: currentFactory.prefix, role: "lead" },
     });
     await mutateFactory(currentFactory.prefix, (current) => {
@@ -1871,6 +1956,7 @@ export default async function plugin(bb: BbPluginApi) {
       title: `${task.key} · ${role.label}${pr === null ? "" : ` · PR #${pr.number}`}: ${task.title}`.slice(0, 200),
       prompt: workerPrompt({
         role: args.role,
+        evidenceContract: factory.evidenceContract,
         factoryName: factory.name,
         prefix: factory.prefix,
         task,
@@ -1913,6 +1999,11 @@ export default async function plugin(bb: BbPluginApi) {
         current.plans = current.plans.filter((entry) => entry.taskKey !== task.key);
         current.plans.push({ taskKey: task.key, threadId: thread.id, commentId: null });
       }
+      // A new QA run replaces the old result: it's assigned because that result no longer stands.
+      if (args.role === "qa") {
+        delete current.qaResults[task.key];
+        for (const candidate of current.prs) if (candidate.taskKey === task.key) candidate.qaHoldNotifiedSha = null;
+      }
       current.agents.push({
         threadId: thread.id,
         role: args.role,
@@ -1925,7 +2016,7 @@ export default async function plugin(bb: BbPluginApi) {
       // task-comment failure must not leave a spawned reviewer outside the gate.
       if (pr !== null && (PR_REVIEW_ROLES as readonly string[]).includes(args.role)) {
         const target = current.prs.find((candidate) => candidate.number === pr.number);
-        target?.reviews.push({ role: args.role as PrReviewRole, threadId: thread.id, sha: target.headSha, verdict: "pending", at: new Date().toISOString() });
+        target?.reviews.push({ role: args.role as PrReviewRole, threadId: thread.id, sha: target.headSha, verdict: "pending", covered: [], at: new Date().toISOString() });
       }
     });
 
@@ -2218,7 +2309,7 @@ export default async function plugin(bb: BbPluginApi) {
       const shadowThreadId = await assign({ taskKey: pr.taskKey, role: "shadow", instructions, pr: { number: pr.number, url: pr.url }, findings });
       await mutateFactory(prefix, (current) => {
         const target = current.prs.find((candidate) => candidate.number === pr.number);
-        target?.reviews.push({ role: "shadow", threadId: shadowThreadId, sha: target.headSha, verdict: "pending", at: new Date().toISOString() });
+        target?.reviews.push({ role: "shadow", threadId: shadowThreadId, sha: target.headSha, verdict: "pending", covered: [], at: new Date().toISOString() });
       });
       await addTrialRun({
         prefix,
@@ -2393,6 +2484,7 @@ ${sections.join("\n\n---\n\n")}`;
         readyAt: null,
         closedAt: null,
         approvedNotifiedSha: null,
+        qaHoldNotifiedSha: null,
         pushFollowUp: null,
         shadow,
         shadowStallNotifiedAt: null,
@@ -2452,12 +2544,12 @@ ${sections.join("\n\n---\n\n")}`;
 
   /** Ask a reviewer to check commits it hasn't seen: in its own thread if it's still there, otherwise a new one. */
   async function requestReReview(factory: Factory, pr: Pr, role: PrReviewRole, review: NonNullable<ReturnType<typeof latestReview>>, sha: string): Promise<void> {
-    const message = reReviewMessage({ role, taskKey: pr.taskKey, prNumber: pr.number, sha, findings: null });
+    const message = reReviewMessage({ role, taskKey: pr.taskKey, prNumber: pr.number, sha, findings: null, evidenceContract: factory.evidenceContract });
     const delivered = review.threadId !== null && (await tellThread(review.threadId, message));
     if (delivered) {
       await mutateFactory(factory.prefix, (current) => {
         const target = current.prs.find((candidate) => candidate.number === pr.number);
-        target?.reviews.push({ role, threadId: review.threadId, sha, verdict: "pending", at: new Date().toISOString() });
+        target?.reviews.push({ role, threadId: review.threadId, sha, verdict: "pending", covered: [], at: new Date().toISOString() });
       });
     } else {
       await startPrReviewer(
@@ -2551,12 +2643,12 @@ ${sections.join("\n\n---\n\n")}`;
         // stands on an older commit. A dismissed shadow is left alone so it can't re-block, and a
         // trial that's been turned off gets no more of the PR's code.
         if (review.verdict === "dismissed" || review.threadId === null || !shadowContinues(pr, shadowMode)) continue;
-        const message = reReviewMessage({ role, taskKey: pr.taskKey, prNumber: pr.number, sha, findings: null });
+        const message = reReviewMessage({ role, taskKey: pr.taskKey, prNumber: pr.number, sha, findings: null, evidenceContract: factory.evidenceContract });
         if (await tellThread(review.threadId, message)) {
           await mutateFactory(prefix, (current) => {
             const target = current.prs.find((candidate) => candidate.number === pr.number);
             if (target === undefined) return;
-            target.reviews.push({ role, threadId: review.threadId, sha, verdict: "pending", at: new Date().toISOString() });
+            target.reviews.push({ role, threadId: review.threadId, sha, verdict: "pending", covered: [], at: new Date().toISOString() });
             // A new pending review can stall again; let it be reported again.
             target.shadowStallNotifiedAt = null;
           });
@@ -2650,7 +2742,7 @@ ${sections.join("\n\n---\n\n")}`;
     if (security !== null && security.threadId !== null && (await tellThread(security.threadId, text))) {
       await mutateFactory(factory.prefix, (current) => {
         const target = current.prs.find((candidate) => candidate.number === pr.number);
-        target?.reviews.push({ role: "security", threadId: security.threadId, sha: target.headSha, verdict: "pending", at: new Date().toISOString() });
+        target?.reviews.push({ role: "security", threadId: security.threadId, sha: target.headSha, verdict: "pending", covered: [], at: new Date().toISOString() });
       });
     } else {
       await startPrReviewer(factory.prefix, pr.number, "security", findings, null);
@@ -2725,11 +2817,24 @@ ${sections.join("\n\n---\n\n")}`;
     }
   }
 
+  /** True if QA is holding this fully approved PR. The Lead hears once per commit, and again if QA's state changes. */
+  async function reportQaHold(factory: Factory, pr: Pr): Promise<boolean> {
+    const qa = qaHold(factory, pr.taskKey, pr.headSha);
+    if (qa === null) return false;
+    if (pr.qaHoldNotifiedSha !== pr.headSha) {
+      await deliverThenMark(factory, pr.number, `[factory] PR #${pr.number} (${pr.taskKey}) has every approval but can't be ${pr.isDraft ? "marked ready" : "merged"}: ${qa}. ${qaNextStep(factory, pr.taskKey)}`, (target) => {
+        target.qaHoldNotifiedSha = pr.headSha;
+      });
+    }
+    return true;
+  }
+
   async function maybeMarkReady(factory: Factory, hostId: string, repo: string, pr: Pr): Promise<void> {
     if (!pr.isDraft || pr.readyRequested || pr.state !== "open") return;
     if (pr.scans.some((scan) => scan.status === "running")) return;
     const roles = requiredReviewRoles(pr);
     if (!approvalsCover(pr, pr.headSha)) return;
+    if (await reportQaHold(factory, pr)) return;
     const { shadowBlocks, shadowMode } = await settings.get();
     if (shadowHolds(pr, shadowBlocks, shadowMode)) {
       const shadow = latestReview(pr, "shadow");
@@ -2786,7 +2891,7 @@ ${sections.join("\n\n---\n\n")}`;
       }
       return;
     }
-    if (!approvalsCover(pr, pr.headSha) || pr.approvedNotifiedSha === pr.headSha) return;
+    if (!approvalsCover(pr, pr.headSha) || (await reportQaHold(factory, pr)) || pr.approvedNotifiedSha === pr.headSha) return;
     const delivered = await deliverThenMark(factory, pr.number, `[factory] PR #${pr.number} (${pr.taskKey}) has every approval on its latest commit \`${pr.headSha.slice(0, 7)}\`. ${mergeInstruction(factory, pr)}`, (target) => {
       target.approvedNotifiedSha = pr.headSha;
     });
@@ -2989,7 +3094,7 @@ ${sections.join("\n\n---\n\n")}`;
       await deliverThenMark(
         factory,
         prNumber,
-        `[factory] Review round complete on PR #${prNumber} (${target.taskKey}) at \`${target.headSha.slice(0, 7)}\`: ${labels}. Send the builder one handoff referencing this PR's REQUEST CHANGES comments and reviewer threads. It must read and address every finding directly, in one push; consult the Planner if findings conflict; each push re-runs CI, the Security reviewer and the reviewers who asked for changes.`,
+        `[factory] Review round complete on PR #${prNumber} (${target.taskKey}) at \`${target.headSha.slice(0, 7)}\`: ${labels}. Send the builder one handoff referencing this PR's REQUEST CHANGES comments and reviewer threads. It must read and address every finding directly, in one push; consult the Planner if findings conflict; each push re-runs CI, the Security reviewer and the reviewers who asked for changes.${factory.evidenceContract ? fixLoopAdvice(changeRounds(target)) : ""}`,
         (pr) => { pr.roundNotifiedSha = round; },
       );
     } finally {
@@ -2997,7 +3102,40 @@ ${sections.join("\n\n---\n\n")}`;
     }
   }
 
-  async function recordVerdict(args: { taskKey: string; role: PrReviewRole; verdict: Exclude<Verdict, "pending">; pr: number | null; threadId: string | null }) {
+  function readCoverage(coverage: string | null) {
+    const account = parseCoverage(coverage ?? "");
+    if (account.invalid.length > 0) {
+      throw new PluginCliError(`These coverage lines can't be read: ${account.invalid.slice(0, 5).join(" | ")}`, {
+        code: "coverage_format",
+        hint: "Use one line per file: `reviewed <path>` or `skipped <path> -- <reason>`.",
+      });
+    }
+    return account;
+  }
+
+  /**
+   * Under the evidence contract, an approval must account for every file this reviewer thread hasn't
+   * already. Returns the files GitHub couldn't list: refusing those would make the largest PRs
+   * impossible to approve, so the shortfall is recorded instead. Such a PR already counts as deep.
+   */
+  async function checkCoverage(factory: Factory, pr: Pr, role: PrReviewRole, threadId: string, covered: string[]): Promise<number> {
+    const { hostId, repo } = await projectHost(factory);
+    if (repo === null) throw new PluginCliError(`Factory ${factory.prefix} has no GitHub repository.`, { code: "no_repo" });
+    const view = JSON.parse(await gh(hostId, ["pr", "view", String(pr.number), "--repo", repo, "--json", "files,changedFiles"])) as { files?: { path: string }[]; changedFiles?: number };
+    if (view.files === undefined) throw new PluginCliError(`GitHub didn't list the files of PR #${pr.number}. Try again shortly.`, { code: "coverage_no_files" });
+    const already = pr.reviews.filter((review) => review.role === role && review.threadId === threadId).flatMap((review) => review.covered);
+    const accounted = new Set([...already, ...covered]);
+    const gaps = view.files.map((file) => file.path).filter((path) => !accounted.has(path));
+    if (gaps.length > 0) {
+      throw new PluginCliError(`Account for ${gaps.length} more file(s) before approving: ${gaps.slice(0, 20).join(", ")}${gaps.length > 20 ? ", …" : ""}`, {
+        code: "coverage_incomplete",
+        hint: "Pass --coverage with one line per file: `reviewed <path>` or `skipped <path> -- <reason>`.",
+      });
+    }
+    return Math.max(0, (view.changedFiles ?? view.files.length) - view.files.length);
+  }
+
+  async function recordVerdict(args: { taskKey: string; role: PrReviewRole; verdict: Exclude<Verdict, "pending">; pr: number | null; threadId: string | null; coverage?: string | null }) {
     const task = await getTaskByKey(args.taskKey);
     const factory = await factoryForTaskKey(task.key);
     const pr =
@@ -3018,17 +3156,25 @@ ${sections.join("\n\n---\n\n")}`;
     // The commit this reviewer was last asked to review. A push during its review moves the head, and
     // stamping the new head would claim an approval for code it never saw; the old stamp gets a delta check.
     const sha = pr.reviews.filter((review) => review.role === args.role && review.threadId === args.threadId).at(-1)?.sha ?? pr.headSha;
+    // The shadow is a comparison trial with its own format, and a block needs only its own evidence.
+    // A block needs no coverage, but what's given is kept, so a later approval doesn't relist those files.
+    const contract = factory.evidenceContract && args.role !== "shadow";
+    const account = contract ? readCoverage(args.coverage ?? null) : null;
+    const unlisted = contract && args.verdict === "approve" ? await checkCoverage(factory, pr, args.role, args.threadId, account!.covered) : 0;
     await mutateFactory(factory.prefix, (current) => {
       const target = current.prs.find((candidate) => candidate.number === pr.number);
-      target?.reviews.push({ role: args.role, threadId: args.threadId, sha, verdict: args.verdict, at: new Date().toISOString() });
+      target?.reviews.push({ role: args.role, threadId: args.threadId, sha, verdict: args.verdict, covered: account?.covered ?? [], at: new Date().toISOString() });
     });
-    await comment(task.id, `**${ROLES[args.role].label}:** ${args.verdict === "approve" ? "APPROVE" : "REQUEST CHANGES"} on [PR #${pr.number}](${pr.url}) at \`${sha.slice(0, 7)}\``);
+    const accountNote =
+      (account === null || account.covered.length === 0 ? "" : ` (${account.reviewed} file(s) reviewed, ${account.skipped} skipped with a reason)`) +
+      (unlisted > 0 ? `. GitHub didn't list ${unlisted} of this PR's files, so they weren't checked` : "");
+    await comment(task.id, `**${ROLES[args.role].label}:** ${args.verdict === "approve" ? "APPROVE" : "REQUEST CHANGES"} on [PR #${pr.number}](${pr.url}) at \`${sha.slice(0, 7)}\`${accountNote}`);
     if (args.role === "shadow" && args.verdict === "changes" && (await settings.get()).shadowBlocks) {
       await onShadowBlock(factory, pr, args.threadId);
     }
     await maybeReportRound(factory, pr.number);
     wakePrWatch();
-    return pr;
+    return { pr, unlisted };
   }
 
   async function mergePr(args: { taskKey: string; pr: number | null; threadId: string | null }): Promise<{ pr: Pr; sha: string }> {
@@ -3053,6 +3199,8 @@ ${sections.join("\n\n---\n\n")}`;
     const view = prMergeViewSchema.parse(JSON.parse(await gh(hostId, ["pr", "view", String(pr.number), "--repo", repo, "--json", "state,isDraft,headRefOid,mergeable,statusCheckRollup"])));
     const { shadowBlocks, shadowMode } = await settings.get();
     const blockers = mergeBlockers(pr, view, shadowBlocks, shadowMode);
+    const qa = qaHold(factory, pr.taskKey, view.headRefOid);
+    if (qa !== null) blockers.push(qa);
     if (blockers.length > 0) {
       throw new PluginCliError(`PR #${pr.number} can't merge yet: ${blockers.join("; ")}.`, {
         code: "merge_blocked",
@@ -3150,7 +3298,7 @@ ${findings}`;
     }
     await mutateFactory(factory.prefix, (current) => {
       const target = current.prs.find((candidate) => candidate.number === pr.number);
-      target?.reviews.push({ role: "shadow", threadId: latestReview(pr, "shadow")?.threadId ?? null, sha: pr.headSha, verdict: "dismissed", at: new Date().toISOString() });
+      target?.reviews.push({ role: "shadow", threadId: latestReview(pr, "shadow")?.threadId ?? null, sha: pr.headSha, verdict: "dismissed", covered: [], at: new Date().toISOString() });
     });
     const who = args.by.kind === "person" ? "the owner" : "the Security reviewer";
     await comment(task.id, `**Shadow security block dismissed** by ${who} on [PR #${pr.number}](${pr.url}): ${args.reason}`);
@@ -3928,6 +4076,86 @@ ${findings}`;
             return { exitCode: 0, stdout: `Plan ready for ${input.positionals.task.toUpperCase()}; builders will receive comment ${input.options.comment}.` };
           },
         }),
+        qa: cliCommand({
+          summary: "Record QA's verdict on the task (QA thread only)",
+          positionals: [{ name: "task", description: "Task key, such as APP-12", required: true }],
+          options: {
+            verdict: { type: "enum", values: ["pass", "fail"], required: true, description: "pass or fail" },
+            sha: { type: "string", required: true, description: "The commit you checked: git rev-parse HEAD" },
+          },
+          async run(input, ctx) {
+            const task = await getTaskByKey(input.positionals.task);
+            const factory = await factoryForTaskKey(task.key);
+            const threadId = ctx.threadId ?? null;
+            const current = factory.agents.filter((agent) => agent.role === "qa" && agent.taskKey === task.key).at(-1);
+            if (threadId === null || current?.threadId !== threadId) {
+              throw new PluginCliError(`Only the latest QA thread the factory started for ${task.key} can record this.`, { code: "not_the_qa" });
+            }
+            const sha = input.options.sha.trim();
+            if (!/^[0-9a-f]{7,40}$/i.test(sha)) throw new PluginCliError("--sha must be a commit hash: git rev-parse HEAD.", { code: "qa_sha_input" });
+            // With a PR open, QA must have checked a commit that PR has been through. Before one, there's nothing to compare with.
+            const open = latestPr(factory, task.key);
+            if (open?.state === "open" && ![open.headSha, ...open.reviews.map((review) => review.sha)].some((known) => known.startsWith(sha))) {
+              throw new PluginCliError(`${sha.slice(0, 7)} isn't a commit of PR #${open.number}.`, {
+                code: "qa_sha_unknown",
+                hint: "Pass git rev-parse HEAD from the builder's worktree. If a push just landed, try again in a few minutes.",
+              });
+            }
+            const verdict = input.options.verdict as "pass" | "fail";
+            await mutateFactory(factory.prefix, (target) => {
+              target.qaResults[task.key] = { verdict, threadId, sha, at: new Date().toISOString() };
+              // The situation changed, so the Lead hears about any hold again.
+              for (const pr of target.prs) if (pr.taskKey === task.key) pr.qaHoldNotifiedSha = null;
+            });
+            await comment(task.id, `**QA:** ${verdict === "pass" ? "PASS" : "FAIL"} at \`${sha.slice(0, 7)}\``);
+            wakePrWatch();
+            return { exitCode: 0, stdout: `Recorded QA ${verdict} on ${task.key}.` };
+          },
+        }),
+        "qa-skip": cliCommand({
+          summary: "Record why a task doesn't need QA (Lead or person). Only the person can skip QA that failed or is under way",
+          positionals: [{ name: "task", description: "Task key, such as APP-12", required: true }],
+          options: { reason: { type: "string", required: true, description: "Why QA isn't needed for this change" } },
+          async run(input, ctx) {
+            const task = await getTaskByKey(input.positionals.task);
+            const factory = await factoryForTaskKey(task.key);
+            const threadId = ctx.threadId ?? null;
+            const isLead = threadId !== null && (threadId === factory.leadThreadId || factory.agents.some((agent) => agent.threadId === threadId && agent.role === "lead"));
+            if (threadId !== null && !isLead) throw new PluginCliError("Only the factory's Lead or the person can skip QA.", { code: "qa_skip_not_allowed" });
+            const reason = input.options.reason.trim();
+            if (reason.length < 10) throw new PluginCliError("Give a reason someone could read later, in at least 10 characters.", { code: "qa_skip_reason" });
+            const qaStarted = factory.agents.some((agent) => agent.role === "qa" && agent.taskKey === task.key);
+            if (isLead && qaStarted && factory.qaResults[task.key]?.verdict !== "pass") {
+              throw new PluginCliError(`QA was assigned on ${task.key} and hasn't passed, so only the person can skip it.`, { code: "qa_skip_person_only" });
+            }
+            const open = latestPr(factory, task.key);
+            if (open?.state !== "open") {
+              throw new PluginCliError(`${task.key} has no open pull request. A skip covers one commit, so record it once the PR is open.`, { code: "qa_skip_no_pr" });
+            }
+            await mutateFactory(factory.prefix, (current) => {
+              current.qaResults[task.key] = { verdict: "skipped", threadId, sha: open.headSha, at: new Date().toISOString() };
+            });
+            await comment(task.id, `**QA skipped** at \`${open.headSha.slice(0, 7)}\` by ${isLead ? "the Lead" : "the person"}: ${reason}`);
+            wakePrWatch();
+            return { exitCode: 0, stdout: `Recorded that ${task.key} doesn't need QA.` };
+          },
+        }),
+        "evidence-contract": cliCommand({
+          summary: "Show or set the evidence and review contract for a factory: on or off (setting it is for the person only)",
+          positionals: [
+            { name: "factory", description: "Factory prefix", required: true },
+            { name: "state", description: "on or off; omit to show it" },
+          ],
+          async run(input, ctx) {
+            const factory = await findFactory(input.positionals.factory);
+            const requested = input.positionals.state;
+            if (requested === undefined) return { exitCode: 0, stdout: `${factory.prefix}: ${factory.evidenceContract ? "on" : "off"}` };
+            if (requested !== "on" && requested !== "off") throw new PluginCliError("The state is on or off.", { code: "evidence_contract_input" });
+            if (ctx.threadId != null) throw new PluginCliError("Only the person can change this, from outside an agent thread.", { code: "evidence_contract_person_only" });
+            await mutateFactory(factory.prefix, (current) => { current.evidenceContract = requested === "on"; });
+            return { exitCode: 0, stdout: `${factory.prefix}: ${requested}. Agents already running keep their first brief; their standing rules change on their next turn.` };
+          },
+        }),
         verdict: cliCommand({
           summary: "Record a reviewer's verdict on the task's pull request (after posting it as a PR comment)",
           positionals: [{ name: "task", description: "Task key, such as APP-12", required: true }],
@@ -3935,16 +4163,18 @@ ${findings}`;
             role: { type: "enum", values: PR_REVIEW_ROLES, required: true, description: "review1, review2, security or shadow" },
             verdict: { type: "enum", values: ["approve", "changes"], required: true, description: "approve, or changes to request changes" },
             pr: { type: "integer", min: 1, max: 10_000_000, description: "PR number; defaults to the task's open PR" },
+            coverage: { type: "string", description: "One line per file: `reviewed <path>` or `skipped <path> -- <reason>`" },
           },
           async run(input, ctx) {
-            const pr = await recordVerdict({
+            const { pr, unlisted } = await recordVerdict({
+              coverage: input.options.coverage ?? null,
               taskKey: input.positionals.task,
               role: input.options.role as PrReviewRole,
               verdict: input.options.verdict as "approve" | "changes",
               pr: input.options.pr ?? null,
               threadId: ctx.threadId ?? null,
             });
-            return { exitCode: 0, stdout: `Recorded ${input.options.verdict} from ${ROLES[input.options.role as PrReviewRole].label} on PR #${pr.number}.` };
+            return { exitCode: 0, stdout: `Recorded ${input.options.verdict} from ${ROLES[input.options.role as PrReviewRole].label} on PR #${pr.number}.${unlisted > 0 ? ` GitHub didn't list ${unlisted} of its files, so your coverage couldn't check them. Say so under "Not checked:".` : ""}` };
           },
         }),
         merge: cliCommand({
@@ -4170,7 +4400,7 @@ ${findings}`;
             });
             await mutateFactory(factory.prefix, (current) => {
               const target = current.prs.find((candidate) => candidate.number === pr.number);
-              target?.reviews.push({ role: "shadow", threadId: shadowThreadId, sha: target.headSha, verdict: "pending", at: new Date().toISOString() });
+              target?.reviews.push({ role: "shadow", threadId: shadowThreadId, sha: target.headSha, verdict: "pending", covered: [], at: new Date().toISOString() });
             });
             await addTrialRun({
               prefix: factory.prefix,
