@@ -104,6 +104,39 @@ still run `gh pr merge` directly, and a merge may happen overnight under `when-g
 The policy replaces conflicting instructions with one rule; it doesn't stop an agent
 determined to ignore it.
 
+## Evidence contract
+
+New factories run with a stricter contract for what counts as done. Existing factories
+keep working as before until you turn it on, from outside an agent thread:
+`bb factory evidence-contract APP on` (or `off`, or no argument to show it).
+
+- **Evidence.** Every role gets a table of what proves a claim, and every report ends with
+  "Not checked:". Another agent's word for it doesn't count.
+- **QA can block.** QA records `bb factory qa APP-12 --verdict pass|fail --sha <commit>`. A PR
+  can't be marked ready or merged with `bb factory merge` until QA passes. If a change doesn't
+  need QA, the Lead records why with `bb factory qa-skip APP-12 --reason "..."`, once the PR is
+  open. A skip covers that commit only, so a new commit needs a new skip or a QA run. Only you can
+  skip QA that was assigned and hasn't passed. Only the task's latest QA thread can record a
+  verdict, and assigning QA again clears the old result. A pass is recorded with its commit, but
+  later fix commits don't require another QA run.
+- **File coverage.** An approval must account for each file in the PR, as `reviewed <path>` or
+  `skipped <path> -- <reason>`, passed with `--coverage`. Reviewers 1 and 2 and Security are
+  covered, and the shadow isn't. Blocking needs no coverage, but what's given is kept. On a
+  re-review, only files that reviewer thread hasn't accounted for yet need listing. It's checked
+  against the PR's latest file list, and a file stays covered after later commits change it, so
+  treat it as an account of what was looked at, not proof. If GitHub lists fewer files than the PR
+  has, the approval still goes through, and the task notes how many weren't checked.
+- **Findings.** A blocking finding needs a concrete failing case. Other concerns go under "Design
+  notes (not blocking)" in the reviewer's PR comment.
+- **Shortcuts.** Builders mark a deliberate shortcut with `shortcut: <the limit>, <when to
+  upgrade>`, reviewers treat it as a decision, and `git grep "shortcut:"` lists them.
+- **Fix loops.** After 3 rounds of requested changes, the Lead is told to involve the Planner.
+  After 5, it's told to bring the PR to you instead of sending it back to the builder. This is
+  guidance to the Lead, not a hard stop.
+
+Turning it on affects open PRs too: an approved PR without QA is held until QA passes or is
+skipped, and the Lead is told.
+
 ## Health
 
 Open **Health** on the Factory page, or run `bb factory health APP [--json]`, to see how
