@@ -2052,6 +2052,10 @@ export default async function plugin(bb: BbPluginApi) {
     return `${where}\n\n${excerpt}`;
   }
 
+  /** File paths are written by agents and can hold anything, including newlines. Keep only ordinary path characters. */
+  const safePaths = (paths: readonly string[], limit = 5): string =>
+    paths.slice(0, limit).map((path) => path.replace(/[^\w./@+-]/g, "_").slice(0, 120)).join(", ");
+
   const SENSITIVE_PATH = /(auth|login|session|token|secret|crypt|password|permission|rbac|rls|payment|billing|stripe|migration|alembic|\.sql$|terraform|docker|k8s|helm|\.github\/workflows|infra)/i;
 
   async function startPrReviewer(
@@ -2294,21 +2298,21 @@ ${sections.join("\n\n---\n\n")}`;
 
   /** Track locally without spawning agents or writing to GitHub. Also used to
    * recover PRs that the watcher could not persist while legacy KV was full. */
-  /** How much review a PR's current diff needs. If its files can't be listed, only its size counts. */
+  /**
+   * How much review a PR's current diff needs. This decides who may merge, so it fails closed: an
+   * error propagates, leaving the head unrecorded so the next pass retries, and a file list shorter
+   * than the PR's real file count counts as deep, because the unseen files could be sensitive.
+   */
   async function classifyPr(hostId: string, repo: string, gp: GhPr): Promise<{ deep: boolean; sensitive: string[]; shadow: boolean }> {
     const { deepReviewLines } = await settings.get();
-    let files: string[] = [];
-    try {
-      const view = JSON.parse(await gh(hostId, ["pr", "view", String(gp.number), "--repo", repo, "--json", "files"])) as { files?: { path: string }[] };
-      files = (view.files ?? []).map((file) => file.path);
-    } catch (error) {
-      bb.log.warn(`could not list files of PR #${gp.number}: ${String(error)}`);
-    }
+    const view = JSON.parse(await gh(hostId, ["pr", "view", String(gp.number), "--repo", repo, "--json", "files,changedFiles"])) as { files?: { path: string }[]; changedFiles?: number };
+    const files = (view.files ?? []).map((file) => file.path);
+    const truncated = view.changedFiles !== undefined && files.length < view.changedFiles;
     const sensitive = files.filter((path) => SENSITIVE_PATH.test(path));
     return {
-      deep: gp.additions + gp.deletions > deepReviewLines || sensitive.length > 0,
+      deep: truncated || gp.additions + gp.deletions > deepReviewLines || sensitive.length > 0,
       sensitive,
-      shadow: wantsShadow(files, gp.title).length > 0,
+      shadow: truncated || wantsShadow(files, gp.title).length > 0,
     };
   }
 
@@ -2364,7 +2368,7 @@ ${sections.join("\n\n---\n\n")}`;
     const { deep, sensitive } = await trackPr(factory, hostId, repo, gp, taskKey);
     const task = await getTaskByKey(taskKey);
     const why = deep
-      ? ` Reviewer 2 added: ${gp.additions + gp.deletions} changed lines${sensitive.length > 0 ? `, sensitive paths (${sensitive.slice(0, 5).join(", ")})` : ""}.`
+      ? ` Reviewer 2 added: ${gp.additions + gp.deletions} changed lines${sensitive.length > 0 ? `, sensitive paths (${safePaths(sensitive)})` : ""}.`
       : "";
     await comment(task.id, `[PR #${gp.number}](${gp.url}) opened${gp.isDraft ? " as a draft" : ""}. Automatic review started.${why}`);
 
@@ -2448,10 +2452,9 @@ ${sections.join("\n\n---\n\n")}`;
       await requestReReview(factory, pr, role, review, gp.headRefOid);
     }
     if (raised.deep) {
-      const why = sensitive.length > 0 ? `sensitive paths (${sensitive.slice(0, 5).join(", ")})` : `${gp.additions + gp.deletions} changed lines`;
       const task = await getTaskByKey(pr.taskKey);
-      await comment(task.id, `[PR #${pr.number}](${pr.url}) now needs Reviewer 2: ${why}.`);
-      await tellLead(factory, `[factory] A push made PR #${pr.number} (${pr.taskKey}) large or sensitive: ${why}. Reviewer 2 is starting and its approval is now required, and only the person can merge this PR.`);
+      await comment(task.id, `[PR #${pr.number}](${pr.url}) now needs Reviewer 2: ${sensitive.length > 0 ? `sensitive paths (${safePaths(sensitive)})` : `${gp.additions + gp.deletions} changed lines, or files the factory couldn't list`}.`);
+      await tellLead(factory, `[factory] A push made PR #${pr.number} (${pr.taskKey}) large or sensitive (${sensitive.length} sensitive path(s), ${gp.additions + gp.deletions} changed lines). Reviewer 2 is starting and its approval is now required, and only the person can merge this PR.`);
       // The watcher starts the now-required Reviewer 2 on this same pass.
     }
     const security = reviewFor(pr, "security");
@@ -2565,7 +2568,7 @@ ${sections.join("\n\n---\n\n")}`;
     }
     if (overlaps.length === 0) return;
     const details = overlaps
-      .map(({ number, taskKey, files }) => `PR #${number} (${taskKey}) shares ${files.slice(0, 3).join(", ")}${files.length > 3 ? ` and ${files.length - 3} more` : ""}`)
+      .map(({ number, taskKey, files }) => `PR #${number} (${taskKey}) shares ${safePaths(files, 3)}${files.length > 3 ? ` and ${files.length - 3} more` : ""}`)
       .join("; ");
     await tellLead(
       factory,
@@ -2767,11 +2770,14 @@ ${sections.join("\n\n---\n\n")}`;
         hint: "Run this from that reviewer's thread. Builders and the Lead cannot approve their own work.",
       });
     }
+    // The commit this reviewer was last asked to review. A push during its review moves the head, and
+    // stamping the new head would claim an approval for code it never saw; the old stamp gets a delta check.
+    const sha = pr.reviews.filter((review) => review.role === args.role && review.threadId === args.threadId).at(-1)?.sha ?? pr.headSha;
     await mutateFactory(factory.prefix, (current) => {
       const target = current.prs.find((candidate) => candidate.number === pr.number);
-      target?.reviews.push({ role: args.role, threadId: args.threadId, sha: pr.headSha, verdict: args.verdict, at: new Date().toISOString() });
+      target?.reviews.push({ role: args.role, threadId: args.threadId, sha, verdict: args.verdict, at: new Date().toISOString() });
     });
-    await comment(task.id, `**${ROLES[args.role].label}:** ${args.verdict === "approve" ? "APPROVE" : "REQUEST CHANGES"} on [PR #${pr.number}](${pr.url}) at \`${pr.headSha.slice(0, 7)}\``);
+    await comment(task.id, `**${ROLES[args.role].label}:** ${args.verdict === "approve" ? "APPROVE" : "REQUEST CHANGES"} on [PR #${pr.number}](${pr.url}) at \`${sha.slice(0, 7)}\``);
     if (args.role === "shadow" && args.verdict === "changes" && (await settings.get()).shadowBlocks) {
       await onShadowBlock(factory, pr, args.threadId);
     }
