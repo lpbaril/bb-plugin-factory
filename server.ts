@@ -128,6 +128,10 @@ const prSchema = z.object({
   scans: z.array(rafterScanSchema),
   readyRequested: z.boolean(),
   openedAt: z.string(),
+  /** When the factory marked the PR ready. Older PRs have none; Health estimates theirs from their approvals. */
+  readyAt: z.string().nullable().default(null),
+  /** When the factory saw the PR merged or closed. */
+  closedAt: z.string().nullable().default(null),
   /** Touches paths the shadow reviewer covers in "sensitive" mode. */
   shadow: z.boolean().default(false),
   /** When the factory reported a shadow review that ended without a verdict. */
@@ -184,6 +188,99 @@ export function mergeBlockers(
   return blockers;
 }
 
+/** The factory's Lead merges only under `when-green`, and never a large or sensitive PR. */
+export function leadMayMerge(factory: Pick<Factory, "mergePolicy">, pr: Pick<Pr, "deep">): boolean {
+  return factory.mergePolicy === "when-green" && !pr.deep;
+}
+
+export type RosterWarning = { id: string; title: string; detail: string };
+/**
+ * Checks that make no claim about which model is better: can each seat run, and does anything
+ * independent check the Builder's work? `providers` is null when the provider list couldn't be
+ * read, so a failed lookup never reads as "unavailable".
+ */
+export function rosterWarnings(
+  roles: Record<string, { providerId: string }>,
+  providers: readonly { id: string; available: boolean }[] | null,
+  options: { shadowOn: boolean },
+): RosterWarning[] {
+  const warnings: RosterWarning[] = [];
+  const builder = roles.build?.providerId;
+  if (builder !== undefined && roles.review1?.providerId === builder && roles.security?.providerId === builder) {
+    const secondProvider = roles.review2 !== undefined && roles.review2.providerId !== builder;
+    warnings.push({
+      id: "roster-shared-provider",
+      title: `The Builder, Reviewer 1 and Security all run on ${builder}`,
+      detail: secondProvider
+        ? `Only large or sensitive PRs get a second provider, through Reviewer 2 (${roles.review2!.providerId}). Reviewers on the same provider tend to share blind spots, so move Reviewer 1 to another provider if you have one.`
+        : "No review comes from a second provider, and reviewers on the same provider tend to share blind spots. Move Reviewer 1 to another provider if you have one.",
+    });
+  }
+  if (providers !== null) {
+    const seats = ROLE_IDS.filter((role) => role !== "shadow" || options.shadowOn);
+    const unavailable = new Map<string, string[]>();
+    for (const role of seats) {
+      const providerId = roles[role]?.providerId;
+      if (providerId === undefined || providers.some((provider) => provider.id === providerId && provider.available)) continue;
+      unavailable.set(providerId, [...(unavailable.get(providerId) ?? []), ROLES[role].label]);
+    }
+    for (const [providerId, labels] of unavailable) {
+      warnings.push({
+        id: `roster-unavailable-${providerId}`,
+        title: `${providerId} isn't available for ${labels.join(", ")}`,
+        detail: `Agents in these seats won't start until it's signed in or the seat moves to another provider.`,
+      });
+    }
+  }
+  return warnings;
+}
+
+const median = (values: number[]): number | null => {
+  if (values.length === 0) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 1 ? sorted[middle]! : (sorted[middle - 1]! + sorted[middle]!) / 2;
+};
+
+const REQUIRED_REVIEW_ROLES: readonly PrReviewRole[] = ["review1", "review2", "security"];
+
+/**
+ * The redesign's baseline: how much rework a PR takes and what a merged task costs. Each number
+ * carries its sample size, because a factory's history is small enough for one PR to move a median.
+ */
+export function computeHealth(prs: readonly Pr[], tokensByTask: ReadonlyMap<string, number>): FactoryHealth {
+  const merged = prs.filter((pr) => pr.state === "merged");
+  const countedVerdicts = (pr: Pr) =>
+    pr.reviews.filter((review) => REQUIRED_REVIEW_ROLES.includes(review.role) && (review.verdict === "approve" || review.verdict === "changes"));
+  const rounds = merged.map((pr) => new Set(countedVerdicts(pr).map((review) => review.sha)).size).filter((count) => count > 0);
+  const reviewed = prs.filter((pr) => countedVerdicts(pr).length > 0);
+  const readyDurations = prs.flatMap((pr) => {
+    const opened = Date.parse(pr.openedAt);
+    let ready = pr.readyAt === null ? Number.NaN : Date.parse(pr.readyAt);
+    if (pr.readyAt === null && pr.readyRequested) {
+      // Older PRs: the last approval on the head is when the gate could open.
+      const approvals = pr.reviews.filter((review) => review.verdict === "approve" && review.sha === pr.headSha && REQUIRED_REVIEW_ROLES.includes(review.role));
+      ready = Math.max(...approvals.map((review) => Date.parse(review.at)));
+    }
+    return Number.isFinite(opened) && Number.isFinite(ready) && ready >= opened ? [ready - opened] : [];
+  });
+  const mergedTasks = [...new Set(merged.map((pr) => pr.taskKey))];
+  const taskTokens = mergedTasks.flatMap((taskKey) => {
+    const tokens = tokensByTask.get(taskKey);
+    return tokens !== undefined && tokens > 0 ? [tokens] : [];
+  });
+  return {
+    prs: prs.length,
+    open: prs.filter((pr) => pr.state === "open").length,
+    merged: merged.length,
+    closedUnmerged: prs.filter((pr) => pr.state === "closed").length,
+    roundsPerMergedPr: { median: median(rounds), sample: rounds.length },
+    changesRequested: { prs: reviewed.filter((pr) => countedVerdicts(pr).some((review) => review.verdict === "changes")).length, sample: reviewed.length },
+    timeToReadyMs: { median: median(readyDurations), sample: readyDurations.length },
+    tokensPerMergedTask: { median: median(taskTokens), sample: taskTokens.length },
+  };
+}
+
 const factorySchema = z.object({
   /** The tracker prefix, which is also the factory's id. */
   prefix: z.string(),
@@ -234,6 +331,19 @@ const factorySummarySchema = factorySchema.omit({ agents: true, prs: true }).ext
   bbProjectName: z.string(),
 });
 export type FactorySummary = z.infer<typeof factorySummarySchema>;
+
+const healthMeasureSchema = z.object({ median: z.number().nullable(), sample: z.number() });
+const factoryHealthSchema = z.object({
+  prs: z.number(),
+  open: z.number(),
+  merged: z.number(),
+  closedUnmerged: z.number(),
+  roundsPerMergedPr: healthMeasureSchema,
+  changesRequested: z.object({ prs: z.number(), sample: z.number() }),
+  timeToReadyMs: healthMeasureSchema,
+  tokensPerMergedTask: healthMeasureSchema,
+});
+export type FactoryHealth = z.infer<typeof factoryHealthSchema>;
 
 export const factoryDoctorSchema = z.object({
   prefix: z.string(),
@@ -315,7 +425,8 @@ const DEFAULT_PROVIDERS: Record<AgentKey, string> = {
   build: "claude-code",
   qa: "codex",
   design: "claude-code",
-  review1: "claude-code",
+  // A provider other than the Builder's, so every PR gets an independent check.
+  review1: "codex",
   review2: "codex",
   security: "claude-code",
   shadow: "acp-cursor",
@@ -328,6 +439,7 @@ const AGENT_LABELS: Record<AgentKey, string> = {
 /** Published when an agent's provider, model or reasoning level changes. */
 const AGENTS_CHANGED = "agents-changed";
 const agentsViewSchema = z.object({
+  warnings: z.array(z.object({ id: z.string(), title: z.string(), detail: z.string() })),
   agents: z.array(
     z.object({
       key: z.enum(AGENT_KEYS),
@@ -475,6 +587,10 @@ export const rpcContract = defineRpcContract({
   factory_runs: {
     input: z.object({ prefix: z.string(), taskKey: z.string().nullable() }),
     output: runReportSchema,
+  },
+  factory_health: {
+    input: z.object({ prefix: z.string() }),
+    output: factoryHealthSchema,
   },
   lead_start: {
     input: z.object({
@@ -773,6 +889,15 @@ export default async function plugin(bb: BbPluginApi) {
     // Up to 0.1.2 the shadow sent this model id as-is; Cursor's model list doesn't show it.
     return { roles, shadowCustomModel: "gemini-4-argon-high" };
   }
+  /** The provider list, or null if it can't be read, which the roster check must not read as "unavailable". */
+  async function listProviders(): Promise<{ id: string; available: boolean }[] | null> {
+    try {
+      return await bb.sdk.providers.list();
+    } catch (error) {
+      bb.log.warn(`could not read the provider list: ${String(error)}`);
+      return null;
+    }
+  }
   /** Copy the old per-role settings into AGENTS_KV once, then reload so the old fields leave the settings page. */
   async function migrateLegacyAgents(): Promise<void> {
     const values = (await settings.get()) as Record<string, unknown>;
@@ -784,6 +909,12 @@ export default async function plugin(bb: BbPluginApi) {
       if ((REASONING_LEVELS as readonly unknown[]).includes(reasoning)) agents.roles[key].reasoningLevel = reasoning as ReasoningLevel;
     }
     agents.shadowCustomModel = typeof values.shadowModel === "string" && values.shadowModel.trim() !== "" ? values.shadowModel.trim() : null;
+    // Reviewer 1 is on every PR, so it can't default to a provider this machine lacks. A person's
+    // later choice is never changed, and the roster check warns about the shared provider.
+    const providers = await listProviders();
+    if (providers !== null && !providers.some((provider) => provider.id === agents.roles.review1.providerId && provider.available)) {
+      agents.roles.review1.providerId = agents.roles.build.providerId;
+    }
     await bb.storage.kv.set(AGENTS_KV, agentsConfigSchema.parse(agents));
     await bb.storage.kv.set(AGENTS_MIGRATED_KV, true);
     bb.log.info("copied the agent provider, model and reasoning settings into the Agents section");
@@ -881,9 +1012,15 @@ export default async function plugin(bb: BbPluginApi) {
       });
     }
   }
+  async function rosterCheck(agents?: AgentsConfig): Promise<RosterWarning[]> {
+    const providers = await listProviders();
+    const { shadowMode } = await settings.get();
+    return rosterWarnings((agents ?? (await readAgents())).roles, providers, { shadowOn: shadowMode !== "off" });
+  }
   /** What the Agents settings section shows: the saved choice and, for unset fields, the provider's defaults. */
   async function agentsView() {
     const agents = await readAgents();
+    const warnings = await rosterCheck(agents);
     const rows = await Promise.all(
       AGENT_KEYS.map(async (key) => {
         const exec = agents.roles[key];
@@ -900,7 +1037,7 @@ export default async function plugin(bb: BbPluginApi) {
         return { key, label: AGENT_LABELS[key], exec, defaultModel, defaultReasoning };
       }),
     );
-    return { agents: rows, shadowCustomModel: agents.shadowCustomModel };
+    return { warnings, agents: rows, shadowCustomModel: agents.shadowCustomModel };
   }
 
   // ----- gh and repository alignment on the project's machine -----
@@ -1292,7 +1429,7 @@ export default async function plugin(bb: BbPluginApi) {
             ? `Waiting on ${pending.join(", ")}`
             : pr.isDraft
             ? "All required reviews approved (marking ready)"
-            : factory.mergePolicy === "when-green"
+            : leadMayMerge(factory, pr)
             ? `Ready to merge: the Lead may run \`bb factory merge ${task.key}\``
             : "Ready for the person to merge";
         openPrsAwaitingAction.push({
@@ -1390,6 +1527,10 @@ export default async function plugin(bb: BbPluginApi) {
         command: `bb factory assign ${readyPlansAwaitingBuilder[0]!.taskKey} --role build`,
         tone: "info",
       });
+    }
+
+    for (const warning of await rosterCheck()) {
+      recommendedActions.push({ id: warning.id, title: warning.title, detail: warning.detail, command: "bb factory agents", tone: "warn" });
     }
 
     if (recommendedActions.length === 0) {
@@ -2153,7 +2294,8 @@ ${sections.join("\n\n---\n\n")}`;
 
   /** Track locally without spawning agents or writing to GitHub. Also used to
    * recover PRs that the watcher could not persist while legacy KV was full. */
-  async function trackPr(factory: Factory, hostId: string, repo: string, gp: GhPr, taskKey: string): Promise<{ deep: boolean; sensitive: string[] }> {
+  /** How much review a PR's current diff needs. If its files can't be listed, only its size counts. */
+  async function classifyPr(hostId: string, repo: string, gp: GhPr): Promise<{ deep: boolean; sensitive: string[]; shadow: boolean }> {
     const { deepReviewLines } = await settings.get();
     let files: string[] = [];
     try {
@@ -2163,7 +2305,15 @@ ${sections.join("\n\n---\n\n")}`;
       bb.log.warn(`could not list files of PR #${gp.number}: ${String(error)}`);
     }
     const sensitive = files.filter((path) => SENSITIVE_PATH.test(path));
-    const deep = gp.additions + gp.deletions > deepReviewLines || sensitive.length > 0;
+    return {
+      deep: gp.additions + gp.deletions > deepReviewLines || sensitive.length > 0,
+      sensitive,
+      shadow: wantsShadow(files, gp.title).length > 0,
+    };
+  }
+
+  async function trackPr(factory: Factory, hostId: string, repo: string, gp: GhPr, taskKey: string): Promise<{ deep: boolean; sensitive: string[] }> {
+    const { deep, sensitive, shadow } = await classifyPr(hostId, repo, gp);
     await mutateFactory(factory.prefix, (current) => {
       if (current.prs.some((pr) => pr.number === gp.number)) return;
       current.prs.push({
@@ -2180,7 +2330,9 @@ ${sections.join("\n\n---\n\n")}`;
         readyRequested: false,
         merge: null,
         openedAt: new Date().toISOString(),
-        shadow: wantsShadow(files, gp.title).length > 0,
+        readyAt: null,
+        closedAt: null,
+        shadow,
         shadowStallNotifiedAt: null,
         roundNotifiedSha: null,
       });
@@ -2236,10 +2388,37 @@ ${sections.join("\n\n---\n\n")}`;
     );
   }
 
-  async function onPrPushed(factory: Factory, gp: GhPr, pr: Pr): Promise<void> {
-    await mutateFactory(factory.prefix, (current) => {
+  /** Ask a reviewer to check commits it hasn't seen: in its own thread if it's still there, otherwise a new one. */
+  async function requestReReview(factory: Factory, pr: Pr, role: PrReviewRole, review: NonNullable<ReturnType<typeof reviewFor>>, sha: string): Promise<void> {
+    const message = reReviewMessage({ role, taskKey: pr.taskKey, prNumber: pr.number, sha, findings: null });
+    const delivered = review.threadId !== null && (await tellThread(review.threadId, message));
+    if (delivered) {
+      await mutateFactory(factory.prefix, (current) => {
+        const target = current.prs.find((candidate) => candidate.number === pr.number);
+        target?.reviews.push({ role, threadId: review.threadId, sha, verdict: "pending", at: new Date().toISOString() });
+      });
+    } else {
+      await startPrReviewer(
+        factory.prefix,
+        pr.number,
+        role,
+        null,
+        `Re-review after new commits (now at ${sha.slice(0, 7)}); an earlier review ${review.verdict === "changes" ? "requested changes" : `approved ${review.sha.slice(0, 7)}`}.`,
+      );
+    }
+  }
+
+  async function onPrPushed(factory: Factory, hostId: string, repo: string, gp: GhPr, pr: Pr): Promise<void> {
+    const { deep, sensitive, shadow } = await classifyPr(hostId, repo, gp);
+    // A push can only raise a PR's review depth: a later smaller diff doesn't undo what it touched.
+    const raised = await mutateFactory(factory.prefix, (current) => {
       const target = current.prs.find((candidate) => candidate.number === pr.number);
-      if (target !== undefined) target.headSha = gp.headRefOid;
+      if (target === undefined) return { deep: false, shadow: false };
+      target.headSha = gp.headRefOid;
+      const changed = { deep: deep && !target.deep, shadow: shadow && !target.shadow };
+      target.deep ||= deep;
+      target.shadow ||= shadow;
+      return changed;
     });
     for (const role of PR_REVIEW_ROLES) {
       const review = reviewFor(pr, role);
@@ -2266,22 +2445,18 @@ ${sections.join("\n\n---\n\n")}`;
       // stands on an older commit. Reviewers 1 and 2 re-review only after REQUEST CHANGES.
       const securityApprovedOlder = role === "security" && review.verdict === "approve" && review.sha !== gp.headRefOid;
       if (review.verdict !== "changes" && !securityApprovedOlder) continue;
-      const message = reReviewMessage({ role, taskKey: pr.taskKey, prNumber: pr.number, sha: gp.headRefOid, findings: null });
-      const delivered = review.threadId !== null && (await tellThread(review.threadId, message));
-      if (delivered) {
-        await mutateFactory(factory.prefix, (current) => {
-          const target = current.prs.find((candidate) => candidate.number === pr.number);
-          target?.reviews.push({ role, threadId: review.threadId, sha: gp.headRefOid, verdict: "pending", at: new Date().toISOString() });
-        });
-      } else {
-        await startPrReviewer(
-          factory.prefix,
-          pr.number,
-          role,
-          null,
-          `Re-review after new commits (now at ${gp.headRefOid.slice(0, 7)}); an earlier review ${review.verdict === "changes" ? "requested changes" : `approved ${review.sha.slice(0, 7)}`}.`,
-        );
-      }
+      await requestReReview(factory, pr, role, review, gp.headRefOid);
+    }
+    if (raised.deep) {
+      const why = sensitive.length > 0 ? `sensitive paths (${sensitive.slice(0, 5).join(", ")})` : `${gp.additions + gp.deletions} changed lines`;
+      const task = await getTaskByKey(pr.taskKey);
+      await comment(task.id, `[PR #${pr.number}](${pr.url}) now needs Reviewer 2: ${why}.`);
+      await tellLead(factory, `[factory] A push made PR #${pr.number} (${pr.taskKey}) large or sensitive: ${why}. Reviewer 2 is starting and its approval is now required, and only the person can merge this PR.`);
+      // The watcher starts the now-required Reviewer 2 on this same pass.
+    }
+    const security = reviewFor(pr, "security");
+    if (raised.shadow && (await settings.get()).shadowMode === "sensitive" && reviewFor(pr, "shadow") === null && security?.threadId != null) {
+      await maybeStartShadow(factory.prefix, { ...pr, shadow: true }, security.threadId, null, null);
     }
   }
 
@@ -2398,11 +2573,25 @@ ${sections.join("\n\n---\n\n")}`;
     );
   }
 
+  /**
+   * Reviewers who approved don't re-review each fix for someone else's finding, which keeps rounds
+   * cheap. Once every required verdict is an approval, those who haven't seen the head check the
+   * delta, so "every reviewer approves" holds for the commit that merges.
+   */
+  async function refreshStaleApprovals(factory: Factory, pr: Pr): Promise<void> {
+    if (pr.state !== "open" || pr.scans.some((scan) => scan.status === "running")) return;
+    const latest = requiredRoles(pr).map((role) => ({ role, review: reviewFor(pr, role) }));
+    if (!latest.every(({ review }) => review?.verdict === "approve")) return;
+    for (const { role, review } of latest) {
+      if (review !== null && review.sha !== pr.headSha) await requestReReview(factory, pr, role, review, pr.headSha);
+    }
+  }
+
   async function maybeMarkReady(factory: Factory, hostId: string, repo: string, pr: Pr): Promise<void> {
     if (!pr.isDraft || pr.readyRequested || pr.state !== "open") return;
     if (pr.scans.some((scan) => scan.status === "running")) return;
     const roles = requiredRoles(pr);
-    if (!roles.every((role) => reviewFor(pr, role)?.verdict === "approve")) return;
+    if (!roles.every((role) => { const review = reviewFor(pr, role); return review?.verdict === "approve" && review.sha === pr.headSha; })) return;
     if ((await settings.get()).shadowBlocks) {
       const shadow = reviewFor(pr, "shadow");
       // Fail closed: only an explicit approve or dismissal from the shadow opens the gate.
@@ -2416,6 +2605,7 @@ ${sections.join("\n\n---\n\n")}`;
       const target = current.prs.find((candidate) => candidate.number === pr.number);
       if (target !== undefined) {
         target.readyRequested = true;
+        target.readyAt = new Date().toISOString();
         // Show "ready" now rather than after the next poll.
         target.isDraft = false;
       }
@@ -2424,10 +2614,10 @@ ${sections.join("\n\n---\n\n")}`;
       await startScan(factory.prefix, repo, pr.number, "ready");
     }
     const labels = roles.map((role) => `${ROLES[role].label} ✓`).join(", ");
-    await prComment(hostId, repo, pr.number, `**Factory:** every reviewer approves (${labels}). Marked ready for review${(await rafterKey()) !== null ? "; a final Rafter scan is running" : ""}. ${factory.mergePolicy === "when-green" ? "The Lead may merge once its gates pass." : "Merging is up to you."}`);
+    await prComment(hostId, repo, pr.number, `**Factory:** every reviewer approves \`${pr.headSha.slice(0, 7)}\` (${labels}). Marked ready for review${(await rafterKey()) !== null ? "; a final Rafter scan is running" : ""}. ${leadMayMerge(factory, pr) ? "The Lead may merge once its gates pass." : "Merging is up to you."}`);
     const task = await getTaskByKey(pr.taskKey);
     await comment(task.id, `[PR #${pr.number}](${pr.url}) approved by ${labels} and marked ready for review.`);
-    await tellLead(factory, `[factory] PR #${pr.number} (${pr.taskKey}) has every approval and is marked ready for review. ${factory.mergePolicy === "when-green" ? `Merge it with \`bb factory merge ${pr.taskKey}\` once CI is green and every approval covers the head.` : "Tell the person it's ready for them to merge."}`);
+    await tellLead(factory, `[factory] PR #${pr.number} (${pr.taskKey}) has every approval and is marked ready for review. ${leadMayMerge(factory, pr) ? `Merge it with \`bb factory merge ${pr.taskKey}\` once CI is green and every approval covers the head.` : `${factory.mergePolicy === "when-green" ? "It's large or sensitive, so only the person can merge it. " : ""}Tell the person it's ready for them to merge.`}`);
     await warnMergeOverlap(factory, hostId, repo, pr);
   }
 
@@ -2443,7 +2633,10 @@ ${sections.join("\n\n---\n\n")}`;
     if (state === "open") return;
     await mutateFactory(factory.prefix, (current) => {
       const target = current.prs.find((candidate) => candidate.number === pr.number);
-      if (target !== undefined) target.state = state;
+      if (target !== undefined) {
+        target.state = state;
+        target.closedAt = new Date().toISOString();
+      }
     });
     const task = await getTaskByKey(pr.taskKey);
     if (state === "merged") {
@@ -2490,7 +2683,7 @@ ${sections.join("\n\n---\n\n")}`;
         if (taskKey !== undefined) await onPrOpened(factory, hostId, repo, gp, taskKey);
         continue;
       }
-      if (known.headSha !== gp.headRefOid) await onPrPushed(factory, gp, known);
+      if (known.headSha !== gp.headRefOid) await onPrPushed(factory, hostId, repo, gp, known);
       if (known.isDraft !== gp.isDraft) {
         await mutateFactory(prefix, (current) => {
           const target = current.prs.find((pr) => pr.number === gp.number);
@@ -2521,6 +2714,7 @@ ${sections.join("\n\n---\n\n")}`;
           if (role === "security" && pr.scans.some(scan => scan.status === "running")) continue;
           await startPrReviewer(prefix, pr.number, role, null, null);
         }
+        await refreshStaleApprovals(factory, pr);
       }
       await maybeMarkReady(factory, hostId, repo, pr);
     }
@@ -2602,6 +2796,9 @@ ${sections.join("\n\n---\n\n")}`;
     const pr = args.pr === null ? latestPr(factory, task.key) : factory.prs.find((candidate) => candidate.number === args.pr) ?? null;
     if (pr === null || pr.taskKey !== task.key) {
       throw new PluginCliError(`${task.key} has no pull request the factory is tracking.`, { code: "no_pr" });
+    }
+    if (isLead && !leadMayMerge(factory, pr)) {
+      throw new PluginCliError(`PR #${pr.number} is large or sensitive, so only the person can merge it. Tell them it's ready.`, { code: "merge_needs_person" });
     }
     const { hostId, repo } = await projectHost(factory);
     if (repo === null) throw new PluginCliError(`Factory ${factory.prefix} has no GitHub repository.`, { code: "no_repo" });
@@ -2902,6 +3099,20 @@ ${findings}`;
     return lines.join("\n");
   }
 
+  function formatHealth(prefix: string, health: FactoryHealth): string {
+    const number = (value: number) => value.toLocaleString("en-US");
+    const measure = (m: { median: number | null; sample: number }, unit: (value: number) => string) =>
+      m.median === null ? "no data yet" : `${unit(m.median)} (median of ${m.sample})`;
+    const { changesRequested: changes } = health;
+    return [
+      `Health for ${prefix}: ${health.prs} PR(s), ${health.open} open, ${health.merged} merged, ${health.closedUnmerged} closed without merging.`,
+      `  Review rounds per merged PR: ${measure(health.roundsPerMergedPr, number)}`,
+      `  PRs with changes requested: ${changes.sample === 0 ? "no data yet" : `${Math.round((changes.prs / changes.sample) * 100)}% (${changes.prs} of ${changes.sample})`}`,
+      `  Time from open to ready: ${measure(health.timeToReadyMs, (ms) => `${Math.round(ms / 60_000)} min`)}`,
+      `  Tokens per merged task, excluding cached: ${measure(health.tokensPerMergedTask, number)}`,
+    ].join("\n");
+  }
+
   bb.events.on("thread.idle", async ({ thread }) => {
     const entry = agentsByThread.get(thread.id);
     if (entry === undefined) return;
@@ -3046,6 +3257,10 @@ ${findings}`;
       return dismissed;
     },
     factory_runs: async ({ prefix, taskKey }) => runReport(await findFactory(prefix), taskKey),
+    factory_health: async ({ prefix }) => {
+      const factory = await findFactory(prefix);
+      return computeHealth(factory.prs, factoryStorage.tokensByTask(factory.prefix));
+    },
     factory_doctor: async ({ prefix }) => computeDoctorReport(await findFactory(prefix)),
     factory_set_mode: async ({ prefix, projectMode }) => {
       const updated = await mutateFactory(prefix, (factory) => {
@@ -3201,7 +3416,8 @@ ${findings}`;
               const reasoning = row.exec.reasoningLevel ?? `default${row.defaultReasoning === null ? "" : ` (${row.defaultReasoning})`}`;
               return `${row.key.padEnd(width)}  ${row.exec.providerId} · ${model} · reasoning ${reasoning}`;
             });
-            return { exitCode: 0, stdout: `${lines.join("\n")}\n\nChange one with \`bb factory agents set <agent> --provider … --model … --reasoning …\`.` };
+            const warnings = view.warnings.map((warning) => `\nWarning: ${warning.title}. ${warning.detail}`).join("");
+            return { exitCode: 0, stdout: `${lines.join("\n")}\n${warnings}\n\nChange one with \`bb factory agents set <agent> --provider … --model … --reasoning …\`.` };
           },
         }),
         "agents set": cliCommand({
@@ -3592,6 +3808,16 @@ ${findings}`;
             const taskKey = input.options.task ?? null;
             const report = runReport(factory, taskKey);
             return { exitCode: 0, stdout: input.options.json ? JSON.stringify(report) : formatRunReport(factory.prefix, taskKey, report) };
+          },
+        }),
+        health: cliCommand({
+          summary: "Show how much rework PRs take and what merged tasks cost, with sample sizes",
+          positionals: [{ name: "factory", description: "Factory prefix", required: true }],
+          options: { json },
+          async run(input) {
+            const factory = await findFactory(input.positionals.factory);
+            const health = computeHealth(factory.prs, factoryStorage.tokensByTask(factory.prefix));
+            return { exitCode: 0, stdout: input.options.json ? JSON.stringify(health) : formatHealth(factory.prefix, health) };
           },
         }),
         dismiss: cliCommand({

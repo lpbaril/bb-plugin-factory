@@ -139,3 +139,17 @@ test('upgrading clears ledger rows with bad token credit, and only those', async
   store.appendRuns('thr', [], { lastSeq: 7, usageSeq: 6, tokensTotal: 1, tokensCached: 0, tokensOutput: 0 });
   assert.equal(store.runCursor('thr').usageSeq, 6);
 });
+
+test('tokensByTask sums each task, leaves out cached input and other factories', async t => {
+  const { bb, harness } = createFakePluginHost({ pluginId: 'factory' });
+  t.after(() => harness.lifecycle.dispose());
+  const store = createFactoryStorage(bb.storage, identity);
+  const row = (threadId, prefix, taskKey, tokensTotal, tokensCached) => ({ threadId, endSeq: 1, prefix, taskKey, role: 'build', providerId: 'codex', model: null, reasoning: null, outcome: 'completed', error: null, startedAt: 1, endedAt: 2, tokensTotal, tokensCached, tokensOutput: 0 });
+  const cursor = { lastSeq: 1, usageSeq: 1, tokensTotal: 0, tokensCached: 0, tokensOutput: 0 };
+  store.appendRuns('a', [row('a', 'P', 'P-1', 100, 40)], cursor);
+  store.appendRuns('b', [row('b', 'P', 'P-1', 10, null)], cursor);
+  store.appendRuns('c', [row('c', 'P', 'P-2', null, null)], cursor);
+  store.appendRuns('d', [row('d', 'P', null, 500, 0)], cursor);
+  store.appendRuns('e', [row('e', 'OTHER', 'P-1', 700, 0)], cursor);
+  assert.deepEqual([...store.tokensByTask('P')].sort(), [['P-1', 70], ['P-2', 0]]);
+});

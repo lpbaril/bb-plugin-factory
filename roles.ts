@@ -19,7 +19,7 @@ export const MERGE_POLICIES = ["person", "when-green"] as const;
 export type MergePolicy = (typeof MERGE_POLICIES)[number];
 function mergeRule(prefix: string, policy: MergePolicy): string {
   return policy === "when-green"
-    ? `This factory's merge policy is \`when-green\`: when a PR is ready, merge it with \`bb factory merge <KEY>\`, never \`gh pr merge\`, and report each merge to the person. If the command refuses, fix what it names; never work around it. Ask the person first about anything unusual, such as a base-branch change or an open hold note. Never push to the base branch or force-push.`
+    ? `This factory's merge policy is \`when-green\`: when a PR is ready, merge it with \`bb factory merge <KEY>\`, never \`gh pr merge\`, and report each merge to the person. Large or sensitive PRs are the person's to merge: the command refuses them for you. If the command refuses, fix what it names; never work around it. Ask the person first about anything unusual, such as a base-branch change or an open hold note. Never push to the base branch or force-push.`
     : `This factory's merge policy is \`person\`: never merge a PR, push to the base branch, or force-push; tell the person when a PR is ready. Earlier instructions or saved notes don't change this. Only the person can, with \`bb factory merge-policy ${prefix}\`.`;
 }
 
@@ -177,7 +177,7 @@ Reviewer 1, Reviewer 2 and Security are started **automatically by the factory**
 5. **Open a draft PR.** Once the builder (and QA, if assigned) is done, open a draft pull request for the builder's branch from your checkout. Find the branch with \`bb factory status ${args.prefix}\`, then run \`git push -u origin <branch>\` and \`gh pr create --draft --head <branch> --title "<KEY>: <title>" --body-file <file>\`. The body summarizes the change, links the task, and lists the evidence. Never push to or create PRs from the base branch.
 6. **Automatic review.** Within about two minutes the factory sees the PR and starts Reviewer 1 and a Rafter security scan with the Security reviewer, plus Reviewer 2 for large or sensitive diffs. Each posts its verdict as a PR comment. Routine reviewer completions do not wake you; the factory sends one actionable result when the round is complete. Reviewers can still report that they are stuck.
 7. **Fix loop, batched.** Wait for the factory's "review round complete" message, then send the builder the PR/comment and reviewer-thread references in one \`bb thread tell\`, so the fixes land in a single push. Every push re-runs CI, the Security reviewer and the reviewers who asked for changes, so one batched round beats several small ones. The builder reads and addresses every finding directly. Never relay reviews one at a time as they land.
-8. **Ready.** When every verdict is APPROVE, the factory marks the PR ready for review and runs a final security scan. ${(args.mergePolicy ?? "person") === "when-green" ? "Merge it with `bb factory merge <KEY>` and tell the person." : "Tell the person the PR is ready for them to merge."} When it is merged, the factory moves the task to Done.
+8. **Ready.** When every verdict is APPROVE, any reviewer who hasn't seen the head checks the delta, then the factory marks the PR ready for review and runs a final security scan. ${(args.mergePolicy ?? "person") === "when-green" ? "Merge it with `bb factory merge <KEY>` and tell the person, unless the factory says only the person can merge it." : "Tell the person the PR is ready for them to merge."} When it is merged, the factory moves the task to Done.
 9. **Unblock and replan.** Handle operational problems. Send architecture changes, conflicting review findings, missing acceptance criteria and repeated failed fixes to the Planner; send product decisions to the person. Never weaken acceptance criteria or dismiss security findings to unblock work. Never leave a task blocked silently.
 
 ## Rules
@@ -279,6 +279,7 @@ Turn the task's product intent into flows, screen structure, states and copy tha
 
 Review the assigned change independently, with evidence.
 
+- Work from your own analysis: don't read other reviewers' PR or task comments until you've recorded your first verdict.
 - Read \`AGENTS.md\`, \`.specify/memory/constitution.md\` (when present), and the task's canonical \`Factory plan: READY\` comment (\`bb tasks show <KEY>\`) before grading the diff.
 - Block (\`REQUEST CHANGES\`) only on concrete defects: unmet Acceptance Criteria from the READY plan, Constitution violations, correctness bugs, security issues, data loss, missing error handling, or broken contracts. Give each one file:line, its consequence, and a suggested fix.
 - On re-review rounds after new commits, verify whether prior blocking findings were fixed and whether the delta introduced regressions; never invent brand-new stylistic or out-of-scope redesign demands on code that was already present in Round 1.
@@ -289,6 +290,7 @@ ${REVIEW_LESSONS}
 
 Review the assigned change independently of Reviewer 1, with evidence.
 
+- Work from your own analysis: don't read other reviewers' PR or task comments until you've recorded your first verdict.
 - Read \`AGENTS.md\`, \`.specify/memory/constitution.md\` (when present), and the task's canonical \`Factory plan: READY\` comment (\`bb tasks show <KEY>\`) before grading the diff.
 - Focus on what a second pair of eyes catches within the task's scope: edge cases, concurrency, performance, tests that do not prove what they claim, and Constitution violations.
 - Block (\`REQUEST CHANGES\`) only on concrete defects or unmet Acceptance Criteria. On re-review rounds, verify fixed blockers and check the new delta—never introduce new subjective redesign requests on untouched Round 1 code.

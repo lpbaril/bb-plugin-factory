@@ -32,7 +32,8 @@ Settings → Plugins → Factory, or `bb plugin config factory`:
   project used last); **Use defaults** goes back to them. The shadow
   reviewer also takes a **custom model id**, sent as-is, for a model the picker
   doesn't list, such as Codex's `gpt-daybreak-blue-latest`. From the command
-  line: `bb factory agents` shows them, and `bb factory agents set <agent>
+  line: `bb factory agents` shows them, with a warning if the Builder, Reviewer 1
+  and Security share a provider or a seat's provider isn't available, and `bb factory agents set <agent>
   --provider … --model … --reasoning …` changes one (`--custom-model` for the
   shadow). Upgrading from 0.1.2 copies the old per-role provider settings and
   the shadow model into Agents once.
@@ -90,6 +91,7 @@ from outside an agent thread: `bb factory merge-policy APP [person|when-green]`.
 
 - **`person`** (the default): the Lead tells you when a PR is ready, and you merge.
 - **`when-green`**: the Lead merges with `bb factory merge APP-12`, then reports it.
+  Large or sensitive PRs, the ones that need Reviewer 2, stay with you.
 
 `bb factory merge` squash-merges only when the PR is open and not a draft, GitHub
 reports it mergeable, every required reviewer approved the exact head, any shadow
@@ -101,6 +103,14 @@ too under either policy, or merge on GitHub yourself.
 still run `gh pr merge` directly, and a merge may happen overnight under `when-green`.
 The policy replaces conflicting instructions with one rule; it doesn't stop an agent
 determined to ignore it.
+
+## Health
+
+Open **Health** on the Factory page, or run `bb factory health APP [--json]`, to see how
+much rework PRs take: review rounds per merged PR, how often changes are requested, time
+from open to ready, tokens per merged task excluding cached input, and PRs closed without
+merging. Each number shows its sample size, because a small history can swing on one PR.
+PRs from before this view estimate time to ready from their last approval on the head.
 
 ## Run ledger
 

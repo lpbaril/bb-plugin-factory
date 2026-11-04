@@ -253,6 +253,14 @@ export function createFactoryStorage(storage: BbPluginApi["storage"], parse: (va
        ORDER BY ended_at DESC, end_seq DESC LIMIT @limit`,
     ).all({ prefix, taskKey, limit }) as RunRow[];
   }
+  /** Tokens per task, excluding cached input, which providers count differently. */
+  function tokensByTask(prefix: string): Map<string, number> {
+    const rows = db.prepare(
+      `SELECT task_key AS taskKey, COALESCE(SUM(tokens_total - COALESCE(tokens_cached, 0)), 0) AS tokens
+       FROM factory_runs WHERE prefix = ? AND task_key IS NOT NULL GROUP BY task_key`,
+    ).all(prefix) as { taskKey: string; tokens: number }[];
+    return new Map(rows.map((row) => [row.taskKey, row.tokens]));
+  }
   /** The model each review thread last ran on, to join verdicts to models. */
   function threadModels(prefix: string): Map<string, string | null> {
     const rows = db.prepare("SELECT thread_id AS threadId, model FROM factory_runs WHERE prefix = ? ORDER BY ended_at, end_seq").all(prefix) as { threadId: string; model: string | null }[];
@@ -281,7 +289,7 @@ export function createFactoryStorage(storage: BbPluginApi["storage"], parse: (va
 
   return {
     read, write, remove, readTrial, writeTrial, retireTrial, prefixes,
-    runCursor, appendRuns, runGroups, recentRuns, threadModels,
+    runCursor, appendRuns, runGroups, recentRuns, tokensByTask, threadModels,
     lessons, recordLesson, markLessonNotified,
   };
 }
