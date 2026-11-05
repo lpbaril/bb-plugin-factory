@@ -161,6 +161,10 @@ const prSchema = z.object({
   qaFailureNotifiedAt: z.string().nullable().default(null),
   /** Other PRs the Lead has had the full merge-train note about, so each pair gets it once. */
   overlapNotified: z.array(z.number()).default([]),
+  /** The commit whose merge card the person dismissed. It isn't offered again for that commit unless someone asks. */
+  mergeCardDismissedSha: z.string().nullable().default(null),
+  /** The commit the person was last notified about, so a card shown again after a restart doesn't notify again. */
+  mergeNotifiedSha: z.string().nullable().default(null),
   /** Touches paths the shadow reviewer covers in "sensitive" mode. */
   shadow: z.boolean().default(false),
   /** When the factory reported a shadow review that ended without a verdict. */
@@ -168,7 +172,7 @@ const prSchema = z.object({
   /** The head whose completed review round was reported to the Lead (batched findings). */
   roundNotifiedSha: z.string().nullable().default(null),
   /** Set when `bb factory merge` merged this PR; a merge on GitHub leaves it null. */
-  merge: z.object({ by: z.enum(["lead", "person"]), threadId: z.string().nullable(), sha: z.string(), policy: z.enum(MERGE_POLICIES), at: z.string() }).nullable().default(null),
+  merge: z.object({ by: z.enum(["lead", "person"]), threadId: z.string().nullable(), sha: z.string(), policy: z.enum(MERGE_POLICIES), at: z.string(), via: z.enum(["command", "card"]).default("command") }).nullable().default(null),
 });
 type Pr = z.infer<typeof prSchema>;
 
@@ -362,6 +366,25 @@ function mergeInstruction(factory: Pick<Factory, "mergePolicy">, pr: Pick<Pr, "d
   if (leadMayMerge(factory, pr)) return `Merge it with \`bb factory merge ${pr.taskKey}\` once CI is green.`;
   return `${factory.mergePolicy === "when-green" ? "It's large or sensitive, so only the person can merge it. " : ""}Tell the person it's ready for them to merge.`;
 }
+
+/** What the merge card shows. It's a snapshot: merging checks everything again on GitHub's live state. */
+export type MergeCardPayload = {
+  prefix: string;
+  taskKey: string;
+  number: number;
+  title: string;
+  url: string;
+  headSha: string;
+  flagged: string | null;
+  approvals: { label: string; verdict: string; atHead: boolean }[];
+  qa: string | null;
+  ci: { passing: number; total: number; failing: string[] } | null;
+  scan: string | null;
+  overlap: string | null;
+  files: { path: string; additions: number; deletions: number }[];
+  moreFiles: number;
+};
+export const MERGE_CARD_RENDERER = "merge-review";
 
 export type MergeOverlap = { number: number; taskKey: string; fileCount: number };
 /**
@@ -832,6 +855,10 @@ export const rpcContract = defineRpcContract({
     input: z.object({ taskKey: z.string(), reason: z.string().trim().min(3).max(2000) }),
     output: z.object({ pr: z.number() }),
   },
+  merge_from_card: {
+    input: z.object({ prefix: z.string(), pr: z.number().int().positive(), headSha: z.string().regex(/^[0-9a-f]{40}$/) }),
+    output: z.object({ ok: z.boolean(), message: z.string() }),
+  },
   task_assign: {
     input: z.object({
       taskKey: z.string(),
@@ -1022,6 +1049,13 @@ export default async function plugin(bb: BbPluginApi) {
         "Permission mode for new factory agents. auto: commands outside the sandbox wait for your approval. accept-edits: file edits run, commands ask. full: no approvals at all; agents can run any command on this machine, so the factory can work while you're away.",
       options: ["auto", "accept-edits", "full"],
       default: "auto",
+    },
+    mergeCards: {
+      type: "boolean",
+      label: "Offer a merge card in the Lead's chat",
+      description:
+        "When a PR is ready for you to merge, show a card in the Lead's chat with its approvals, QA, CI and changed files, and a Merge button that runs the same checks as bb factory merge. While the card waits, it takes the place of the chat's message box until you merge or choose Not now. It also sends a notification. This is a convenience, not a lock: agents could make the same call.",
+      default: true,
     },
     prReviews: {
       type: "boolean",
@@ -2636,6 +2670,8 @@ ${sections.join("\n\n---\n\n")}`;
         draftNotice: null,
         qaFailureNotifiedAt: null,
         overlapNotified: [],
+        mergeCardDismissedSha: null,
+        mergeNotifiedSha: null,
         pushFollowUp: null,
         shadow,
         shadowStallNotifiedAt: null,
@@ -3006,6 +3042,141 @@ ${sections.join("\n\n---\n\n")}`;
     });
   }
 
+  // ----- Merge card -----
+
+  /** One card per factory, because a card takes over the Lead chat's message box while it waits. */
+  const openMergeCards = new Map<string, { pr: number; sha: string; controller: AbortController }>();
+  const MERGE_CARD_TIMEOUT_MS = 7 * 24 * 60 * 60 * 1000;
+
+  /** Offered once the factory has told the Lead the PR is ready for the person to merge. */
+  function mergeCardDue(factory: Factory, pr: Pr): boolean {
+    return factory.leadThreadId !== null && pr.state === "open" && !pr.isDraft && pr.merge === null && !leadMayMerge(factory, pr)
+      && pr.approvedNotifiedSha === pr.headSha && pr.mergeCardDismissedSha !== pr.headSha;
+  }
+
+  /** Null until GitHub can merge the PR and every CI check passes: a merge before that would be refused. */
+  async function mergeCardPayload(factory: Factory, hostId: string, repo: string, pr: Pr): Promise<MergeCardPayload | null> {
+    let view: { title?: string; mergeable?: string; files?: { path: string; additions?: number; deletions?: number }[]; statusCheckRollup?: z.infer<typeof prMergeViewSchema>["statusCheckRollup"] } = {};
+    try {
+      view = JSON.parse(await gh(hostId, ["pr", "view", String(pr.number), "--repo", repo, "--json", "title,files,statusCheckRollup,mergeable"]));
+    } catch (error) {
+      bb.log.warn(`could not read PR #${pr.number} for its merge card: ${String(error)}`);
+    }
+    // Also not while GitHub reports a conflict or is still working it out, as it does right after another merge.
+    if (view.mergeable !== "MERGEABLE") return null;
+    const checks = view.statusCheckRollup ?? null;
+    if (checks === null || checks.length === 0 || checks.some((check) => !PASSING_CHECKS.includes(check.conclusion ?? check.state ?? ""))) return null;
+    const files = (view.files ?? []).map((file) => ({ path: file.path, additions: file.additions ?? 0, deletions: file.deletions ?? 0 }));
+    const scan = pr.scans.filter((candidate) => candidate.phase === "ready").at(-1);
+    const overlaps = await findMergeOverlaps(factory, hostId, repo, pr);
+    const qaText = !factory.evidenceContract ? null
+      : pr.qa == null ? "No QA result"
+      : pr.qa.verdict === "skipped" ? "Skipped for this commit, with a recorded reason"
+      : (await currentQaCarryNote(factory, hostId, repo, pr)) || `${pr.qa.verdict === "pass" ? "Passed" : "Failed"} at this commit`;
+    return {
+      prefix: factory.prefix,
+      taskKey: pr.taskKey,
+      number: pr.number,
+      title: (view.title ?? "").slice(0, 300),
+      url: pr.url,
+      headSha: pr.headSha,
+      flagged: pr.deep ? "Large or sensitive: Reviewer 2 was required, so only you can merge it." : null,
+      approvals: requiredReviewRoles(pr).map((role) => {
+        const review = latestReview(pr, role);
+        return { label: ROLES[role].label, verdict: review?.verdict ?? "missing", atHead: review?.sha === pr.headSha };
+      }),
+      qa: qaText,
+      ci: {
+        passing: checks.filter((check) => PASSING_CHECKS.includes(check.conclusion ?? check.state ?? "")).length,
+        total: checks.length,
+        failing: checks.filter((check) => !PASSING_CHECKS.includes(check.conclusion ?? check.state ?? "")).slice(0, 5).map((check) => (check.name ?? check.context ?? "unnamed").slice(0, 100)),
+      },
+      scan: scan === undefined ? null : `${scan.status === "completed" ? "Completed" : scan.status === "failed" ? "Failed" : "Running"} at ${scan.sha.slice(0, 7)}${scan.sha === pr.headSha ? "" : ", not the latest commit"}`,
+      overlap: overlaps.length === 0 ? null : `Shares files with ${overlaps.map((overlap) => `#${overlap.number} (${overlap.taskKey})`).join(" and ")}, so merging either first may conflict with the other.`,
+      files: files.slice(0, 60),
+      moreFiles: Math.max(0, files.length - 60),
+    };
+  }
+
+  async function notifyMergeReady(factory: Factory, pr: Pr): Promise<void> {
+    if (pr.mergeNotifiedSha === pr.headSha || factory.leadThreadId === null) return;
+    try {
+      await bb.sdk.plugins.callRpc({
+        pluginId: "push-notifications",
+        method: "notifications.send",
+        input: { title: `${pr.taskKey} is ready to merge`, body: `PR #${pr.number} in ${factory.name}. Tap to review it and merge.`, threadId: factory.leadThreadId } as never,
+        outputSchema: z.unknown(),
+      });
+      await mutateFactory(factory.prefix, (current) => {
+        const target = current.prs.find((candidate) => candidate.number === pr.number);
+        if (target !== undefined) target.mergeNotifiedSha = pr.headSha;
+      });
+    } catch (error) {
+      bb.log.warn(`could not send the merge notification for PR #${pr.number}: ${String(error)}`);
+    }
+  }
+
+  async function maybeOfferMergeCard(prefix: string, hostId: string, repo: string, prNumber: number): Promise<void> {
+    if (!(await settings.get()).mergeCards) return;
+    // Fresh, so a PR announced earlier in this pass gets its card now.
+    const factory = await findFactory(prefix);
+    const pr = factory.prs.find((candidate) => candidate.number === prNumber);
+    const open = openMergeCards.get(prefix);
+    if (open !== undefined) {
+      if (open.pr !== prNumber) return;
+      if (pr !== undefined && open.sha === pr.headSha && mergeCardDue(factory, pr)) return;
+      open.controller.abort();
+      openMergeCards.delete(prefix);
+    }
+    if (pr === undefined || !mergeCardDue(factory, pr) || factory.leadThreadId === null) return;
+    const payload = await mergeCardPayload(factory, hostId, repo, pr);
+    if (payload === null) return;
+    const controller = new AbortController();
+    const sha = pr.headSha;
+    let waiting: Promise<{ outcome: "submitted"; value: unknown } | { outcome: "cancelled"; reason: string }>;
+    try {
+      waiting = bb.ui.requestInput({
+        threadId: factory.leadThreadId,
+        rendererId: MERGE_CARD_RENDERER,
+        title: `Merge PR #${pr.number} (${pr.taskKey})?`,
+        payload: payload as never,
+        timeoutMs: MERGE_CARD_TIMEOUT_MS,
+      }, { signal: controller.signal });
+    } catch (error) {
+      bb.log.warn(`could not show the merge card for PR #${pr.number}: ${String(error)}`);
+      return;
+    }
+    openMergeCards.set(prefix, { pr: pr.number, sha, controller });
+    await notifyMergeReady(factory, pr);
+    void waiting.then(async (result) => {
+      if (openMergeCards.get(prefix)?.controller === controller) openMergeCards.delete(prefix);
+      // The card's Merge button merges through merge_from_card. An answer never merges, whoever sends it:
+      // an agent can answer this card with `bb thread interactions respond`.
+      const value = result.outcome === "submitted" ? result.value : null;
+      const merged = typeof value === "object" && value !== null && !Array.isArray(value) && (value as { action?: unknown }).action === "merged";
+      const dismissed = (result.outcome === "submitted" && !merged) || (result.outcome === "cancelled" && result.reason === "user");
+      if (dismissed) {
+        await mutateFactory(prefix, (current) => {
+          const target = current.prs.find((candidate) => candidate.number === prNumber);
+          if (target !== undefined) target.mergeCardDismissedSha = sha;
+        });
+      }
+      // Withdrawn, timed out or interrupted by a restart: the next pass shows it again if it's still due.
+      wakePrWatch();
+    }).catch((error: unknown) => bb.log.warn(`merge card for PR #${prNumber} ended badly: ${String(error)}`));
+  }
+
+  /** A card for a PR that's no longer ready to merge, at the commit it shows, is taken back. */
+  async function withdrawStaleMergeCard(prefix: string): Promise<void> {
+    const open = openMergeCards.get(prefix);
+    if (open === undefined) return;
+    const factory = await findFactory(prefix);
+    const pr = factory.prs.find((candidate) => candidate.number === open.pr);
+    if (pr !== undefined && pr.headSha === open.sha && mergeCardDue(factory, pr) && (await settings.get()).mergeCards) return;
+    open.controller.abort();
+    openMergeCards.delete(prefix);
+  }
+
   /** True if QA is holding this fully approved PR. The Lead hears once per commit, and again if QA's state changes. */
   async function reportQaHold(factory: Factory, pr: Pr): Promise<boolean> {
     const qa = qaHold(factory, pr);
@@ -3337,8 +3508,10 @@ ${sections.join("\n\n---\n\n")}`;
         if (await maybeReturnToDraft(factory, hostId, repo, pr)) return;
         await maybeAnnounceReapproval(factory, hostId, repo, pr);
         await maybeMarkReady(factory, hostId, repo, pr);
+        await maybeOfferMergeCard(prefix, hostId, repo, pr.number);
       });
     }
+    await withdrawStaleMergeCard(prefix);
 
     const tracked = new Set([...sameRepo.map((gp) => gp.number), ...factory.prs.map((pr) => pr.number)]);
     for (const number of tracked) {
@@ -3479,7 +3652,7 @@ ${sections.join("\n\n---\n\n")}`;
     return { pr, unlisted };
   }
 
-  async function mergePr(args: { taskKey: string; pr: number | null; threadId: string | null }): Promise<{ pr: Pr; sha: string }> {
+  async function mergePr(args: { taskKey: string; pr: number | null; threadId: string | null; expectedHead?: string; via?: "command" | "card" }): Promise<{ pr: Pr; sha: string }> {
     const task = await getTaskByKey(args.taskKey);
     const factory = await factoryForTaskKey(task.key);
     const isLead = args.threadId !== null && (args.threadId === factory.leadThreadId || factory.agents.some((agent) => agent.threadId === args.threadId && agent.role === "lead"));
@@ -3499,6 +3672,10 @@ ${sections.join("\n\n---\n\n")}`;
     const { hostId, repo } = await projectHost(factory);
     if (repo === null) throw new PluginCliError(`Factory ${factory.prefix} has no GitHub repository.`, { code: "no_repo" });
     const view = prMergeViewSchema.parse(JSON.parse(await gh(hostId, ["pr", "view", String(pr.number), "--repo", repo, "--json", "state,isDraft,headRefOid,mergeable,statusCheckRollup"])));
+    // A card shows one commit, so a merge from it is for that commit only.
+    if (args.expectedHead !== undefined && view.headRefOid !== args.expectedHead) {
+      throw new PluginCliError(`PR #${pr.number} has new commits since this card was shown, so it wasn't merged. A new card comes once they're reviewed.`, { code: "merge_head_moved" });
+    }
     const { shadowBlocks, shadowMode } = await settings.get();
     const blockers = mergeBlockers(pr, view, shadowBlocks, shadowMode);
     // The watcher hasn't caught up, so what's stored for this PR is from before it closed.
@@ -3521,9 +3698,9 @@ ${sections.join("\n\n---\n\n")}`;
     const by = isLead ? "lead" : "person";
     await mutateFactory(factory.prefix, (current) => {
       const target = current.prs.find((candidate) => candidate.number === pr.number);
-      if (target !== undefined) target.merge = { by, threadId: args.threadId, sha: view.headRefOid, policy: factory.mergePolicy, at: new Date().toISOString() };
+      if (target !== undefined) target.merge = { by, threadId: args.threadId, sha: view.headRefOid, policy: factory.mergePolicy, at: new Date().toISOString(), via: args.via ?? "command" };
     });
-    await comment(task.id, `Merged [PR #${pr.number}](${pr.url}) at \`${view.headRefOid.slice(0, 7)}\` with \`bb factory merge\`, run by ${isLead ? `the Lead under the ${factory.mergePolicy} policy` : "the person"}.`);
+    await comment(task.id, `Merged [PR #${pr.number}](${pr.url}) at \`${view.headRefOid.slice(0, 7)}\` ${args.via === "card" ? "from the merge card" : "with \`bb factory merge\`"}, run by ${isLead ? `the Lead under the ${factory.mergePolicy} policy` : "the person"}.`);
     wakePrWatch();
     return { pr, sha: view.headRefOid };
   }
@@ -4014,6 +4191,25 @@ ${findings}`;
         z.object({ comments: z.array(commentSchema) }),
       );
       return { description: task.description, comments: comments.slice(-30) };
+    },
+    // Agents can call this too, as they can any client call; see the mergeCards setting. Another plugin can't.
+    merge_from_card: async ({ prefix, pr: number, headSha }, ctx) => {
+      if (ctx.experimental_caller.kind !== "client") return { ok: false, message: "Only bb's own interface can merge from a card." };
+      try {
+        // Only while a card for this exact PR and commit is showing, so this call can't merge at any other
+        // time, including after Not now. An agent could still make it while a card shows.
+        const card = openMergeCards.get(prefix);
+        if (!(await settings.get()).mergeCards || card === undefined || card.pr !== number || card.sha !== headSha) {
+          return { ok: false, message: `There's no merge card showing for PR #${number} at commit ${headSha.slice(0, 7)}, so it wasn't merged.` };
+        }
+        const factory = await findFactory(prefix);
+        const pr = factory.prs.find((candidate) => candidate.number === number);
+        if (pr === undefined) return { ok: false, message: `PR #${number} isn't one this factory tracks.` };
+        const { sha } = await withTaskLock(pr.taskKey, () => mergePr({ taskKey: pr.taskKey, pr: number, threadId: null, expectedHead: headSha, via: "card" }));
+        return { ok: true, message: `Merged PR #${number} at ${sha.slice(0, 7)}.` };
+      } catch (error) {
+        return { ok: false, message: error instanceof Error ? error.message : String(error) };
+      }
     },
     task_assign: async (input) => ({ threadId: await assign(input) }),
     shadow_dismiss: async ({ taskKey, reason }, ctx) => {
@@ -4525,6 +4721,22 @@ ${findings}`;
             const taskKey = input.positionals.task;
             const { pr, sha } = await withTaskLock(taskKey, () => mergePr({ taskKey, pr: input.options.pr ?? null, threadId: ctx.threadId ?? null }));
             return { exitCode: 0, stdout: `Merged PR #${pr.number} at ${sha.slice(0, 7)}.` };
+          },
+        }),
+        "merge-card": cliCommand({
+          summary: "Show the merge card again for a task's PR, after the person chose Not now",
+          positionals: [{ name: "task", description: "Task key, such as APP-12", required: true }],
+          async run(input) {
+            const task = await getTaskByKey(input.positionals.task);
+            const factory = await factoryForTaskKey(task.key);
+            const pr = factory.prs.find((candidate) => candidate.taskKey === task.key && candidate.state === "open");
+            if (pr === undefined) throw new PluginCliError(`${task.key} has no open pull request.`, { code: "no_pr" });
+            await mutateFactory(factory.prefix, (current) => {
+              const target = current.prs.find((candidate) => candidate.number === pr.number);
+              if (target !== undefined) target.mergeCardDismissedSha = null;
+            });
+            wakePrWatch();
+            return { exitCode: 0, stdout: `The merge card for PR #${pr.number} will show again in the Lead's chat once the PR is ready for the person to merge.` };
           },
         }),
         "merge-policy": cliCommand({

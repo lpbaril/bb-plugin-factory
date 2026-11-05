@@ -99,6 +99,18 @@ block is cleared, no Rafter scan is running, and CI on the head reports checks t
 all passed. It pins the merge to that head and records who ran it. You can run it
 too under either policy, or merge on GitHub yourself.
 
+**Merge card.** When a PR is ready for you to merge, with CI green and no conflict on GitHub, the factory shows a card in the
+Lead's chat and sends a notification to your phone and desktop. The card lists the
+reviewers' approvals, QA, CI, the final scan, any overlap with other open PRs, and
+the changed files, with a link to the full diff on GitHub. Tap **Merge** to run the
+same checks as `bb factory merge` for that exact commit, or **Not now** to close it.
+While the card waits, it takes the place of the chat's message box. One card shows at
+a time per factory, a new commit takes it back, and `bb factory merge-card APP-12`
+shows it again. Turn it off with the **Offer a merge card in the Lead's chat** setting.
+Answering the card some other way never merges, and Merge only works while a card
+for that exact PR and commit is showing. Still, the card isn't a lock: while it shows,
+an agent could make the same call.
+
 **This is not a security boundary.** Agents use your `gh` login, so an agent could
 still run `gh pr merge` directly, and a merge may happen overnight under `when-green`.
 The policy replaces conflicting instructions with one rule; it doesn't stop an agent
