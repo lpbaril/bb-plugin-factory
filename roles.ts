@@ -420,7 +420,7 @@ function evidenceBrief(role: WorkerRoleId, taskKey: string): string {
   const parts = [EVIDENCE];
   if (reviewer) parts.push(reviewContract());
   if (role === "build") parts.push("## Shortcuts\n\nA deliberate shortcut with a known limit gets a code comment in this form: `shortcut: <the limit>, <when to upgrade>`. Reviewers treat it as a decision, and it can be found later with `git grep \"shortcut:\"`.");
-  if (role === "qa") parts.push(`## Your verdict\n\nA PR can't be marked ready or merged until QA passes, so record it: \`bb factory qa ${taskKey} --verdict pass|fail --sha $(git rev-parse HEAD)\`. Do this as well as commenting on the task.`);
+  if (role === "qa") parts.push(`## Your verdict\n\nA PR can't be marked ready or merged until QA passes, so record it: \`bb factory qa ${taskKey} --verdict pass|fail --sha $(git rev-parse HEAD)\`. If the task has more than one open PR, check and record each one, adding \`--pr <number>\` if the commit doesn't say which. Do this as well as commenting on the task.`);
   return parts.join("\n\n");
 }
 
