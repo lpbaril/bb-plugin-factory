@@ -4416,8 +4416,18 @@ ${findings}`;
             const owner = closedOwner ?? open;
             const verdict = input.options.verdict as "pass" | "fail";
             await mutateFactory(factory.prefix, (target) => {
+              // Reading the head from GitHub can take a while, so what was checked above may have changed.
+              if (target.agents.filter((agent) => agent.role === "qa" && agent.taskKey === task.key).at(-1)?.threadId !== threadId) {
+                throw new PluginCliError(`Only the latest QA thread the factory started for ${task.key} can record this.`, { code: "not_the_qa" });
+              }
               const result = { verdict, threadId, sha, at: new Date().toISOString() };
               const pr = owner === null ? undefined : target.prs.find((candidate) => candidate.number === owner.number);
+              if (owner !== null && pr?.state !== owner.state) {
+                throw new PluginCliError(`PR #${owner.number} changed while this was being recorded, so nothing was saved.`, {
+                  code: "qa_pr_changed",
+                  hint: "Check the PR's state and head, then record the verdict again.",
+                });
+              }
               if (pr === undefined) {
                 target.qaResults[task.key] = result;
                 return;

@@ -3470,6 +3470,51 @@ test('the merge-train note says may conflict', () => {
   assert.doesNotMatch(note, /likely/);
 });
 
+// ----- Saving a QA verdict after waiting on GitHub -----
+
+const duringLookup = async (t, change) => {
+  let context = null;
+  const result = await contractFixture(t, {
+    initial: { agents: [builderAgent, qaAgent, leadAgent] },
+    view: async (args) => {
+      if (args.includes('headRefOid')) await change(context);
+      return { code: 0, stderr: '', stdout: JSON.stringify({ headRefOid: SHA_B }) };
+    },
+  });
+  context = result;
+  return result;
+};
+const recordPass = (harness) => harness.behavior.runCli(['qa', 'TEST-1', '--verdict', 'pass', '--sha', SHA_B], { threadId: 'thr_qa' });
+
+test('a QA thread replaced during the GitHub lookup can\'t save its verdict', async t => {
+  const { bb, harness } = await duringLookup(t, async ({ harness: h }) => {
+    assert.equal((await h.behavior.runCli(['assign', 'TEST-1', '--role', 'qa'])).exitCode, 0);
+  });
+  const refused = await recordPass(harness);
+  assert.notEqual(refused.exitCode, 0);
+  assert.match(refused.stderr, /Only the latest QA thread/);
+  assert.equal((await readPrs(bb))[0].qa ?? null, null, 'the new run is still to come');
+});
+
+test('a PR that closes during the GitHub lookup gets no verdict', async t => {
+  const { bb, harness } = await duringLookup(t, async ({ bb: b }) => {
+    const storage = createFactoryStorage(b.storage, value => value);
+    const factory = await storage.read('TEST');
+    factory.prs[0].state = 'closed';
+    await storage.write(factory);
+  });
+  const refused = await recordPass(harness);
+  assert.notEqual(refused.exitCode, 0);
+  assert.match(refused.stderr, /PR #7 changed while this was being recorded, so nothing was saved/);
+  assert.equal((await readPrs(bb))[0].qa ?? null, null);
+});
+
+test('with no change during the lookup, the verdict is saved', async t => {
+  const { bb, harness } = await duringLookup(t, async () => {});
+  assert.equal((await recordPass(harness)).exitCode, 0);
+  assert.equal((await readPrs(bb))[0].qa.sha, SHA_B);
+});
+
 async function reopenFixture(t, pr, initial = {}, live = { isDraft: false }) {
   const ghCalls = [];
   const bodies = [];
