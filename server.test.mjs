@@ -3085,19 +3085,34 @@ test('one QA thread can record on each open PR, by commit, without being assigne
   assert.equal(spawns.length, 0);
 });
 
-test('assigning QA clears the result with one PR open, and with several keeps passes', async t => {
+test('assigning QA clears the results on every open PR of the task, and only those', async t => {
   const one = await contractFixture(t, { extra: { qa: passedQa() }, initial: { agents: [builderAgent, leadAgent] } });
   assert.equal((await one.harness.behavior.runCli(['assign', 'TEST-1', '--role', 'qa'])).exitCode, 0);
   assert.equal((await readPrs(one.bb))[0].qa, null);
   const closed = prRecord({ number: 5, state: 'closed', qa: failedQa() });
-  const several = await contractFixture(t, { initial: { agents: [builderAgent, leadAgent], prs: [prRecord({ qa: passedQa(), qaHoldNotifiedSha: SHA_A }), secondPr({ qa: failedQa(), qaHoldNotifiedSha: SHA_B }), closed] } });
+  const otherTask = secondPr({ number: 6, url: 'u6', taskKey: 'TEST-2', qa: passedQa() });
+  const several = await contractFixture(t, { initial: { agents: [builderAgent, leadAgent], prs: [prRecord({ qa: passedQa(), qaHoldNotifiedSha: SHA_A }), secondPr({ qa: failedQa(), qaHoldNotifiedSha: SHA_B }), closed, otherTask] } });
   assert.equal((await several.harness.behavior.runCli(['assign', 'TEST-1', '--role', 'qa'])).exitCode, 0);
   const prs = await readPrs(several.bb);
-  assert.equal(prs[0].qa.verdict, 'pass', 'a pass stays');
+  assert.equal(prs[0].qa, null, 'a pass being re-checked no longer opens the gate');
   assert.equal(prs[0].qaHoldNotifiedSha, null);
-  assert.equal(prs[1].qa, null, 'a failure is cleared');
+  assert.equal(prs[1].qa, null);
   assert.equal(prs[1].qaHoldNotifiedSha, null);
   assert.equal(prs[2].qa.verdict, 'fail', 'a closed PR keeps its record');
+  assert.equal(prs[3].qa.verdict, 'pass', 'another task is left alone');
+});
+
+test('while QA is re-run on a task with two open PRs, the PR that had passed can\'t merge', async t => {
+  const prs = [
+    { number: 7, taskKey: 'TEST-1', url: 'u7', headSha: HEAD, branch: 'b', state: 'open', isDraft: false, deep: false, readyRequested: true, openedAt: '', scans: [], reviews: readyPr().reviews, qa: passedQa() },
+    { number: 9, taskKey: 'TEST-1', url: 'u9', headSha: SHA_B, branch: 'c', state: 'open', isDraft: true, deep: false, readyRequested: false, openedAt: '', scans: [], reviews: [] },
+  ];
+  const { harness, merges } = await mergeFixture(t, { mergePolicy: 'person', evidenceContract: true, qaResults: {}, agents: [builderAgent, leadAgent], prs });
+  assert.equal((await harness.behavior.runCli(['assign', 'TEST-1', '--role', 'qa'])).exitCode, 0);
+  const refused = await harness.behavior.runCli(['merge', 'TEST-1', '--pr', '7']);
+  assert.notEqual(refused.exitCode, 0);
+  assert.match(refused.stderr, /QA hasn't recorded a verdict for this PR/);
+  assert.equal(merges().length, 0);
 });
 
 test('the Factory page can assign QA on a task with two open PRs', async t => {
