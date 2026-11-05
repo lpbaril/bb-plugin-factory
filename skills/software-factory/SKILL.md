@@ -75,7 +75,7 @@ needed. Do not paste full plans or logs into the Lead thread, or poll active wor
    Reviewer 2, and the PR stays that way even if a later push shrinks it.
 5. When every required verdict is APPROVE, reviewers who haven't seen the head
    check the delta. Once all approvals cover it, the factory marks the PR ready for
-   review (which also runs full CI) and, with Rafter, runs the PR's one final scan. If
+   review (which also runs full CI) and, with Rafter, runs the PR's one final scan, which a later return to ready doesn't repeat unless the attempt failed for a reason other than quota. If
    the PR touches files another open factory PR also touches, the message saying
    it's ready carries a merge-train note, in full once per pair of PRs, so the Lead
    can suggest an order. The factory's merge policy says who
@@ -151,6 +151,7 @@ skip docs-only changes. PRs stay drafts until every reviewer approves, so
 | `bb factory init-specs [APP] [--mode greenfield\|brownfield]` | Scaffold missing Spec-Driven alignment files in the repository without overwriting existing files. |
 | `bb factory reconcile [APP] [--notify-lead]` | Move tasks with already-merged PRs to Done, audit stalled In-Progress tasks, and optionally send a status/alignment brief to the Lead thread. |
 | `bb factory assign APP-12 --role plan\|build\|qa\|design\|review1\|review2\|security [--instructions "..."]` | Spawn a specialist for the task as the Lead's child. Planner uses the project checkout; Builder and Designer get a new worktree; QA and reviewers reuse the task's builder worktree. PR reviewers are normally started automatically instead. |
+| `bb factory assign APP-12 --role qa --pr N` | Assign QA for one PR, which clears only that PR's QA result. Needed if the task has several open PRs. |
 | `bb factory assign APP-12 --role review1\|review2\|security --pr N` | Replace a reviewer that failed (dead provider, removed model) with a fresh one on the current roster, reviewing that PR. Retrying the old thread keeps the model it was spawned with, so it cannot recover from a provider that ran out. |
 | `bb factory plan-ready APP-12 --comment <id>` | Current Planner only: validate its READY planning comment and allow Builder assignments. |
 | `bb factory plan APP-12` | Print only the task's READY plan. Reviewers use this because `bb tasks show` also prints other reviewers' verdicts. |
