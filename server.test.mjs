@@ -46,7 +46,7 @@ async function fixture(t, fallback = false, initial = {}, overrides = {}) {
     pluginId: 'factory', settings: { superviseAgents: true },
     experimental_callHostRpc: overrides.hostRpc,
     sdk: {
-      projects: { get: async () => ({ name: 'Test', gitRemoteUrl: 'https://github.com/owner/repo.git', sources: [{ hostId: 'host_test', isDefault: true, path: overrides.projectPath ?? null }] }) },
+      projects: { get: async () => ({ name: 'Test', gitRemoteUrl: overrides.gitRemoteUrl === undefined ? 'https://github.com/owner/repo.git' : overrides.gitRemoteUrl, sources: [{ hostId: 'host_test', isDefault: true, path: overrides.projectPath ?? null }] }) },
       providers: { models: async () => ({ models: [] }) },
       threads: {
         get: async () => makeThreadResponse({ id: 'thr_builder', environmentId: 'env_builder' }),
@@ -2280,16 +2280,30 @@ test('a QA skip covers one commit: a new commit holds the merge again', async t 
   assert.equal((await harness.behavior.runCli(['merge', 'TEST-1'])).exitCode, 0, 'the skip covers its own commit');
 });
 
-test('a new commit after a skip tells the Lead once, and a skip needs an open PR', async t => {
-  const { messages, pass } = await watchOnce(t, {
+test('a new commit after a skip returns the PR to draft and tells the Lead once, and a skip needs an open PR', async t => {
+  const live = { headRefOid: SHA_B, isDraft: false };
+  const { messages, pass, ghCalls } = await watchOnce(t, {
     initial: { evidenceContract: true, qaResults: { 'TEST-1': { verdict: 'skipped', threadId: null, sha: SHA_A, at: '' } }, agents: [builderAgent, leadAgent] },
-    pr: { number: 7, headSha: SHA_B, isDraft: false, readyRequested: true, deep: false, shadow: false, reviews: [approved('review1', SHA_B), approved('security', SHA_B)] },
-    live: { headRefOid: SHA_B, isDraft: false },
+    pr: { number: 7, headSha: SHA_B, isDraft: false, readyRequested: true, readySha: SHA_A, deep: false, shadow: false, reviews: [approved('review1', SHA_B), approved('security', SHA_B)] },
+    live,
   });
+  assert.ok(ghCalls.some(args => args[1] === 'ready' && args.includes('--undo')));
+  live.isDraft = true;
   await pass();
-  assert.equal(messages.filter(message => /can't be merged: QA was skipped for an earlier commit/.test(message.input[0].text)).length, 1, 'a ready PR hears about the hold, once');
+  await pass();
+  assert.equal(messages.filter(message => /can't be marked ready: QA was skipped for an earlier commit/.test(message.input[0].text)).length, 1);
   const noPr = await contractFixture(t, { initial: { agents: [builderAgent, leadAgent], prs: [] } });
   assert.match((await noPr.harness.behavior.runCli(['qa-skip', 'TEST-1', '--reason', 'Only a docs typo, nothing to exercise'], { threadId: 'thr_lead' })).stderr, /no open pull request/);
+});
+
+test('a PR someone marked ready by hand still hears about a QA hold, and stays as they left it', async t => {
+  const { messages, ghCalls } = await watchOnce(t, {
+    initial: { evidenceContract: true, qaResults: {}, agents: [builderAgent, leadAgent] },
+    pr: { number: 7, headSha: SHA_B, isDraft: false, readyRequested: false, deep: false, shadow: false, reviews: [approved('review1', SHA_B), approved('security', SHA_B)] },
+    live: { headRefOid: SHA_B, isDraft: false },
+  });
+  assert.ok(messages.some(message => /can't be merged: QA wasn't assigned/.test(message.input[0].text)));
+  assert.ok(!ghCalls.some(args => args.includes('--undo')));
 });
 
 test('the hold notice repeats when QA changes, with advice that fits', async t => {
@@ -2308,5 +2322,147 @@ test('the hold notice repeats when QA changes, with advice that fits', async t =
   await runPasses(harness, 2);
   assert.equal(holds().length, 3, 'reassigning QA resets the notice too');
   assert.match(holds()[2], /Wait for QA to finish/);
+});
+
+// ----- Fixes from the SAND test -----
+
+const contractWatch = (t, pr, { qa = { verdict: 'pass', threadId: 'thr_qa', sha: SHA_A, at: '' }, initial = {}, live = {}, settings = {} } = {}) => watchOnce(t, {
+  initial: { evidenceContract: true, qaResults: qa === null ? {} : { 'TEST-1': qa }, agents: [builderAgent, leadAgent], ...initial },
+  pr: { number: 7, isDraft: false, readyRequested: true, deep: false, shadow: false, ...pr },
+  live: { isDraft: false, ...live },
+  settings,
+});
+const undoCalls = (ghCalls) => ghCalls.filter(args => args[1] === 'ready' && args.includes('--undo'));
+
+test('new commits on a ready PR put it back to draft, once, and say why on the PR', async t => {
+  const live = { headRefOid: SHA_B };
+  const { ghCalls, stored, pass } = await contractWatch(t, { headSha: SHA_A, readySha: SHA_A, approvedNotifiedSha: SHA_A, reviews: [approved('review1', SHA_A), approved('security', SHA_A)] }, { live });
+  assert.equal(undoCalls(ghCalls).length, 1);
+  const pr = await stored();
+  assert.equal(pr.isDraft, true);
+  assert.equal(pr.readyRequested, false);
+  assert.equal(pr.readySha, null);
+  assert.equal(pr.approvedNotifiedSha, null);
+  assert.ok(ghCalls.some(args => args[1] === 'comment'));
+  live.isDraft = true;
+  await pass();
+  assert.equal(undoCalls(ghCalls).length, 1, 'not repeated');
+});
+
+test('a requested change or a QA failure on the same commit also puts it back to draft', async t => {
+  const changes = await contractWatch(t, { headSha: SHA_A, readySha: SHA_A, reviews: [approved('review1', SHA_A), approved('security', SHA_A, 'changes')] }, { live: { headRefOid: SHA_A } });
+  assert.equal(undoCalls(changes.ghCalls).length, 1);
+  const failed = await contractWatch(t, { headSha: SHA_A, readySha: SHA_A, reviews: [approved('review1', SHA_A), approved('security', SHA_A)] }, { qa: { verdict: 'fail', threadId: 'thr_qa', sha: SHA_A, at: '' }, live: { headRefOid: SHA_A } });
+  assert.equal(undoCalls(failed.ghCalls).length, 1);
+});
+
+test('the final scan re-review, a hand-marked PR, a good PR and the contract being off all stay ready', async t => {
+  const pending = await contractWatch(t, { headSha: SHA_A, readySha: SHA_A, reviews: [approved('review1', SHA_A), approved('security', SHA_A), approved('security', SHA_A, 'pending')] }, { live: { headRefOid: SHA_A } });
+  assert.equal(undoCalls(pending.ghCalls).length, 0, 'pending on the same commit');
+  const hand = await contractWatch(t, { headSha: SHA_B, readyRequested: false, reviews: [approved('review1', SHA_A), approved('security', SHA_A)] }, { live: { headRefOid: SHA_B } });
+  assert.equal(undoCalls(hand.ghCalls).length, 0, 'marked ready by a person');
+  const good = await contractWatch(t, { headSha: SHA_A, readySha: SHA_A, reviews: [approved('review1', SHA_A), approved('security', SHA_A)] }, { live: { headRefOid: SHA_A } });
+  assert.equal(undoCalls(good.ghCalls).length, 0, 'still good');
+  const off = await contractWatch(t, { headSha: SHA_A, readySha: SHA_A, reviews: [approved('review1', SHA_A), approved('security', SHA_A)] }, { initial: { evidenceContract: false }, live: { headRefOid: SHA_B } });
+  assert.equal(undoCalls(off.ghCalls).length, 0, 'contract off');
+});
+
+test('a PR put back to draft is marked ready again once it qualifies', async t => {
+  const live = { headRefOid: SHA_A, isDraft: true };
+  const { ghCalls, stored } = await contractWatch(t, { headSha: SHA_A, isDraft: true, readyRequested: false, readySha: null, reviews: [approved('review1', SHA_A), approved('security', SHA_A)] }, { live });
+  assert.ok(ghCalls.some(args => args[1] === 'ready' && !args.includes('--undo')));
+  const pr = await stored();
+  assert.equal(pr.readyRequested, true);
+  assert.equal(pr.readySha, SHA_A);
+});
+
+test('if the undo fails, the PR stays as it was and it is tried again', async t => {
+  let failing = true;
+  const undo = [];
+  const { bb, harness } = await fixture(t, false, { repo: 'owner/repo', evidenceContract: true, qaResults: { 'TEST-1': { verdict: 'fail', threadId: 'thr_qa', sha: SHA_A, at: '' } }, agents: [builderAgent, leadAgent], prs: [prRecord({ isDraft: false, readyRequested: true, readySha: SHA_A, reviews: [approved('review1', SHA_A), approved('security', SHA_A)] })] }, {
+    threads: { list: threadList },
+    hostRpc: async ({ input }) => {
+      if (input.args[1] === 'list') return { code: 0, stderr: '', stdout: ghList([{ headRefOid: SHA_A, isDraft: !failing && undo.length > 1 }]) };
+      if (input.args.includes('--undo')) { undo.push(input.args); return failing ? { code: 1, stdout: '', stderr: 'HTTP 502' } : { code: 0, stdout: '', stderr: '' }; }
+      return { code: 0, stdout: '', stderr: '' };
+    },
+  });
+  await harness.behavior.setSettings({ prReviews: true });
+  await runPasses(harness, 2);
+  assert.ok(undo.length >= 1);
+  assert.equal((await readPrs(bb))[0].readyRequested, true, 'unchanged');
+  failing = false;
+  await runPasses(harness, 2);
+  assert.equal((await readPrs(bb))[0].isDraft, true);
+});
+
+const scanStart = (result) => (_url, init) => (init?.method === 'POST' ? result : new Response('', { status: 503 }));
+
+test('the ready comment only claims a final scan that is really running', async t => {
+  const draft = { number: 7, headSha: SHA_A, isDraft: true, deep: false, shadow: false, reviews: [approved('review1', SHA_A), approved('security', SHA_A)] };
+  const bodies = async (over, settings) => {
+    const stdin = [];
+    const result = await watchOnceWithStdin(t, over, settings, stdin);
+    return { stdin, result };
+  };
+  const mock = t.mock.method(globalThis, 'fetch', scanStart(new Response('{"scan_id":"s"}', { status: 200 })));
+  const running = await bodies(draft, { rafterApiKey: 'k' });
+  assert.ok(running.stdin.some(body => /a final Rafter scan is running/.test(body)));
+  mock.mock.mockImplementation(async () => new Response('over quota', { status: 429 }));
+  const quota = await bodies(draft, { rafterApiKey: 'k' });
+  assert.ok(quota.stdin.some(body => /the final Rafter scan failed/.test(body)));
+  assert.ok(!quota.stdin.some(body => /scan is running/.test(body)));
+  assert.ok(quota.result.messages.some(message => /Tell the person it's ready/.test(message.input[0].text)), 'with no scan running, the Lead can act');
+  const none = await bodies(draft, {});
+  assert.ok(!none.stdin.some(body => /Rafter/.test(body)));
+});
+
+async function watchOnceWithStdin(t, pr, settings, stdin) {
+  const result = await fixture(t, false, { repo: 'owner/repo', prs: [{ url: 'https://example.org/7', taskKey: 'TEST-1', branch: 'build', state: 'open', readyRequested: false, openedAt: '', scans: [], ...pr }] }, {
+    threads: { list: threadList },
+    hostRpc: async ({ input }) => {
+      if (input.args[1] === 'comment') stdin.push(input.stdin ?? '');
+      if (input.args[1] === 'list') return { code: 0, stderr: '', stdout: ghList([{ headRefOid: pr.headSha }]) };
+      return { code: 0, stdout: '', stderr: '' };
+    },
+  });
+  await result.harness.behavior.setSettings({ prReviews: true, ...settings });
+  await runPasses(result.harness);
+  return result;
+}
+
+const doctorFixture = async (t, initial, overrides = {}, settings = {}) => {
+  const result = await fixture(t, false, initial, {
+    projectPath: '/repo/test',
+    tasksRpc: async ({ method }) => (method === 'listTasks' ? { tasks: [] } : undefined),
+    hostRpc: async () => ({ exists: true, isGitRepo: true, commitCount: 3, sourceDirs: [], detectedMode: 'brownfield', files: { agentsMd: 'a', constitution: 'c', specs: 's', roadmap: 'r' }, existingDocs: [] }),
+    ...overrides,
+  });
+  await result.harness.behavior.setSettings(settings);
+  return (await result.harness.behavior.callRpc('factory_doctor', { prefix: 'TEST' })).recommendedActions;
+};
+const scan = (status, startedAt, error = null) => ({ phase: 'open', sha: SHA_A, scanId: null, status, startedAt, error });
+
+test('doctor warns about a project with no GitHub remote, and says how to fix it', async t => {
+  const missing = await doctorFixture(t, {}, { gitRemoteUrl: null });
+  const action = missing.find(entry => entry.id === 'no-github-remote');
+  assert.equal(action.tone, 'warn');
+  assert.match(action.command, /bb project source update proj_test <source-id> --path \/repo\/test/);
+  const other = await doctorFixture(t, {}, { gitRemoteUrl: 'https://gitlab.com/owner/repo.git' });
+  assert.ok(other.some(entry => entry.id === 'no-github-remote'), 'a non-GitHub remote can not be tracked either');
+  assert.ok(!(await doctorFixture(t, {})).some(entry => entry.id === 'no-github-remote'));
+});
+
+test('doctor warns about Rafter quota only while the latest scan is failing for it', async t => {
+  const quota = 'Rafter scan quota is used up for this billing period';
+  const prs = (...scans) => ({ prs: [prRecord({ scans })] });
+  const warned = await doctorFixture(t, prs(scan('completed', '2026-11-01T00:00:00Z'), scan('failed', '2026-11-02T00:00:00Z', quota)), {}, { rafterApiKey: 'k' });
+  assert.equal(warned.find(entry => entry.id === 'rafter-quota').command, 'bb factory rafter check');
+  const recovered = await doctorFixture(t, prs(scan('failed', '2026-11-01T00:00:00Z', quota), scan('completed', '2026-11-02T00:00:00Z')), {}, { rafterApiKey: 'k' });
+  assert.ok(!recovered.some(entry => entry.id === 'rafter-quota'), 'clears itself');
+  const noKey = await doctorFixture(t, prs(scan('failed', '2026-11-02T00:00:00Z', quota)), {}, {});
+  assert.ok(!noKey.some(entry => entry.id === 'rafter-quota'), 'scans were turned off');
+  const otherError = await doctorFixture(t, prs(scan('failed', '2026-11-02T00:00:00Z', 'HTTP 500')), {}, { rafterApiKey: 'k' });
+  assert.ok(!otherError.some(entry => entry.id === 'rafter-quota'));
 });
 

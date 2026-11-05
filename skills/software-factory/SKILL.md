@@ -94,6 +94,8 @@ pass `--coverage` with one line per file not yet accounted for: `reviewed <path>
 `skipped <path> -- <reason>`. A blocking finding needs a concrete failing case, and other concerns
 go under "Design notes (not blocking)". Every report ends with "Not checked:". After 3 rounds of
 requested changes the Lead involves the Planner, and after 5 it brings the PR to the person.
+If a PR the factory marked ready stops qualifying, the factory puts it back to draft and marks it
+ready again once that's resolved. Don't merge a draft or mark it ready by hand to get around this.
 
 ## Recurring review findings
 
