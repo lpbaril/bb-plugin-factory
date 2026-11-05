@@ -3792,3 +3792,30 @@ test('a Builder may merge the base branch into its own branch, and still never f
   }
   assert.ok(reminder.length < 4096);
 });
+
+// ----- A fresh Builder for a task with an open PR -----
+
+test('a Builder assigned to a task with an open PR continues in that PR\'s worktree', async t => {
+  const { harness, spawns } = await contractFixture(t, { initial: { agents: [builderAgent, leadAgent] } });
+  const assigned = await harness.behavior.runCli(['assign', 'TEST-1', '--role', 'build']);
+  assert.equal(assigned.exitCode, 0, JSON.stringify(assigned));
+  const spawn = spawns.at(-1);
+  assert.deepEqual(spawn.environment, { type: 'reuse', environmentId: 'env_builder' });
+  assert.match(spawn.prompt, /PR #7 is already open for TEST-1, on this worktree's branch \(`build`\)\. You're continuing it/);
+});
+
+test('without an open PR, a Builder gets a new worktree as before', async t => {
+  const closed = await contractFixture(t, { initial: { agents: [builderAgent, leadAgent], prs: [prRecord({ state: 'merged' })] } });
+  assert.equal((await closed.harness.behavior.runCli(['assign', 'TEST-1', '--role', 'build'])).exitCode, 0);
+  const spawn = closed.spawns.at(-1);
+  assert.equal(spawn.environment.type, 'host');
+  assert.equal(spawn.environment.workspace.type, 'managed-worktree');
+  assert.doesNotMatch(spawn.prompt, /already open/);
+});
+
+test('if the PR\'s worktree is gone, a Builder gets a new worktree rather than failing', async t => {
+  const { harness, spawns } = await contractFixture(t, { initial: { agents: [leadAgent] } });
+  assert.equal((await harness.behavior.runCli(['assign', 'TEST-1', '--role', 'build'])).exitCode, 0);
+  assert.equal(spawns.at(-1).environment.type, 'host');
+  assert.doesNotMatch(spawns.at(-1).prompt, /already open/);
+});
