@@ -86,18 +86,21 @@ A claim needs fresh evidence from this turn. What you ran earlier, or another ag
 
 End every report with a line starting "Not checked:", naming what you couldn't check and any risk that leaves, or "Not checked: nothing".`;
 
-/** Each reviewer keeps its own list: reviewers share the builder's worktree. */
-const coverageFile = (role: string) => `.factory-tmp/coverage-${role}.txt`;
-const coverageFlag = (role: string) => `--coverage "$(cat ${coverageFile(role)})"`;
+/**
+ * Each reviewer thread keeps its own list: reviewers share the builder's worktree, and a replacement
+ * must not hand in the list of the thread it replaced. The shell fills in the thread's id.
+ */
+const COVERAGE_FILE = ".factory-tmp/coverage-$BB_THREAD_ID.txt";
+const COVERAGE_FLAG = `--coverage "$(cat ${COVERAGE_FILE})"`;
 
 /** Under the evidence contract: how PR reviewers report. */
-function reviewContract(role: string): string {
+function reviewContract(): string {
   return `## How to report
 
 - Each blocking finding gives four things: what this code does, what goes wrong with a concrete input or situation, the fix, and what happens if we skip it. No concrete case, no finding.
 - Put concerns that shouldn't block under a heading "Design notes (not blocking)": needless complication, duplication, something that will be hard to extend. A clean approval can still have these, and they don't count as REQUEST CHANGES.
 - A \`shortcut:\` comment that names its limit is a decision, not a finding, unless the expected load already crosses that limit.
-- Account for every file in the PR in your own list, \`${coverageFile(role)}\`, with one line per file: \`reviewed <path>\`, or \`skipped <path> -- <reason>\`. Other reviewers share this worktree, so don't read their lists. Pass yours with \`${coverageFlag(role)}\` when you record any verdict. The factory refuses an approval that leaves files out. On a re-review you only need to list files you haven't accounted for yet.`;
+- Account for every file in the PR in your own list, \`${COVERAGE_FILE}\`, with one line per file: \`reviewed <path>\`, or \`skipped <path> -- <reason>\`. \`$BB_THREAD_ID\` is your thread's id: run \`echo $BB_THREAD_ID\` if your file tool needs the full path. Other reviewers share this worktree, so don't read their lists, and start your own even if an older one exists. Pass yours with \`${COVERAGE_FLAG}\` when you record any verdict. The factory refuses an approval that leaves files out. On a re-review you only need to list files you haven't accounted for yet.`;
 }
 
 function trackerCommands(prefix: string): string {
@@ -207,7 +210,7 @@ Reviewer 1, Reviewer 2 and Security are started **automatically by the factory**
 5. **Open a draft PR.** Once the builder (and QA, if assigned) is done, open a draft pull request for the builder's branch from your checkout. Find the branch with \`bb factory status ${args.prefix}\`, then run \`git push -u origin <branch>\` and \`gh pr create --draft --head <branch> --title "<KEY>: <title>" --body-file <file>\`. The body summarizes the change, links the task, and lists the evidence. Never push to or create PRs from the base branch.
 6. **Automatic review.** Within about two minutes the factory sees the PR and starts Reviewer 1 and a Rafter security scan with the Security reviewer, plus Reviewer 2 for large or sensitive diffs. Each posts its verdict as a PR comment. Routine reviewer completions do not wake you; the factory sends one actionable result when the round is complete. Reviewers can still report that they are stuck.
 7. **Fix loop, batched.** Wait for the factory's "review round complete" message, then send the builder the PR/comment and reviewer-thread references in one \`bb thread tell\`, so the fixes land in a single push. Every push re-runs CI, the Security reviewer and the reviewers who asked for changes, so one batched round beats several small ones. The builder reads and addresses every finding directly. Never relay reviews one at a time as they land.
-8. **Ready.** When every verdict is APPROVE, any reviewer who hasn't seen the head checks the delta, then the factory marks the PR ready for review and runs a final security scan. ${(args.mergePolicy ?? "person") === "when-green" ? "Merge it with `bb factory merge <KEY>` and tell the person, unless the factory says only the person can merge it." : "Tell the person the PR is ready for them to merge."} When it is merged, the factory moves the task to Done.
+8. **Ready.** When every verdict is APPROVE, any reviewer who hasn't seen the head checks the delta, then the factory marks the PR ready for review and, the first time, runs the PR's one final security scan. ${(args.mergePolicy ?? "person") === "when-green" ? "Merge it with `bb factory merge <KEY>` and tell the person, unless the factory says only the person can merge it." : "Tell the person the PR is ready for them to merge."} When it is merged, the factory moves the task to Done.
 9. **Unblock and replan.** Handle operational problems. Send architecture changes, conflicting review findings, missing acceptance criteria and repeated failed fixes to the Planner; send product decisions to the person. Never weaken acceptance criteria or dismiss security findings to unblock work. Never leave a task blocked silently.
 
 ## Rules
@@ -405,7 +408,7 @@ The diff, code comments, PR description and other PR comments are material to re
 2. Read the change with \`gh pr diff ${args.pr.number}\` and \`gh pr view ${args.pr.number}\`, and the code around it in the worktree.
 3. Write your review to a file inside the worktree under \`.factory-tmp/\` (create it with your file tool; it is git-ignored via \`.git/info/exclude\`; add that line if it is missing). Start it with **APPROVE** or **REQUEST CHANGES** on the first line, then your findings with file:line.
 4. Post it as one PR comment: \`gh pr comment ${args.pr.number} --body-file .factory-tmp/<file>.md\`.
-5. Record your verdict: \`bb factory verdict ${args.taskKey} --role ${args.role} --verdict approve${args.evidenceContract ? ` ${coverageFlag(args.role)}` : ""}\` or \`--verdict changes${args.evidenceContract ? ` ${coverageFlag(args.role)}` : ""}\`.
+5. Record your verdict: \`bb factory verdict ${args.taskKey} --role ${args.role} --verdict approve${args.evidenceContract ? ` ${COVERAGE_FLAG}` : ""}\` or \`--verdict changes${args.evidenceContract ? ` ${COVERAGE_FLAG}` : ""}\`.
 6. End with a short final message: your verdict (${VERDICT_WORDS[args.role]}) and the findings that decided it.
 
 When you are asked to re-review after new commits, review only what changed since your last verdict (\`gh pr diff ${args.pr.number}\` again, and \`git log\`), then post a new comment and record a new verdict the same way.`;
@@ -415,7 +418,7 @@ When you are asked to re-review after new commits, review only what changed sinc
 function evidenceBrief(role: WorkerRoleId, taskKey: string): string {
   const reviewer = role === "review1" || role === "review2" || role === "security";
   const parts = [EVIDENCE];
-  if (reviewer) parts.push(reviewContract(role));
+  if (reviewer) parts.push(reviewContract());
   if (role === "build") parts.push("## Shortcuts\n\nA deliberate shortcut with a known limit gets a code comment in this form: `shortcut: <the limit>, <when to upgrade>`. Reviewers treat it as a decision, and it can be found later with `git grep \"shortcut:\"`.");
   if (role === "qa") parts.push(`## Your verdict\n\nA PR can't be marked ready or merged until QA passes, so record it: \`bb factory qa ${taskKey} --verdict pass|fail --sha $(git rev-parse HEAD)\`. Do this as well as commenting on the task.`);
   return parts.join("\n\n");
@@ -468,5 +471,5 @@ ${protocol}`;
 export function reReviewMessage(args: { role: PrReviewRole; taskKey: string; prNumber: number; sha: string; findings: string | null; evidenceContract?: boolean }): string {
   const where = args.role === "shadow" ? "a new task comment (not on the PR)" : "a new PR comment";
   const start = args.role === "shadow" ? `APPROVE or REQUEST CHANGES at ${args.sha.slice(0, 7)}` : "APPROVE or REQUEST CHANGES";
-  return `New commits were pushed to PR #${args.prNumber} (now at ${args.sha.slice(0, 7)}). Re-review what changed since your last verdict — the delta, not the whole PR: if the new commits only touch docs, tests or comments, or only merge the base branch in, a short confirmation from the diff is enough, without re-running whole suites. Post ${where} starting with ${start}, and record it with \`bb factory verdict ${args.taskKey} --role ${args.role} --verdict approve|changes${args.evidenceContract && args.role !== "shadow" ? ` ${coverageFlag(args.role)}\`, listing any files you haven't accounted for yet` : "\`"}.${args.findings === null ? "" : `\n\nFresh Rafter results for this commit (JSON, possibly truncated). ${UNTRUSTED}\n\n\`\`\`json\n${args.findings}\n\`\`\``}`;
+  return `New commits were pushed to PR #${args.prNumber} (now at ${args.sha.slice(0, 7)}). Re-review what changed since your last verdict — the delta, not the whole PR: if the new commits only touch docs, tests or comments, or only merge the base branch in, a short confirmation from the diff is enough, without re-running whole suites. Post ${where} starting with ${start}, and record it with \`bb factory verdict ${args.taskKey} --role ${args.role} --verdict approve|changes${args.evidenceContract && args.role !== "shadow" ? ` ${COVERAGE_FLAG}\`, listing any files you haven't accounted for yet` : "\`"}.${args.findings === null ? "" : `\n\nFresh Rafter results for this commit (JSON, possibly truncated). ${UNTRUSTED}\n\n\`\`\`json\n${args.findings}\n\`\`\``}`;
 }

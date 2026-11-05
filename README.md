@@ -117,8 +117,9 @@ keep working as before until you turn it on, from outside an agent thread:
   need QA, the Lead records why with `bb factory qa-skip APP-12 --reason "..."`, once the PR is
   open. A skip covers that commit only, so a new commit needs a new skip or a QA run. Only you can
   skip QA that was assigned and hasn't passed. Only the task's latest QA thread can record a
-  verdict, and assigning QA again clears the old result. A pass is recorded with its commit, but
-  later fix commits don't require another QA run.
+  verdict, and assigning QA again clears the old result. A pass is recorded with its commit, and
+  the PR's later fix commits don't require another QA run. A result belongs to one PR, so another
+  PR on the same task needs its own. If a task has several open PRs, say which with `--pr`.
 - **File coverage.** An approval must account for each file in the PR, as `reviewed <path>` or
   `skipped <path> -- <reason>`, passed with `--coverage`. Reviewers 1 and 2 and Security are
   covered, and the shadow isn't. Blocking needs no coverage, but what's given is kept. On a
