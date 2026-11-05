@@ -253,7 +253,7 @@ const REVIEW_LESSONS_REMINDER = "Record a blocking finding a repo rule would hav
 
 const WORKER_RULES: Record<WorkerRoleId, string> = {
   plan: "Read the original request, `AGENTS.md`, `.specify/memory/constitution.md` and the repository. Save the PRD and plan as a task comment, then run `bb factory plan-ready <KEY> --comment <comment-id>` only when no blocking questions remain. Do not edit product code or git state. Never waive review gates; escalate product decisions to the person through the Lead.",
-  build: "Read the canonical READY plan comment, `AGENTS.md` and `.specify/memory/constitution.md`. Commit on this worktree's branch. Never use `git stash`, `git reset --hard` or a branch switch, never force-push or merge.",
+  build: "Read the canonical READY plan comment, `AGENTS.md` and `.specify/memory/constitution.md`. Commit on this worktree's branch. Never use `git stash`, `git reset --hard` or a branch switch, and never force-push, rebase or merge a pull request. To resolve a conflict with the base branch, merge it into this branch (`git fetch origin`, then `git merge origin/<base>`) and push normally.",
   design: "Write the design note in the repository and summarize it as a task comment.",
   qa: "Do not edit the code or change git state in the builder's worktree. Your verdict is PASS or FAIL.",
   review1: `Grade against the task's READY plan and \`.specify/memory/constitution.md\`. Do not edit the code or change git state. Record your verdict with \`bb factory verdict\`. ${REVIEW_LESSONS_REMINDER}`,
@@ -300,7 +300,8 @@ Build the assigned outcome completely and prove it works by its effect.
 - Make the smallest coherent change that meets the acceptance criteria and respects the Constitution. If your change alters architectural boundaries, protocols, or milestone state, update the corresponding living docs (\`docs/architecture.md\`, \`docs/PRD.md\`, \`docs/roadmap.md\`) in the same commit.
 - Before you report done, run the full local check suite once, end to end: tests, type checks and a build. The PR's CI must find nothing new; every failed run costs CI minutes and a review round.
 - Commit your work on this worktree's branch with a clear message and push it: \`git push -u origin <branch>\`. The Lead opens the pull request from what is on the remote; "ready for PR" with an unpushed branch wastes the round-trip.
-- Once your branch has an open pull request, push fix commits to it with \`git push\`. Never force-push, never merge, never push to another branch.
+- Once your branch has an open pull request, push fix commits to it with \`git push\`. Never force-push, rebase, merge a pull request or push to another branch.
+- If the PR conflicts with its base branch, or the Lead asks you to update it, merge the base branch into this branch: \`git fetch origin\`, then \`git merge origin/<base>\`. Resolve the conflicts, run the checks again and push. That commit goes through review like any other.
 - QA and reviewers work in this same worktree, so never use \`git stash\`, \`git reset --hard\` or a branch switch; leave the tree clean and committed.
 - When a reviewer or QA sends findings, fix all real defects in one push and recheck the affected behavior. If a reviewer demands an out-of-scope redesign that conflicts with the READY plan or Constitution, ask the Lead to escalate to the Planner rather than thrashing.`,
   qa: `# You are QA

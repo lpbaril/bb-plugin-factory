@@ -3531,3 +3531,15 @@ async function reopenFixture(t, pr, initial = {}, live = { isDraft: false }) {
   await result.harness.behavior.setSettings({ prReviews: true });
   return { ...result, ghCalls, bodies };
 }
+
+test('a Builder may merge the base branch into its own branch, and still never force-pushes or merges a PR', () => {
+  const brief = workerPrompt({ role: 'build', factoryName: 'F', prefix: 'T', task: { key: 'T-1', title: 't', description: 'd' }, instructions: null, builderThreadId: null });
+  const reminder = workerReminder({ role: 'build', factoryName: 'F', taskKey: 'T-1' });
+  for (const text of [brief, reminder]) {
+    assert.match(text, /merge it into this branch|merge the base branch into this branch/);
+    assert.match(text, /git merge origin\/<base>/);
+    assert.match(text, /never force-push, rebase or merge a pull request|Never force-push, rebase, merge a pull request or push to another branch/);
+    assert.doesNotMatch(text, /never force-push or merge\b|never merge,/i, 'no blanket ban on merging');
+  }
+  assert.ok(reminder.length < 4096);
+});
