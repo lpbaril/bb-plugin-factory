@@ -76,8 +76,9 @@ needed. Do not paste full plans or logs into the Lead thread, or poll active wor
 5. When every required verdict is APPROVE, reviewers who haven't seen the head
    check the delta. Once all approvals cover it, the factory marks the PR ready for
    review (which also runs full CI) and, with Rafter, runs the PR's one final scan. If
-   the PR touches files another open factory PR also touches, the Lead gets a
-   merge-train note so it can suggest an order. The factory's merge policy says who
+   the PR touches files another open factory PR also touches, the message saying
+   it's ready carries a merge-train note, in full once per pair of PRs, so the Lead
+   can suggest an order. The factory's merge policy says who
    merges: the person, or under `when-green` the Lead with `bb factory merge`, except
    large or sensitive PRs, which only the person can merge. The factory then moves
    the task to Done. A ready PR that gets new commits or a blocking verdict and is
