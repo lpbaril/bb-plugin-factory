@@ -157,6 +157,8 @@ const prSchema = z.object({
     notify: z.object({ comment: z.string().nullable(), lead: z.string() }).nullable(),
     shadow: z.boolean(),
   }).nullable().default(null),
+  /** Other PRs the Lead has had the full merge-train note about, so each pair gets it once. */
+  overlapNotified: z.array(z.number()).default([]),
   /** Touches paths the shadow reviewer covers in "sensitive" mode. */
   shadow: z.boolean().default(false),
   /** When the factory reported a shadow review that ended without a verdict. */
@@ -331,6 +333,25 @@ export function fixLoopAdvice(rounds: number): string {
 function mergeInstruction(factory: Pick<Factory, "mergePolicy">, pr: Pick<Pr, "deep" | "taskKey">): string {
   if (leadMayMerge(factory, pr)) return `Merge it with \`bb factory merge ${pr.taskKey}\` once CI is green.`;
   return `${factory.mergePolicy === "when-green" ? "It's large or sensitive, so only the person can merge it. " : ""}Tell the person it's ready for them to merge.`;
+}
+
+export type MergeOverlap = { number: number; taskKey: string; fileCount: number };
+/**
+ * For the message saying a PR is ready, so that it doesn't read as clear to merge. Each pair of PRs
+ * gets the full note once, and after that a reminder. It counts files and never names them: file
+ * names come from the repository, so they don't reach agents.
+ */
+export function mergeOverlapNote(prs: Pick<Pr, "number" | "overlapNotified">[], pr: Pick<Pr, "number" | "overlapNotified">, overlaps: MergeOverlap[]): string {
+  const told = (overlap: MergeOverlap) => pr.overlapNotified.includes(overlap.number) || prs.some((other) => other.number === overlap.number && other.overlapNotified.includes(pr.number));
+  const name = (overlap: MergeOverlap) => `PR #${overlap.number} (${overlap.taskKey})`;
+  const fresh = overlaps.filter((overlap) => !told(overlap));
+  const known = overlaps.filter(told);
+  const parts: string[] = [];
+  if (fresh.length > 0) {
+    parts.push(`Merge-train note: ${fresh.map((overlap) => `${name(overlap)} shares ${overlap.fileCount} file(s)`).join("; ")}. Merging either PR first likely conflicts the other, so suggest an order to the person, and after each merge have the other builder merge the base branch into its branch and re-check.`);
+  }
+  if (known.length > 0) parts.push(`It still shares files with ${known.map(name).join(" and ")}.`);
+  return parts.join(" ");
 }
 
 export type RosterWarning = { id: string; title: string; detail: string };
@@ -2566,6 +2587,7 @@ ${sections.join("\n\n---\n\n")}`;
         qaHoldNotifiedSha: null,
         qa: current.qaResults[taskKey] ?? null,
         draftNotice: null,
+        overlapNotified: [],
         pushFollowUp: null,
         shadow,
         shadowStallNotifiedAt: null,
@@ -2620,7 +2642,7 @@ ${sections.join("\n\n---\n\n")}`;
     }
     await tellLead(
       factory,
-      `[factory] PR #${gp.number} for ${taskKey} is picked up: Reviewer 1${deep ? ", Reviewer 2" : ""} and Security are reviewing it.${securityNote} You'll get each reviewer's result, then a round-complete message; hold the findings until then and send them to the builder in one message.`,
+      `[factory] PR #${gp.number} for ${taskKey} is picked up: Reviewer 1${deep ? ", Reviewer 2" : ""} and Security are reviewing it.${securityNote} You won't hear about each verdict. If anyone requests changes, you'll get one round-complete message once they've all reported: send those findings to the builder in one message. If they all approve, you'll hear when the PR is marked ready, or what's holding it.`,
     );
   }
 
@@ -2847,14 +2869,13 @@ ${sections.join("\n\n---\n\n")}`;
   }
 
   /**
-   * Merge-train note: when a freshly approved PR touches files another open
-   * factory PR also touches, merging either first likely conflicts the other
-   * (a merge-from-main push, a full CI run and a re-review round). Warn once,
-   * when the PR becomes ready, so the Lead can suggest an order.
+   * Other open PRs touching the same files as this freshly approved one. Merging either first likely
+   * conflicts the other (a merge-from-main push, a full CI run and a re-review round). A failed lookup
+   * reports no overlap: this is advice, and shouldn't hold up saying the PR is ready.
    */
-  async function warnMergeOverlap(factory: Factory, hostId: string, repo: string, pr: Pr): Promise<void> {
+  async function findMergeOverlaps(factory: Factory, hostId: string, repo: string, pr: Pr): Promise<MergeOverlap[]> {
     const others = factory.prs.filter((candidate) => candidate.state === "open" && candidate.number !== pr.number);
-    if (others.length === 0) return;
+    if (others.length === 0) return [];
     const filesOf = async (number: number): Promise<Set<string>> => {
       try {
         const view = JSON.parse(await gh(hostId, ["pr", "view", String(number), "--repo", repo, "--json", "files"])) as { files?: { path: string }[] };
@@ -2865,20 +2886,16 @@ ${sections.join("\n\n---\n\n")}`;
       }
     };
     const mine = await filesOf(pr.number);
-    if (mine.size === 0) return;
-    const overlaps: { number: number; taskKey: string; files: string[] }[] = [];
+    if (mine.size === 0) return [];
+    const overlaps: MergeOverlap[] = [];
     for (const other of others) {
-      const shared = [...(await filesOf(other.number))].filter((path) => mine.has(path)).sort();
-      if (shared.length > 0) overlaps.push({ number: other.number, taskKey: other.taskKey, files: shared });
+      const fileCount = [...(await filesOf(other.number))].filter((path) => mine.has(path)).length;
+      if (fileCount > 0) overlaps.push({ number: other.number, taskKey: other.taskKey, fileCount });
     }
-    if (overlaps.length === 0) return;
-    const details = overlaps
-      .map(({ number, taskKey, files }) => `PR #${number} (${taskKey}) shares ${files.length} file(s)`)
-      .join("; ");
-    await tellLead(
-      factory,
-      `[factory] Merge-train note for PR #${pr.number} (${pr.taskKey}): ${details}. Merging either PR first likely conflicts the other; suggest an order to the person, and after each merge have the other builder merge the base branch into its branch and re-check.`,
-    );
+    return overlaps;
+  }
+  function markOverlapsNotified(target: Pr, overlaps: MergeOverlap[]): void {
+    target.overlapNotified = [...new Set([...target.overlapNotified, ...overlaps.map((overlap) => overlap.number)])];
   }
 
   /**
@@ -2948,7 +2965,9 @@ ${sections.join("\n\n---\n\n")}`;
       : finalScan.sha === pr.headSha ? (finalScan.status === "failed" ? "; the final Rafter scan failed, so this commit has no final scan" : "")
       : finalScan.status === "failed" ? `; this PR's one final Rafter scan failed at \`${finalScan.sha.slice(0, 7)}\`, so this commit has no final scan`
       : `; this PR's one final Rafter scan ran at \`${finalScan.sha.slice(0, 7)}\`, so this commit wasn't scanned`;
-    await prComment(hostId, repo, pr.number, `**Factory:** every reviewer approves \`${pr.headSha.slice(0, 7)}\` (${labels}). Marked ready for review${scanNote}. ${leadMayMerge(factory, pr) ? "The Lead may merge once its gates pass." : "Merging is up to you."}`);
+    const overlaps = await findMergeOverlaps(factory, hostId, repo, pr);
+    const overlapComment = overlaps.length === 0 ? "" : ` It shares files with ${overlaps.map((overlap) => `#${overlap.number}`).join(" and ")}, so merging either first likely conflicts the other.`;
+    await prComment(hostId, repo, pr.number, `**Factory:** every reviewer approves \`${pr.headSha.slice(0, 7)}\` (${labels}). Marked ready for review${scanNote}. ${leadMayMerge(factory, pr) ? "The Lead may merge once its gates pass." : "Merging is up to you."}${overlapComment}`);
     const task = await getTaskByKey(pr.taskKey);
     await comment(task.id, `[PR #${pr.number}](${pr.url}) approved by ${labels} and marked ready for review.`);
     // If anything here fails, the PR is already ready, so maybeAnnounceReapproval delivers this on a
@@ -2958,10 +2977,12 @@ ${sections.join("\n\n---\n\n")}`;
     await deliverThenMark(
       factory,
       pr.number,
-      `[factory] PR #${pr.number} (${pr.taskKey}) has every approval and is marked ready for review. ${scanning ? "A final security scan is running; you'll hear again when the PR can merge." : mergeInstruction(factory, pr)}`,
-      (target) => { if (!scanning) target.approvedNotifiedSha = pr.headSha; },
+      [`[factory] PR #${pr.number} (${pr.taskKey}) has every approval and is marked ready for review.`, mergeOverlapNote(factory.prs, pr, overlaps), scanning ? "A final security scan is running; you'll hear again when the PR can merge." : mergeInstruction(factory, pr)].filter((part) => part !== "").join(" "),
+      (target) => {
+        if (!scanning) target.approvedNotifiedSha = pr.headSha;
+        markOverlapsNotified(target, overlaps);
+      },
     );
-    await warnMergeOverlap(factory, hostId, repo, pr);
   }
 
   /** Say why a PR went back to draft. Each message is cleared once sent, so a failure retries only what's left. */
@@ -3003,13 +3024,15 @@ ${sections.join("\n\n---\n\n")}`;
     // A shadow that hasn't answered is waiting, not blocking, so it's only a reason on a new commit.
     const shadowBlocked = shadowBlocks && latestReview(pr, "shadow")?.verdict === "changes";
     const newCommitsWaiting = pr.readySha !== pr.headSha && (shadowHolds(pr, shadowBlocks, shadowMode) || !approvalsCover(pr, pr.headSha));
-    const reason =
-      requiredReviewRoles(pr).some((role) => latestReview(pr, role)?.verdict === "changes") ? "a reviewer requested changes"
-      : qa !== null ? qa
-      : shadowBlocked ? "the shadow reviewer's block is open"
-      : newCommitsWaiting ? "new commits need review"
+    // The next step goes with the reason, so someone reading only the PR knows what happens now.
+    const hold =
+      requiredReviewRoles(pr).some((role) => latestReview(pr, role)?.verdict === "changes") ? { reason: "a reviewer requested changes", next: "The builder fixes what was requested, and the reviewers check it again." }
+      : qa !== null ? { reason: qa, next: qaNextStep(factory, pr) }
+      : shadowBlocked ? { reason: "the shadow reviewer's block is open", next: `The builder fixes what the shadow reviewer found, or the owner dismisses it from task ${pr.taskKey} on the Factory page.` }
+      : newCommitsWaiting ? { reason: "new commits need review", next: "The factory asks the reviewers to check them, so nobody needs to do anything yet." }
       : null;
-    if (reason === null) return false;
+    if (hold === null) return false;
+    const { reason, next } = hold;
     await gh(hostId, ["pr", "ready", String(pr.number), "--repo", repo, "--undo"]);
     await mutateFactory(factory.prefix, (current) => {
       const target = current.prs.find((candidate) => candidate.number === pr.number);
@@ -3019,8 +3042,8 @@ ${sections.join("\n\n---\n\n")}`;
       target.readySha = null;
       target.approvedNotifiedSha = null;
       target.draftNotice = {
-        pr: `**Factory:** put back to draft at \`${pr.headSha.slice(0, 7)}\`: ${reason}. It will be marked ready again once that's resolved, so don't merge it until then.`,
-        task: `[PR #${pr.number}](${pr.url}) put back to draft at \`${pr.headSha.slice(0, 7)}\`: ${reason}.`,
+        pr: `**Factory:** put back to draft at \`${pr.headSha.slice(0, 7)}\`: ${reason}. Next: ${next} It will be marked ready again once that's resolved, so don't merge it until then.`,
+        task: `[PR #${pr.number}](${pr.url}) put back to draft at \`${pr.headSha.slice(0, 7)}\`: ${reason}. Next: ${next}`,
       };
     });
     await deliverDraftNotice(factory.prefix, hostId, repo, pr.number);
@@ -3032,7 +3055,7 @@ ${sections.join("\n\n---\n\n")}`;
    * blocking verdict and is approved again has no other way to reach the Lead or the person. A pending
    * verdict changes nothing: the final scan's re-review of an announced commit isn't news.
    */
-  async function maybeAnnounceReapproval(factory: Factory, pr: Pr): Promise<void> {
+  async function maybeAnnounceReapproval(factory: Factory, hostId: string, repo: string, pr: Pr): Promise<void> {
     if (pr.isDraft) return;
     // A running scan decides nothing yet. If it finds something, Security's verdict will say so.
     if (pr.scans.some((scan) => scan.status === "running")) return;
@@ -3048,8 +3071,11 @@ ${sections.join("\n\n---\n\n")}`;
       return;
     }
     if (!approvalsCover(pr, pr.headSha) || (await reportQaHold(factory, pr)) || pr.approvedNotifiedSha === pr.headSha) return;
-    const delivered = await deliverThenMark(factory, pr.number, `[factory] PR #${pr.number} (${pr.taskKey}) has every approval on its latest commit \`${pr.headSha.slice(0, 7)}\`. ${mergeInstruction(factory, pr)}`, (target) => {
+    const overlaps = await findMergeOverlaps(factory, hostId, repo, pr);
+    const announcement = [`[factory] PR #${pr.number} (${pr.taskKey}) has every approval on its latest commit \`${pr.headSha.slice(0, 7)}\`.`, mergeOverlapNote(factory.prs, pr, overlaps), mergeInstruction(factory, pr)].filter((part) => part !== "").join(" ");
+    const delivered = await deliverThenMark(factory, pr.number, announcement, (target) => {
       target.approvedNotifiedSha = pr.headSha;
+      markOverlapsNotified(target, overlaps);
     });
     if (!delivered) return;
     const task = await getTaskByKey(pr.taskKey);
@@ -3190,7 +3216,7 @@ ${sections.join("\n\n---\n\n")}`;
         await refreshStaleVerdicts(factory, pr);
         await maybeReportRound(factory, pr.number);
         if (await maybeReturnToDraft(factory, hostId, repo, pr)) return;
-        await maybeAnnounceReapproval(factory, pr);
+        await maybeAnnounceReapproval(factory, hostId, repo, pr);
         await maybeMarkReady(factory, hostId, repo, pr);
       });
     }

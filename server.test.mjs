@@ -10,7 +10,7 @@ registerHooks({ resolve(specifier, context, next) {
   }
   return next(specifier, context);
 } });
-const { default: plugin, supervisorAction, turnsFromEvents, creditUsage, mergeBlockers, leadMayMerge, rosterWarnings, computeHealth, qaHold, qaNextStep, parseCoverage, changeRounds, fixLoopAdvice } = await import('./server.ts');
+const { default: plugin, supervisorAction, turnsFromEvents, creditUsage, mergeBlockers, mergeOverlapNote, leadMayMerge, rosterWarnings, computeHealth, qaHold, qaNextStep, parseCoverage, changeRounds, fixLoopAdvice } = await import('./server.ts');
 const { leadCharter, leadPrompt, reReviewMessage, workerPrompt, workerReminder } = await import('./roles.ts');
 const { createFactoryStorage } = await import('./factory-storage.ts');
 
@@ -2747,4 +2747,150 @@ test('an owed notice that keeps failing does not stop the PR being marked ready,
   const pr = (await readPrs(bb))[0];
   assert.equal(pr.readyRequested, true);
   assert.equal(pr.draftNotice, null, 'its "don\'t merge" would be out of date');
+});
+
+// ----- Messages the SAND-10 Lead found confusing -----
+
+test('the pickup message promises what actually arrives', async t => {
+  const { messages } = await watchOnce(t, {
+    initial: { prs: [], agents: [{ threadId: 'thr_builder', role: 'build', taskKey: 'TEST-1', providerId: 'codex', createdAt: '', pr: null }] },
+    pr: {},
+    live: {},
+  });
+  const pickup = messages.find(message => /is picked up/.test(message.input[0].text));
+  assert.ok(pickup, messages.map(message => message.input[0].text).join('\n'));
+  const text = pickup.input[0].text;
+  assert.doesNotMatch(text, /You'll get each reviewer's result/);
+  assert.match(text, /You won't hear about each verdict/);
+  assert.match(text, /one round-complete message/);
+  assert.match(text, /If they all approve, you'll hear when the PR is marked ready, or what's holding it/);
+});
+
+const overlapPrs = (seven = {}, eight = {}) => [
+  { url: 'u7', taskKey: 'TEST-1', branch: 'build', state: 'open', readyRequested: false, openedAt: '', scans: [], number: 7, headSha: SHA_A, isDraft: true, deep: false, shadow: false, reviews: bothApprove(SHA_A), ...seven },
+  { url: 'u8', taskKey: 'TEST-2', branch: 'other', state: 'open', readyRequested: false, openedAt: '', scans: [], number: 8, headSha: SHA_B, isDraft: true, deep: false, shadow: false, reviews: [], ...eight },
+];
+const textsOf = (messages) => messages.map(message => message.input[0].text);
+
+test('the ready message carries the overlap, before the instruction, and nothing comes separately', async t => {
+  const { messages, stored } = await watchOnce(t, { initial: { prs: overlapPrs() }, pr: {}, live: { headRefOid: SHA_A } });
+  const ready = textsOf(messages).filter(text => /marked ready for review/.test(text));
+  assert.equal(ready.length, 1);
+  assert.match(ready[0], /PR #8 \(TEST-2\) shares 1 file\(s\)/);
+  assert.ok(ready[0].indexOf('Merge-train note') < ready[0].indexOf("Tell the person it's ready"), 'read before the instruction');
+  assert.equal(textsOf(messages).filter(text => /Merge-train note/.test(text)).length, 1, 'not a second message');
+  assert.deepEqual((await stored()).overlapNotified, [8]);
+});
+
+test('with no overlap, the ready message is as it was', async t => {
+  const { messages } = await watchOnce(t, { pr: { number: 7, headSha: SHA_A, isDraft: true, deep: false, shadow: false, reviews: bothApprove(SHA_A) }, live: { headRefOid: SHA_A } });
+  const ready = textsOf(messages).find(text => /marked ready for review/.test(text));
+  assert.match(ready, /marked ready for review\. Tell the person/);
+  assert.doesNotMatch(ready, /Merge-train|shares files/);
+});
+
+test('each pair of PRs gets the full note once, then a reminder, from either side', async t => {
+  const again = await watchOnce(t, { initial: { prs: overlapPrs({ overlapNotified: [8] }) }, pr: {}, live: { headRefOid: SHA_A } });
+  const second = textsOf(again.messages).find(text => /marked ready for review/.test(text));
+  assert.match(second, /It still shares files with PR #8 \(TEST-2\)\./);
+  assert.doesNotMatch(second, /Merge-train note/);
+  const otherSide = await watchOnce(t, { initial: { prs: overlapPrs({}, { overlapNotified: [7] }) }, pr: {}, live: { headRefOid: SHA_A } });
+  const fromThere = textsOf(otherSide.messages).find(text => /marked ready for review/.test(text));
+  assert.match(fromThere, /It still shares files with PR #8/);
+  assert.doesNotMatch(fromThere, /Merge-train note/);
+});
+
+test('mergeOverlapNote gives the full note for a new pair and a reminder for a known one, together', () => {
+  const pr = { number: 7, overlapNotified: [8] };
+  const note = mergeOverlapNote([pr, { number: 8, overlapNotified: [] }, { number: 9, overlapNotified: [] }], pr, [{ number: 8, taskKey: 'T-2', fileCount: 1 }, { number: 9, taskKey: 'T-3', fileCount: 2 }]);
+  assert.match(note, /Merge-train note: PR #9 \(T-3\) shares 2 file\(s\)\./);
+  assert.match(note, /It still shares files with PR #8 \(T-2\)\./);
+  assert.equal(mergeOverlapNote([pr], pr, []), '');
+});
+
+test('an overlap note that could not be delivered still counts as owed', async t => {
+  const sends = [];
+  let failing = true;
+  const result = await fixture(t, false, { repo: 'owner/repo', prs: overlapPrs() }, {
+    threads: {
+      list: threadList,
+      send: async (args) => {
+        if (failing && /marked ready for review|every approval/.test(args.input[0].text)) throw new Error('thread is busy');
+        sends.push(args.input[0].text);
+        return {};
+      },
+    },
+    hostRpc: async ({ input }) => {
+      if (input.args[1] === 'list') return { code: 0, stderr: '', stdout: ghList([{ headRefOid: SHA_A, isDraft: !failing ? false : true }]) };
+      if (input.args[1] === 'view') return { code: 0, stderr: '', stdout: JSON.stringify({ files: [{ path: 'src/app.ts' }] }) };
+      return { code: 0, stdout: '', stderr: '' };
+    },
+  });
+  await result.harness.behavior.setSettings({ prReviews: true });
+  await runPasses(result.harness);
+  assert.deepEqual((await readPrs(result.bb))[0].overlapNotified ?? [], []);
+  failing = false;
+  await runPasses(result.harness, 2);
+  const announced = sends.filter(text => /every approval/.test(text));
+  assert.equal(announced.length, 1);
+  assert.match(announced[0], /Merge-train note: PR #8/);
+  assert.deepEqual((await readPrs(result.bb))[0].overlapNotified, [8]);
+});
+
+test('the re-approval message carries the overlap too', async t => {
+  const { messages } = await watchOnce(t, { initial: { prs: overlapPrs({ isDraft: false, readyRequested: true, approvedNotifiedSha: 'older' }) }, pr: {}, live: { headRefOid: SHA_A, isDraft: false } });
+  const announced = textsOf(messages).find(text => /every approval on its latest commit/.test(text));
+  assert.match(announced, /Merge-train note: PR #8 \(TEST-2\) shares 1 file\(s\)/);
+});
+
+test('the ready comment on the PR mentions the overlap, without file names', async t => {
+  const stdin = [];
+  const result = await fixture(t, false, { repo: 'owner/repo', prs: overlapPrs() }, {
+    threads: { list: threadList },
+    hostRpc: async ({ input }) => {
+      if (input.args[1] === 'comment') stdin.push(input.stdin ?? '');
+      if (input.args[1] === 'list') return { code: 0, stderr: '', stdout: ghList([{ headRefOid: SHA_A }]) };
+      if (input.args[1] === 'view') return { code: 0, stderr: '', stdout: JSON.stringify({ files: [{ path: 'secret-name.ts' }] }) };
+      return { code: 0, stdout: '', stderr: '' };
+    },
+  });
+  await result.harness.behavior.setSettings({ prReviews: true });
+  await runPasses(result.harness);
+  const comment = stdin.find(body => /Marked ready for review/.test(body));
+  assert.match(comment, /Merging is up to you\. It shares files with #8, so merging either first likely conflicts the other\./);
+  assert.doesNotMatch(comment, /secret-name/);
+});
+
+test('the draft comment says what happens next, for each reason', async t => {
+  const draftBody = async (pr, options = {}) => {
+    const { harness, bodies } = await watchWithBodies(t, { headSha: SHA_A, readySha: SHA_A, ...pr }, options);
+    await runPasses(harness);
+    return bodies.find(body => /put back to draft/.test(body));
+  };
+  const changes = await draftBody({ reviews: [approved('review1', SHA_A), approved('security', SHA_A, 'changes')] });
+  assert.match(changes, /a reviewer requested changes\. Next: The builder fixes what was requested/);
+
+  const qaFailed = await draftBody({ reviews: bothApprove(SHA_A) }, { qa: { verdict: 'fail', threadId: 'thr_qa', sha: SHA_A, at: '' } });
+  assert.match(qaFailed, /QA failed\. Next: Send the failure to the builder, then assign QA again with `bb factory assign TEST-1 --role qa`/);
+
+  const expired = await draftBody({ headSha: SHA_B, reviews: bothApprove(SHA_B) }, { qa: { verdict: 'skipped', threadId: 'thr_lead', sha: SHA_A, at: '' }, live: { headRefOid: SHA_B } });
+  assert.match(expired, /QA was skipped for an earlier commit\. Next: Assign QA with .*bb factory qa-skip TEST-1 --pr 7/);
+
+  const shadow = await draftBody({ reviews: [...bothApprove(SHA_A), approved('shadow', SHA_A, 'changes')] }, { settings: shadowSettings });
+  assert.match(shadow, /block is open\. Next: The builder fixes what the shadow reviewer found, or the owner dismisses it from task TEST-1/);
+
+  const commits = await draftBody({ headSha: SHA_B, reviews: bothApprove(SHA_A) }, { live: { headRefOid: SHA_B } });
+  assert.match(commits, /new commits need review\. Next: The factory asks the reviewers to check them, so nobody needs to do anything yet\./);
+});
+
+test('the task comment gives the next step too', async t => {
+  const posted = [];
+  const { harness } = await fixture(t, false, { repo: 'owner/repo', evidenceContract: true, qaResults: {}, agents: [builderAgent, leadAgent], prs: [prRecord({ isDraft: false, readyRequested: true, readySha: SHA_A, qa: { verdict: 'fail', threadId: 'thr_qa', sha: SHA_A, at: '' }, reviews: bothApprove(SHA_A) })] }, {
+    threads: { list: threadList },
+    hostRpc: async ({ input }) => (input.args[1] === 'list' ? { code: 0, stderr: '', stdout: ghList([{ isDraft: false }]) } : { code: 0, stdout: '', stderr: '' }),
+    tasksRpc: async ({ method, input }) => { if (method === 'createComment') posted.push(input.body); return undefined; },
+  });
+  await harness.behavior.setSettings({ prReviews: true });
+  await runPasses(harness);
+  assert.ok(posted.some(body => /put back to draft.*QA failed\. Next: Send the failure to the builder/.test(body)), posted.join('\n'));
 });
