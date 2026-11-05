@@ -2116,15 +2116,14 @@ export default async function plugin(bb: BbPluginApi) {
         current.plans = current.plans.filter((entry) => entry.taskKey !== task.key);
         current.plans.push({ taskKey: task.key, threadId: thread.id, commentId: null });
       }
-      // A new QA run replaces the old result, because it's assigned when that no longer stands. With
-      // several PRs open, a pass stays: the run may be for another PR, and a new verdict replaces it anyway.
-      // A closed PR's result stays as the record of what happened to it.
+      // A new QA run replaces the old results, on every open PR of the task: the gate shouldn't stay open
+      // on a pass someone is re-checking. A closed PR's result stays as the record of what happened to it.
       if (args.role === "qa") {
         delete current.qaResults[task.key];
-        const openPrs = current.prs.filter((candidate) => candidate.taskKey === task.key && candidate.state === "open");
-        for (const candidate of openPrs) {
+        for (const candidate of current.prs) {
+          if (candidate.taskKey !== task.key || candidate.state !== "open") continue;
           candidate.qaHoldNotifiedSha = null;
-          if (openPrs.length === 1 || candidate.qa?.verdict !== "pass") candidate.qa = null;
+          candidate.qa = null;
         }
       }
       current.agents.push({
