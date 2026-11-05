@@ -2184,7 +2184,8 @@ function readMergeCard(payload: unknown): MergeCardPayload | null {
     headSha: card.headSha,
     flagged: typeof card.flagged === "string" ? card.flagged : null,
     approvals: Array.isArray(card.approvals) ? card.approvals : [],
-    qa: typeof card.qa === "string" ? card.qa : null,
+    // Messages elsewhere use Markdown code marks, which this card shows as plain text.
+    qa: typeof card.qa === "string" ? card.qa.replace(/`/g, "") : null,
     ci: card.ci ?? null,
     scan: typeof card.scan === "string" ? card.scan : null,
     overlap: typeof card.overlap === "string" ? card.overlap : null,
