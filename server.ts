@@ -380,6 +380,21 @@ export function mergeOverlapNote(prs: Pick<Pr, "number" | "overlapNotified">[], 
   return parts.join(" ");
 }
 
+/**
+ * A QA pass carries through later commits, so whoever merges should see which commit it covers.
+ * `commits` is the PR's commits, oldest first, or null if they couldn't be read. Empty if QA saw the head.
+ */
+export function qaCarryNote(qa: Pick<QaResult, "verdict" | "sha"> | null | undefined, headSha: string, commits: string[] | null): string {
+  if (qa?.verdict !== "pass" || qa.sha === null || headSha.startsWith(qa.sha)) return "";
+  const sha = qa.sha;
+  const short = `\`${sha.slice(0, 7)}\``;
+  const index = commits?.findIndex((oid) => oid.startsWith(sha)) ?? -1;
+  // Not among the PR's commits, after a rebase for one, or unreadable: say what's known, not a number.
+  if (commits == null || index < 0) return `QA passed ${short}, an earlier commit, so the latest changes haven't had QA.`;
+  const later = commits.length - 1 - index;
+  return `QA passed ${short}, and ${later} later ${later === 1 ? "commit hasn't" : "commits haven't"} had QA.`;
+}
+
 export type RosterWarning = { id: string; title: string; detail: string };
 /**
  * Checks that make no claim about which model is better: can each seat run, and does anything
@@ -506,6 +521,8 @@ const prSummarySchema = z.object({
   state: z.enum(["open", "merged", "closed"]),
   checks: z.array(z.object({ role: z.enum(PR_REVIEW_ROLES), label: z.string(), verdict: z.enum(VERDICTS) })),
   scan: z.enum(["running", "completed", "failed"]).nullable(),
+  /** The commit that scan ran on, if it isn't the PR's latest. */
+  scanOlderSha: z.string().nullable().default(null),
 });
 export type PrSummary = z.infer<typeof prSummarySchema>;
 
@@ -1397,6 +1414,7 @@ export default async function plugin(bb: BbPluginApi) {
         return review === null ? [] : [{ role, label: ROLES[role].label, verdict: review.verdict }];
       }),
       scan: scan?.status ?? null,
+      scanOlderSha: scan === null || scan.sha === pr.headSha ? null : scan.sha.slice(0, 7),
     };
   }
   async function comment(taskId: string, body: string): Promise<void> {
@@ -2918,6 +2936,18 @@ ${sections.join("\n\n---\n\n")}`;
     }
     return overlaps;
   }
+  /** A failed lookup still gives a note, without the count: this shouldn't hold up saying the PR is ready. */
+  async function currentQaCarryNote(factory: Factory, hostId: string, repo: string, pr: Pr): Promise<string> {
+    if (!factory.evidenceContract || pr.qa?.verdict !== "pass" || pr.qa.sha === null || pr.headSha.startsWith(pr.qa.sha)) return "";
+    let commits: string[] | null = null;
+    try {
+      const view = JSON.parse(await gh(hostId, ["pr", "view", String(pr.number), "--repo", repo, "--json", "commits"])) as { commits?: { oid: string }[] };
+      commits = view.commits?.map((commit) => commit.oid) ?? null;
+    } catch (error) {
+      bb.log.warn(`could not list the commits of PR #${pr.number}: ${String(error)}`);
+    }
+    return qaCarryNote(pr.qa, pr.headSha, commits);
+  }
   /** From saved state, not the pass's: another PR may have been told about this pair earlier in the same pass. */
   async function currentOverlapNote(factory: Factory, pr: Pr, overlaps: MergeOverlap[]): Promise<string> {
     const { prs } = await findFactory(factory.prefix);
@@ -2988,6 +3018,7 @@ ${sections.join("\n\n---\n\n")}`;
     const labels = roles.map((role) => `${ROLES[role].label} ✓`).join(", ");
     // From what happened, not from having a key: a scan can fail to start, for one when the quota runs out.
     const finalScan = (await findFactory(factory.prefix)).prs.find((candidate) => candidate.number === pr.number)?.scans.filter((scan) => scan.phase === "ready").at(-1);
+    const scanning = finalScan?.status === "running";
     const scanNote =
       finalScan === undefined ? ""
       : finalScan.status === "running" ? "; a final Rafter scan is running"
@@ -2995,18 +3026,18 @@ ${sections.join("\n\n---\n\n")}`;
       : finalScan.status === "failed" ? `; this PR's one final Rafter scan failed at \`${finalScan.sha.slice(0, 7)}\`, so this commit has no final scan`
       : `; this PR's one final Rafter scan ran at \`${finalScan.sha.slice(0, 7)}\`, so this commit wasn't scanned`;
     const overlaps = await findMergeOverlaps(factory, hostId, repo, pr);
+    const qaNote = await currentQaCarryNote(factory, hostId, repo, pr);
     const overlapComment = overlaps.length === 0 ? "" : ` It shares files with ${overlaps.map((overlap) => `#${overlap.number}`).join(" and ")}, so merging either first likely conflicts the other.`;
-    await prComment(hostId, repo, pr.number, `**Factory:** every reviewer approves \`${pr.headSha.slice(0, 7)}\` (${labels}). Marked ready for review${scanNote}. ${leadMayMerge(factory, pr) ? "The Lead may merge once its gates pass." : "Merging is up to you."}${overlapComment}`);
+    await prComment(hostId, repo, pr.number, `**Factory:** every reviewer approves \`${pr.headSha.slice(0, 7)}\` (${labels}). Marked ready for review${scanNote}. ${leadMayMerge(factory, pr) ? "The Lead may merge once its gates pass." : scanning ? "Merging is up to you once it finishes." : "Merging is up to you."}${overlapComment}${qaNote === "" ? "" : ` ${qaNote}`}`);
     const task = await getTaskByKey(pr.taskKey);
     await comment(task.id, `[PR #${pr.number}](${pr.url}) approved by ${labels} and marked ready for review.`);
     // If anything here fails, the PR is already ready, so maybeAnnounceReapproval delivers this on a
     // later pass. The same goes for a running final scan: the PR can't merge until it clears, so the
     // merge instruction waits, and this commit doesn't count as announced yet.
-    const scanning = finalScan?.status === "running";
     await deliverThenMark(
       factory,
       pr.number,
-      [`[factory] PR #${pr.number} (${pr.taskKey}) has every approval and is marked ready for review.`, await currentOverlapNote(factory, pr, overlaps), scanning ? "A final security scan is running; you'll hear again when the PR can merge." : mergeInstruction(factory, pr)].filter((part) => part !== "").join(" "),
+      [`[factory] PR #${pr.number} (${pr.taskKey}) has every approval and is marked ready for review.`, await currentOverlapNote(factory, pr, overlaps), qaNote, scanning ? "A final security scan is running; you'll hear again when the PR can merge." : mergeInstruction(factory, pr)].filter((part) => part !== "").join(" "),
       (target) => {
         if (!scanning) target.approvedNotifiedSha = pr.headSha;
         markOverlapsNotified(target, overlaps);
@@ -3104,7 +3135,7 @@ ${sections.join("\n\n---\n\n")}`;
     }
     if (!approvalsCover(pr, pr.headSha) || (await reportQaHold(factory, pr)) || pr.approvedNotifiedSha === pr.headSha) return;
     const overlaps = await findMergeOverlaps(factory, hostId, repo, pr);
-    const announcement = [`[factory] PR #${pr.number} (${pr.taskKey}) has every approval on its latest commit \`${pr.headSha.slice(0, 7)}\`.`, await currentOverlapNote(factory, pr, overlaps), mergeInstruction(factory, pr)].filter((part) => part !== "").join(" ");
+    const announcement = [`[factory] PR #${pr.number} (${pr.taskKey}) has every approval on its latest commit \`${pr.headSha.slice(0, 7)}\`.`, await currentOverlapNote(factory, pr, overlaps), await currentQaCarryNote(factory, hostId, repo, pr), mergeInstruction(factory, pr)].filter((part) => part !== "").join(" ");
     const delivered = await deliverThenMark(factory, pr.number, announcement, (target) => {
       target.approvedNotifiedSha = pr.headSha;
       markOverlapsNotified(target, overlaps);
@@ -3282,7 +3313,8 @@ ${sections.join("\n\n---\n\n")}`;
     if (roundsReporting.has(key)) return;
     roundsReporting.add(key);
     try {
-      const target = (await findFactory(factory.prefix)).prs.find((candidate) => candidate.number === prNumber);
+      const latest = await findFactory(factory.prefix);
+      const target = latest.prs.find((candidate) => candidate.number === prNumber);
       if (target === undefined || target.state !== "open") return;
       const verdicts = requiredReviewRoles(target).map((role) => ({ role, review: latestReview(target, role) }));
       if (!verdicts.every(({ review }) => review !== null && (review.verdict === "approve" || review.verdict === "changes"))) return;
@@ -3306,10 +3338,12 @@ ${sections.join("\n\n---\n\n")}`;
       const round = `${target.headSha}|${changes.map(({ role }) => role).join(",")}`;
       if (target.roundNotifiedSha === round || target.roundNotifiedSha === target.headSha) return;
       const labels = verdicts.map(({ role, review }) => `${ROLES[role].label} ${review!.verdict === "approve" ? `APPROVE${review!.sha === target.headSha ? "" : ` at \`${review!.sha.slice(0, 7)}\``}` : `REQUEST CHANGES (thread ${review!.threadId})`}`).join(", ");
+      // The hold message only comes once every approval covers the head, so this is where the Lead hears about a QA failure.
+      const qaFailure = latest.evidenceContract && target.qa?.verdict === "fail" ? ` QA failed too. ${qaNextStep(latest, target)}` : "";
       await deliverThenMark(
         factory,
         prNumber,
-        `[factory] Review round complete on PR #${prNumber} (${target.taskKey}) at \`${target.headSha.slice(0, 7)}\`: ${labels}. Send the builder one handoff referencing this PR's REQUEST CHANGES comments and reviewer threads. It must read and address every finding directly, in one push; consult the Planner if findings conflict; each push re-runs CI, the Security reviewer and the reviewers who asked for changes.${factory.evidenceContract ? fixLoopAdvice(changeRounds(target)) : ""}`,
+        `[factory] Review round complete on PR #${prNumber} (${target.taskKey}) at \`${target.headSha.slice(0, 7)}\`: ${labels}.${qaFailure} Send the builder one handoff referencing this PR's REQUEST CHANGES comments and reviewer threads. It must read and address every finding directly, in one push; consult the Planner if findings conflict; each push re-runs CI, the Security reviewer and the reviewers who asked for changes.${factory.evidenceContract ? fixLoopAdvice(changeRounds(target)) : ""}`,
         (pr) => { pr.roundNotifiedSha = round; },
       );
     } finally {
@@ -4363,7 +4397,7 @@ ${findings}`;
               throw new PluginCliError(`QA passed on PR #${open.number}, and that carries through its later commits, so there's nothing to skip.`, { code: "qa_skip_passed" });
             }
             if (isLead && qaStarted(factory, task.key)) {
-              throw new PluginCliError(`QA was assigned on ${task.key}, so only the person can skip it.`, { code: "qa_skip_person_only" });
+              throw new PluginCliError(`${qaHold(factory, open) ?? `QA was assigned on ${task.key}`}, so only the person can skip it.`, { code: "qa_skip_person_only", hint: qaNextStep(factory, open) });
             }
             await mutateFactory(factory.prefix, (current) => {
               const target = current.prs.find((candidate) => candidate.number === open.number);
@@ -4756,7 +4790,7 @@ ${findings}`;
                 const builderBranch = factory.agents.find((agent) => agent.role === "build" && agent.taskKey === task.key);
                 if (task.pr !== null) {
                   const checks = task.pr.checks.map((check) => `${check.label} ${check.verdict}`).join(", ");
-                  lines.push(`      PR #${task.pr.number} ${task.pr.state}${task.pr.isDraft ? " draft" : ""}${checks === "" ? "" : ` · ${checks}`}${task.pr.scan === null ? "" : ` · Rafter ${task.pr.scan}`}`);
+                  lines.push(`      PR #${task.pr.number} ${task.pr.state}${task.pr.isDraft ? " draft" : ""}${checks === "" ? "" : ` · ${checks}`}${task.pr.scan === null ? "" : ` · Rafter ${task.pr.scan}${task.pr.scanOlderSha === null ? "" : ` at ${task.pr.scanOlderSha}, not the latest commit`}`}`);
                 } else if (builderBranch !== undefined && branches.get(builderBranch.threadId)) {
                   lines.push(`      branch ${branches.get(builderBranch.threadId)}`);
                 }

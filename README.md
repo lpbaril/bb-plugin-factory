@@ -118,7 +118,8 @@ keep working as before until you turn it on, from outside an agent thread:
   open. A skip covers that commit only, so a new commit needs a new skip or a QA run. Only you can
   skip QA once it's been assigned on the task, including on a later PR. Only the task's latest QA thread can record a
   verdict, and assigning QA again clears the results on all the task's open PRs. A pass is recorded with its commit, and
-  the PR's later fix commits don't require another QA run. A result belongs to one PR, so another
+  the PR's later fix commits don't require another QA run. The ready message and PR
+  comment say which commit QA passed and how many came after, so whoever merges can decide. A result belongs to one PR, so another
   PR on the same task needs its own. If a task has several open PRs, one QA thread can record
   on each, and `--pr` says which on `qa` or `qa-skip`.
 - **File coverage.** An approval must account for each file in the PR, as `reviewed <path>` or
