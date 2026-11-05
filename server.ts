@@ -157,6 +157,8 @@ const prSchema = z.object({
     notify: z.object({ comment: z.string().nullable(), lead: z.string() }).nullable(),
     shadow: z.boolean(),
   }).nullable().default(null),
+  /** When the QA failure the Lead was last told about was recorded, so each failure is reported once. */
+  qaFailureNotifiedAt: z.string().nullable().default(null),
   /** Other PRs the Lead has had the full merge-train note about, so each pair gets it once. */
   overlapNotified: z.array(z.number()).default([]),
   /** Touches paths the shadow reviewer covers in "sensitive" mode. */
@@ -309,7 +311,7 @@ export function qaNextStep(factory: QaState, pr: QaPr): string {
   if (result?.verdict === "fail") return `Send the failure to the builder, then assign QA again with ${assign}. Only the person can skip QA that failed.`;
   if (qaStarted(factory, taskKey)) {
     return result === null
-      ? `Wait for QA to finish. If its thread has stopped, or it was checking another PR, assign QA again with ${assign}. Only the person can skip QA once it's been assigned on a task.`
+      ? `Wait for QA to finish. If it was checking another PR, ask its thread to record on this one too. If its thread has stopped, assign QA again with ${assign}, which clears the results on all this task's open PRs. Only the person can skip QA once it's been assigned on a task.`
       : `Assign QA again with ${assign}. Only the person can skip QA once it's been assigned on a task.`;
   }
   return `Assign QA with ${assign}, or if this commit doesn't need it, record why with \`bb factory qa-skip ${taskKey} --pr ${pr.number} --reason "<why>"\`.`;
@@ -389,9 +391,11 @@ export function qaCarryNote(qa: Pick<QaResult, "verdict" | "sha"> | null | undef
   const sha = qa.sha;
   const short = `\`${sha.slice(0, 7)}\``;
   const index = commits?.findIndex((oid) => oid.startsWith(sha)) ?? -1;
-  // Not among the PR's commits, after a rebase for one, or unreadable: say what's known, not a number.
-  if (commits == null || index < 0) return `QA passed ${short}, an earlier commit, so the latest changes haven't had QA.`;
-  const later = commits.length - 1 - index;
+  const headIndex = commits?.indexOf(headSha) ?? -1;
+  // Counted up to the head being announced. If either isn't there, after a rebase or a push just landing, or
+  // the list is unreadable: say what's known, not a number.
+  if (commits == null || index < 0 || headIndex <= index) return `QA passed ${short}, an earlier commit, so the latest changes haven't had QA.`;
+  const later = headIndex - index;
   return `QA passed ${short}, and ${later} later ${later === 1 ? "commit hasn't" : "commits haven't"} had QA.`;
 }
 
@@ -2142,6 +2146,8 @@ export default async function plugin(bb: BbPluginApi) {
           if (candidate.taskKey !== task.key || candidate.state !== "open") continue;
           candidate.qaHoldNotifiedSha = null;
           candidate.qa = null;
+          // Otherwise a PR marked ready by hand isn't announced again when QA passes.
+          if (current.evidenceContract) candidate.approvedNotifiedSha = null;
         }
       }
       current.agents.push({
@@ -2628,6 +2634,7 @@ ${sections.join("\n\n---\n\n")}`;
         qaHoldNotifiedSha: null,
         qa: current.qaResults[taskKey] ?? null,
         draftNotice: null,
+        qaFailureNotifiedAt: null,
         overlapNotified: [],
         pushFollowUp: null,
         shadow,
@@ -2938,7 +2945,7 @@ ${sections.join("\n\n---\n\n")}`;
   }
   /** A failed lookup still gives a note, without the count: this shouldn't hold up saying the PR is ready. */
   async function currentQaCarryNote(factory: Factory, hostId: string, repo: string, pr: Pr): Promise<string> {
-    if (!factory.evidenceContract || pr.qa?.verdict !== "pass" || pr.qa.sha === null || pr.headSha.startsWith(pr.qa.sha)) return "";
+    if (!factory.evidenceContract || qaCarryNote(pr.qa, pr.headSha, null) === "") return "";
     let commits: string[] | null = null;
     try {
       const view = JSON.parse(await gh(hostId, ["pr", "view", String(pr.number), "--repo", repo, "--json", "commits"])) as { commits?: { oid: string }[] };
@@ -2973,6 +2980,18 @@ ${sections.join("\n\n---\n\n")}`;
     for (const { role, review } of staleChanges.length > 0 ? staleChanges : allApproved ? stale : []) {
       await requestReReview(factory, pr, role, review!, pr.headSha);
     }
+  }
+
+  /**
+   * The hold message only comes once every approval covers the head, so with a reviewer also blocking
+   * the Lead would hear nothing about a failure. Each one is reported once, and retried until delivered.
+   */
+  async function maybeReportQaFailure(factory: Factory, pr: Pr): Promise<void> {
+    if (!factory.evidenceContract || pr.qa?.verdict !== "fail" || pr.qaFailureNotifiedAt === pr.qa.at) return;
+    const { at, sha } = pr.qa;
+    await deliverThenMark(factory, pr.number, `[factory] QA failed on PR #${pr.number} (${pr.taskKey})${sha === null ? "" : ` at \`${sha.slice(0, 7)}\``}. ${qaNextStep(factory, pr)}`, (target) => {
+      target.qaFailureNotifiedAt = at;
+    });
   }
 
   /** True if QA is holding this fully approved PR. The Lead hears once per commit, and again if QA's state changes. */
@@ -3182,6 +3201,27 @@ ${sections.join("\n\n---\n\n")}`;
     return null;
   }
 
+  /**
+   * A closed PR that's open again goes back through the gates. Its QA result is about the past: it may
+   * have been closed because of what came after, and a pass mustn't stay valid through a later QA run.
+   */
+  async function onPrReopened(factory: Factory, pr: Pr): Promise<void> {
+    await mutateFactory(factory.prefix, (current) => {
+      const target = current.prs.find((candidate) => candidate.number === pr.number);
+      if (target === undefined) return;
+      target.state = "open";
+      target.closedAt = null;
+      target.qa = null;
+      target.readyRequested = false;
+      target.readySha = null;
+      target.approvedNotifiedSha = null;
+      target.qaHoldNotifiedSha = null;
+      target.draftNotice = null;
+    });
+    await comment((await getTaskByKey(pr.taskKey)).id, `[PR #${pr.number}](${pr.url}) was reopened.`);
+    await tellLead(factory, `[factory] PR #${pr.number} (${pr.taskKey}) was reopened, so the factory is tracking it again.${factory.evidenceContract ? " Its QA result was cleared, so it needs QA or a recorded reason before it can be marked ready or merged." : ""}`);
+  }
+
   const PR_FAILURE_ALERT_PASSES = 5;
   const prFailureStreaks = new Map<string, number>();
 
@@ -3233,6 +3273,7 @@ ${sections.join("\n\n---\n\n")}`;
           if (taskKey !== undefined) await onPrOpened(factory, hostId, repo, gp, taskKey);
           return;
         }
+        if (known.state !== "open") await onPrReopened(factory, known);
         if (known.headSha !== gp.headRefOid) await onPrPushed(factory, hostId, repo, gp, known);
         else if (known.pushFollowUp !== null) await finishPush(prefix, known.number);
         if (known.isDraft !== gp.isDraft) {
@@ -3278,6 +3319,7 @@ ${sections.join("\n\n---\n\n")}`;
         await retryMissingShadow(factory, pr);
         await refreshStaleVerdicts(factory, pr);
         await maybeReportRound(factory, pr.number);
+        await maybeReportQaFailure(factory, pr);
         if (await maybeReturnToDraft(factory, hostId, repo, pr)) return;
         await maybeAnnounceReapproval(factory, hostId, repo, pr);
         await maybeMarkReady(factory, hostId, repo, pr);
@@ -3313,8 +3355,7 @@ ${sections.join("\n\n---\n\n")}`;
     if (roundsReporting.has(key)) return;
     roundsReporting.add(key);
     try {
-      const latest = await findFactory(factory.prefix);
-      const target = latest.prs.find((candidate) => candidate.number === prNumber);
+      const target = (await findFactory(factory.prefix)).prs.find((candidate) => candidate.number === prNumber);
       if (target === undefined || target.state !== "open") return;
       const verdicts = requiredReviewRoles(target).map((role) => ({ role, review: latestReview(target, role) }));
       if (!verdicts.every(({ review }) => review !== null && (review.verdict === "approve" || review.verdict === "changes"))) return;
@@ -3338,12 +3379,10 @@ ${sections.join("\n\n---\n\n")}`;
       const round = `${target.headSha}|${changes.map(({ role }) => role).join(",")}`;
       if (target.roundNotifiedSha === round || target.roundNotifiedSha === target.headSha) return;
       const labels = verdicts.map(({ role, review }) => `${ROLES[role].label} ${review!.verdict === "approve" ? `APPROVE${review!.sha === target.headSha ? "" : ` at \`${review!.sha.slice(0, 7)}\``}` : `REQUEST CHANGES (thread ${review!.threadId})`}`).join(", ");
-      // The hold message only comes once every approval covers the head, so this is where the Lead hears about a QA failure.
-      const qaFailure = latest.evidenceContract && target.qa?.verdict === "fail" ? ` QA failed too. ${qaNextStep(latest, target)}` : "";
       await deliverThenMark(
         factory,
         prNumber,
-        `[factory] Review round complete on PR #${prNumber} (${target.taskKey}) at \`${target.headSha.slice(0, 7)}\`: ${labels}.${qaFailure} Send the builder one handoff referencing this PR's REQUEST CHANGES comments and reviewer threads. It must read and address every finding directly, in one push; consult the Planner if findings conflict; each push re-runs CI, the Security reviewer and the reviewers who asked for changes.${factory.evidenceContract ? fixLoopAdvice(changeRounds(target)) : ""}`,
+        `[factory] Review round complete on PR #${prNumber} (${target.taskKey}) at \`${target.headSha.slice(0, 7)}\`: ${labels}. Send the builder one handoff referencing this PR's REQUEST CHANGES comments and reviewer threads. It must read and address every finding directly, in one push; consult the Planner if findings conflict; each push re-runs CI, the Security reviewer and the reviewers who asked for changes.${factory.evidenceContract ? fixLoopAdvice(changeRounds(target)) : ""}`,
         (pr) => { pr.roundNotifiedSha = round; },
       );
     } finally {
@@ -3448,6 +3487,8 @@ ${sections.join("\n\n---\n\n")}`;
     const view = prMergeViewSchema.parse(JSON.parse(await gh(hostId, ["pr", "view", String(pr.number), "--repo", repo, "--json", "state,isDraft,headRefOid,mergeable,statusCheckRollup"])));
     const { shadowBlocks, shadowMode } = await settings.get();
     const blockers = mergeBlockers(pr, view, shadowBlocks, shadowMode);
+    // The watcher hasn't caught up, so what's stored for this PR is from before it closed.
+    if (pr.state === "closed" && view.state === "OPEN") blockers.push("it was reopened and the factory hasn't caught up yet, so try again in a couple of minutes");
     const qa = qaHold(factory, { ...pr, headSha: view.headRefOid });
     const reviewHint = blockers.length > 0 ? "For an approval on an older head, wait: once all required verdicts are approvals, the factory asks that reviewer to check the delta. A verdict recorded without that request stays on the older commit." : null;
     if (qa !== null) blockers.push(qa);
@@ -4346,15 +4387,19 @@ ${findings}`;
             const sha = input.options.sha.trim().toLowerCase();
             if (!/^[0-9a-f]{7,40}$/i.test(sha)) throw new PluginCliError("--sha must be a commit hash: git rev-parse HEAD.", { code: "qa_sha_input" });
             // With a PR open, QA must have checked a commit that PR has been through. Before one, there's nothing to compare with.
-            const open = qaTargetPr(factory, task.key, input.options.pr, sha);
+            // A PR that closed while QA ran keeps its own verdict, even with another PR open now.
+            const taskPrs = factory.prs.filter((pr) => pr.taskKey === task.key);
+            const onOpenPr = taskPrs.some((pr) => pr.state === "open" && prKnowsCommit(pr, sha));
+            const closedOwner = input.options.pr === undefined && !onOpenPr ? taskPrs.filter((pr) => pr.state !== "open" && prKnowsCommit(pr, sha)).at(-1) ?? null : null;
+            const open = closedOwner === null ? qaTargetPr(factory, task.key, input.options.pr, sha) : null;
             if (open !== null && !prKnowsCommit(open, sha)) {
               throw new PluginCliError(`${sha.slice(0, 7)} isn't a commit of PR #${open.number}.`, {
                 code: "qa_sha_unknown",
                 hint: "Pass git rev-parse HEAD from the builder's worktree. If a push just landed, try again in a few minutes. If it's on a branch whose PR isn't open yet, record the verdict once it is.",
               });
             }
-            // A PR that closed while QA ran keeps its own verdict. Only a commit no PR has seen can wait for the next one.
-            const owner = open ?? factory.prs.filter((pr) => pr.taskKey === task.key && prKnowsCommit(pr, sha)).at(-1) ?? null;
+            // Only a commit no PR has seen can wait for the next one.
+            const owner = closedOwner ?? open;
             const verdict = input.options.verdict as "pass" | "fail";
             await mutateFactory(factory.prefix, (target) => {
               const result = { verdict, threadId, sha, at: new Date().toISOString() };
@@ -4397,7 +4442,9 @@ ${findings}`;
               throw new PluginCliError(`QA passed on PR #${open.number}, and that carries through its later commits, so there's nothing to skip.`, { code: "qa_skip_passed" });
             }
             if (isLead && qaStarted(factory, task.key)) {
-              throw new PluginCliError(`${qaHold(factory, open) ?? `QA was assigned on ${task.key}`}, so only the person can skip it.`, { code: "qa_skip_person_only", hint: qaNextStep(factory, open) });
+              const hold = qaHold(factory, open);
+              // With no hold there's nothing to do, and assigning QA again would wipe the skip that's there.
+              throw new PluginCliError(`${hold ?? `QA was assigned on ${task.key}`}, so only the person can skip it.`, { code: "qa_skip_person_only", ...(hold === null ? {} : { hint: qaNextStep(factory, open) }) });
             }
             await mutateFactory(factory.prefix, (current) => {
               const target = current.prs.find((candidate) => candidate.number === open.number);
