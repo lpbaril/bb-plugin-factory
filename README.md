@@ -116,7 +116,8 @@ keep working as before until you turn it on, from outside an agent thread:
   can't be marked ready or merged with `bb factory merge` until QA passes. If a change doesn't
   need QA, the Lead records why with `bb factory qa-skip APP-12 --reason "..."`, once the PR is
   open. A skip covers that commit only, so a new commit needs a new skip or a QA run. Only you can
-  skip QA that was assigned and hasn't passed. Only the task's latest QA thread can record a
+  skip QA that was assigned and hasn't passed, or a PR on a task whose latest QA run failed or
+  didn't finish. A QA thread assigned for one PR can only record on that PR. Only the task's latest QA thread can record a
   verdict, and assigning QA again clears that PR's result. A pass is recorded with its commit, and
   the PR's later fix commits don't require another QA run. A result belongs to one PR, so another
   PR on the same task needs its own. If a task has several open PRs, say which with `--pr` on
