@@ -75,7 +75,7 @@ needed. Do not paste full plans or logs into the Lead thread, or poll active wor
    Reviewer 2, and the PR stays that way even if a later push shrinks it.
 5. When every required verdict is APPROVE, reviewers who haven't seen the head
    check the delta. Once all approvals cover it, the factory marks the PR ready for
-   review (which also runs full CI) and, with Rafter, runs a final scan. If
+   review (which also runs full CI) and, with Rafter, runs the PR's one final scan. If
    the PR touches files another open factory PR also touches, the Lead gets a
    merge-train note so it can suggest an order. The factory's merge policy says who
    merges: the person, or under `when-green` the Lead with `bb factory merge`, except
@@ -89,7 +89,8 @@ needed. Do not paste full plans or logs into the Lead thread, or poll active wor
 `bb factory evidence-contract APP` shows whether this factory has it. It's on for new factories.
 With it on, QA records its verdict with `bb factory qa`, and the PR can't be marked ready or
 merged until QA passes or the Lead records a reason with `bb factory qa-skip`, which covers one
-commit and needs the PR to be open. An approval must
+commit and needs the PR to be open. A QA result belongs to one PR, and `--pr` says which if a task
+has several open. An approval must
 pass `--coverage` with one line per file not yet accounted for: `reviewed <path>` or
 `skipped <path> -- <reason>`. A blocking finding needs a concrete failing case, and other concerns
 go under "Design notes (not blocking)". Every report ends with "Not checked:". After 3 rounds of
@@ -153,8 +154,8 @@ skip docs-only changes. PRs stay drafts until every reviewer approves, so
 | `bb factory plan-ready APP-12 --comment <id>` | Current Planner only: validate its READY planning comment and allow Builder assignments. |
 | `bb factory plan APP-12` | Print only the task's READY plan. Reviewers use this because `bb tasks show` also prints other reviewers' verdicts. |
 | `bb factory verdict APP-12 --role review1\|review2\|security\|shadow --verdict approve\|changes [--pr N] [--coverage "..."]` | Record a reviewer's verdict on the task's PR, after posting it (as a PR comment; the shadow reviewer posts a task comment). Only the reviewer thread the factory started can record it. |
-| `bb factory qa APP-12 --verdict pass\|fail --sha <commit>` | Latest QA thread only: record QA's verdict. |
-| `bb factory qa-skip APP-12 --reason "..."` | Lead or person: record why the open PR's current commit doesn't need QA. Only the person can skip QA that was assigned and hasn't passed. |
+| `bb factory qa APP-12 --verdict pass\|fail --sha <commit> [--pr N]` | Latest QA thread only: record QA's verdict on the task's PR. |
+| `bb factory qa-skip APP-12 --reason "..." [--pr N]` | Lead or person: record why the open PR's current commit doesn't need QA. Only the person can skip QA that was assigned and hasn't passed. |
 | `bb factory evidence-contract APP [on\|off]` | Show the evidence contract, or set it (person only). |
 | `bb factory merge APP-12 [--pr N]` | Lead under the `when-green` policy, or the person: squash-merge after checking approvals and CI on the exact head. Large or sensitive PRs are the person's only. Fix what it names if it refuses. |
 | `bb factory merge-policy APP [person\|when-green]` | Show the policy. Only the person can set it, from outside an agent thread. |
