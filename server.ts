@@ -262,6 +262,19 @@ function qaStarted(factory: Pick<Factory, "agents" | "prs">, pr: Pick<Pr, "numbe
     return !factory.prs.some((other) => other.number !== pr.number && other.taskKey === pr.taskKey && other.qa?.threadId === agent.threadId);
   });
 }
+/**
+ * Whether only the person can skip QA on this PR. QA that failed here, or is under way for it, counts.
+ * So does a failure or an unfinished run elsewhere on the task that no later pass replaced: otherwise
+ * closing a PR and opening another with the same code would get around it.
+ */
+function qaSkipNeedsPerson(factory: Pick<Factory, "agents" | "prs">, pr: Pick<Pr, "number" | "taskKey"> & { qa?: QaResult | null }): boolean {
+  if (pr.qa?.verdict === "fail" || qaStarted(factory, pr)) return true;
+  const taskPrs = factory.prs.filter((other) => other.taskKey === pr.taskKey);
+  const verdicts = taskPrs.flatMap((other) => (other.qa != null && other.qa.verdict !== "skipped" ? [other.qa] : []));
+  if (verdicts.sort((a, b) => a.at.localeCompare(b.at)).at(-1)?.verdict === "fail") return true;
+  const latestRun = factory.agents.filter((agent) => agent.role === "qa" && agent.taskKey === pr.taskKey).at(-1);
+  return latestRun !== undefined && !taskPrs.some((other) => other.qa?.threadId === latestRun.threadId);
+}
 function prKnowsCommit(pr: Pick<Pr, "headSha" | "reviews">, sha: string): boolean {
   return [pr.headSha, ...pr.reviews.map((review) => review.sha)].some((known) => known.startsWith(sha));
 }
@@ -316,6 +329,7 @@ export function qaNextStep(factory: QaState, pr: QaPr): string {
       ? `Wait for QA to finish. If its thread has stopped, assign QA again with ${assign}. Only the person can skip QA that's under way.`
       : `Assign QA again with ${assign}. Only the person can skip QA that was assigned and hasn't passed.`;
   }
+  if (qaSkipNeedsPerson(factory, pr)) return `Assign QA for this PR with ${assign}. An earlier QA run on this task failed or didn't finish, so only the person can skip it.`;
   return `Assign QA with ${assign}, or if this commit doesn't need it, record why with \`bb factory qa-skip ${taskKey} --pr ${pr.number} --reason "<why>"\`.`;
 }
 
@@ -4321,8 +4335,23 @@ ${findings}`;
             const sha = input.options.sha.trim().toLowerCase();
             if (!/^[0-9a-f]{7,40}$/i.test(sha)) throw new PluginCliError("--sha must be a commit hash: git rev-parse HEAD.", { code: "qa_sha_input" });
             // With a PR open, QA must have checked a commit that PR has been through. Before one, there's nothing to compare with.
-            const assignedPr = factory.prs.find((pr) => pr.number === current?.pr && pr.state === "open")?.number;
-            const open = qaTargetPr(factory, task.key, input.options.pr ?? assignedPr, sha);
+            // A thread assigned for one PR only speaks for that PR. Only one with no PR assigned can choose.
+            const assignedPr = current?.pr ?? null;
+            if (assignedPr !== null) {
+              if (input.options.pr !== undefined && input.options.pr !== assignedPr) {
+                throw new PluginCliError(`This QA thread was assigned for PR #${assignedPr}, so it can't record on PR #${input.options.pr}.`, {
+                  code: "qa_pr_not_assigned",
+                  hint: `Assign QA for that PR: \`bb factory assign ${task.key} --role qa --pr ${input.options.pr}\`.`,
+                });
+              }
+              if (factory.prs.find((pr) => pr.number === assignedPr)?.state !== "open") {
+                throw new PluginCliError(`PR #${assignedPr} isn't open any more, so this QA verdict has nothing to apply to.`, {
+                  code: "qa_pr_closed",
+                  hint: `If another PR replaced it, assign QA for that one: \`bb factory assign ${task.key} --role qa --pr <number>\`.`,
+                });
+              }
+            }
+            const open = qaTargetPr(factory, task.key, assignedPr ?? input.options.pr, sha);
             if (open !== null && !prKnowsCommit(open, sha)) {
               throw new PluginCliError(`${sha.slice(0, 7)} isn't a commit of PR #${open.number}.`, {
                 code: "qa_sha_unknown",
@@ -4372,8 +4401,8 @@ ${findings}`;
             if (open.qa?.verdict === "pass") {
               throw new PluginCliError(`QA passed on PR #${open.number}, and that carries through its later commits, so there's nothing to skip.`, { code: "qa_skip_passed" });
             }
-            if (isLead && qaStarted(factory, open)) {
-              throw new PluginCliError(`QA was assigned on ${task.key} and hasn't passed, so only the person can skip it.`, { code: "qa_skip_person_only" });
+            if (isLead && qaSkipNeedsPerson(factory, open)) {
+              throw new PluginCliError(`QA on ${task.key} failed or hasn't finished, so only the person can skip it.`, { code: "qa_skip_person_only" });
             }
             await mutateFactory(factory.prefix, (current) => {
               const target = current.prs.find((candidate) => candidate.number === open.number);
