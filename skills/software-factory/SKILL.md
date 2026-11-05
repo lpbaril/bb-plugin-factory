@@ -90,7 +90,8 @@ needed. Do not paste full plans or logs into the Lead thread, or poll active wor
 `bb factory evidence-contract APP` shows whether this factory has it. It's on for new factories.
 With it on, QA records its verdict with `bb factory qa`, and the PR can't be marked ready or
 merged until QA passes or the Lead records a reason with `bb factory qa-skip`, which covers one
-commit and needs the PR to be open. A QA result belongs to one PR, and `--pr` says which if a task
+commit and needs the PR to be open. A pass carries through later commits, and the ready message
+and PR comment say which commit it covers and how many came after. A QA result belongs to one PR, and `--pr` says which if a task
 has several open. An approval must
 pass `--coverage` with one line per file not yet accounted for: `reviewed <path>` or
 `skipped <path> -- <reason>`. A blocking finding needs a concrete failing case, and other concerns

@@ -165,9 +165,9 @@ function PrChips({ pr }: { pr: PrSummary }) {
             "rounded border border-border px-1.5 py-0.5",
             pr.scan === "failed" ? "text-destructive" : pr.scan === "running" ? "text-muted-foreground" : "",
           )}
-          title={`Rafter scan ${pr.scan}`}
+          title={`Rafter scan ${pr.scan}${pr.scanOlderSha === null ? "" : ` at ${pr.scanOlderSha}, not the latest commit`}`}
         >
-          Rafter {pr.scan === "running" ? "…" : pr.scan === "failed" ? "✗" : "✓"}
+          Rafter {pr.scan === "running" ? "…" : pr.scan === "failed" ? "✗" : "✓"}{pr.scanOlderSha === null ? "" : ` ${pr.scanOlderSha}`}
         </span>
       )}
     </div>
