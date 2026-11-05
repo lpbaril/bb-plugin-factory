@@ -2113,6 +2113,10 @@ export default async function plugin(bb: BbPluginApi) {
         hint: `Assign a builder first: \`bb factory assign ${task.key} --role build\`.`,
       });
     }
+    // A Builder for a task whose PR is open continues on that PR's branch, in the worktree that has it.
+    // That's how a stuck Builder gets a fresh session: a new worktree would be on another branch.
+    const openPr = args.role === "build" ? factory.prs.find((candidate) => candidate.taskKey === task.key && candidate.state === "open") : undefined;
+    const continuing = openPr === undefined ? null : await builderEnvironment(factory, task.key);
     const execution = await executionFor(args.role);
     const { providerId } = execution;
     const pr = args.pr ?? null;
@@ -2135,6 +2139,7 @@ export default async function plugin(bb: BbPluginApi) {
         task,
         instructions: [
           args.instructions,
+          openPr === undefined || continuing === null ? null : `PR #${openPr.number} is already open for ${task.key}, on this worktree's branch (\`${openPr.branch}\`). You're continuing it: stay on this branch, commit and push to it, and don't open another PR.`,
           plan?.commentId == null ? null : `Canonical plan for ${task.key}: task comment ${plan.commentId}. ${(PR_REVIEW_ROLES as readonly string[]).includes(args.role) ? `Read it with bb factory plan ${task.key}, which leaves out other reviewers' verdicts` : `Read it directly with bb tasks show ${task.key} (including comments)`}; preserve its acceptance criteria.`,
         ].filter((part) => part != null).join("\n\n") || null,
         builderThreadId: builder?.threadId ?? null,
@@ -2146,10 +2151,10 @@ export default async function plugin(bb: BbPluginApi) {
     let thread;
     if (role.environment === "project") {
       thread = await bb.sdk.threads.spawn({ ...base, environment: { type: "project-default" } });
-    } else if (builder !== null) {
+    } else if (builder !== null || continuing !== null) {
       thread = await bb.sdk.threads.spawn({
         ...base,
-        environment: { type: "reuse", environmentId: builder.environmentId },
+        environment: { type: "reuse", environmentId: (builder ?? continuing)!.environmentId },
       });
     } else {
       try {
