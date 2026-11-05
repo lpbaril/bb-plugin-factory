@@ -2666,7 +2666,7 @@ test('a merge held only by QA gets QA advice, and one also held by a reviewer ge
   const hintOf = (result) => `${result.stderr}\n${result.hint ?? ''}`;
   const onlyQa = await mergeFixture(t, { mergePolicy: 'person', evidenceContract: true, qaResults: {}, prs: [pr()] });
   const text = hintOf(await onlyQa.harness.behavior.runCli(['merge', 'TEST-1']));
-  assert.match(text, /Assign QA with `bb factory assign TEST-1 --role qa --pr 7`/);
+  assert.match(text, /Assign QA with `bb factory assign TEST-1 --role qa`/);
   assert.doesNotMatch(text, /approval on an older head/);
   const both = await mergeFixture(t, { mergePolicy: 'person', evidenceContract: true, qaResults: {}, prs: [pr({ reviews: [approved('review1', HEAD), approved('security', 'older')] })] });
   const mixed = hintOf(await both.harness.behavior.runCli(['merge', 'TEST-1']));
@@ -2869,7 +2869,7 @@ test('the draft comment says what happens next, for each reason', async t => {
   assert.match(changes, /a reviewer requested changes\. Next: The builder fixes what was requested/);
 
   const qaFailed = await draftBody({ reviews: bothApprove(SHA_A) }, { qa: { verdict: 'fail', threadId: 'thr_qa', sha: SHA_A, at: '' } });
-  assert.match(qaFailed, /QA failed\. Next: Send the failure to the builder, then assign QA again with `bb factory assign TEST-1 --role qa --pr 7`/);
+  assert.match(qaFailed, /QA failed\. Next: Send the failure to the builder, then assign QA again with `bb factory assign TEST-1 --role qa`/);
 
   const expired = await draftBody({ headSha: SHA_B, reviews: bothApprove(SHA_B) }, { qa: { verdict: 'skipped', threadId: 'thr_lead', sha: SHA_A, at: '' }, live: { headRefOid: SHA_B } });
   assert.match(expired, /QA was skipped for an earlier commit\. Next: Assign QA with .*bb factory qa-skip TEST-1 --pr 7/);
@@ -2922,52 +2922,6 @@ test('a shadow that stops on a ready PR is reported, once, with wording for a re
   assert.equal(messages.filter(message => /shadow Security reviewer .*stopped without a verdict/.test(message.input[0].text)).length, 1);
   assert.equal(bodies.filter(body => /so this PR can't merge/.test(body)).length, 1);
   assert.ok(!bodies.some(body => /stays in draft/.test(body)));
-});
-
-test('assigning QA for one PR leaves another open PR\'s result alone', async t => {
-  const prs = () => [prRecord({ isDraft: false, readyRequested: true, qa: passed() }), secondPr()];
-  const { bb, harness, spawns } = await contractFixture(t, { initial: { agents: [builderAgent, leadAgent], prs: prs() } });
-  const refused = await harness.behavior.runCli(['assign', 'TEST-1', '--role', 'qa']);
-  assert.match(refused.stderr, /Say which with --pr/);
-  assert.equal(spawns.length, 0, 'refused before starting anything');
-  const assigned = await harness.behavior.runCli(['assign', 'TEST-1', '--role', 'qa', '--pr', '9']);
-  assert.equal(assigned.exitCode, 0, JSON.stringify(assigned));
-  const stored = await readPrs(bb);
-  assert.equal(stored[0].qa.verdict, 'pass');
-  assert.equal(stored[1].qa ?? null, null);
-  const agent = (await storedFactory(bb)).agents.at(-1);
-  assert.equal(agent.pr, 9);
-  // That thread's verdict goes to the PR it was assigned for, without needing --pr.
-  const qa = (sha) => harness.behavior.runCli(['qa', 'TEST-1', '--verdict', 'pass', '--sha', sha], { threadId: agent.threadId });
-  assert.match((await qa(SHA_A)).stderr, /isn't a commit of PR #9/);
-  assert.equal((await qa(SHA_B)).exitCode, 0);
-  assert.equal((await readPrs(bb))[1].qa.sha, SHA_B);
-  assert.match((await harness.behavior.runCli(['assign', 'TEST-1', '--role', 'qa', '--pr', '9', '--track-only'])).stderr, /--track-only is for reviewer roles/);
-  assert.match((await harness.behavior.runCli(['assign', 'TEST-1', '--role', 'build', '--pr', '9'])).stderr, /--pr only applies/);
-});
-
-test('QA counts as started only for the PR it was for', () => {
-  const pr = (number, qa = null) => ({ number, taskKey: 'T-1', headSha: 'h', qa });
-  const done = { verdict: 'pass', threadId: 'thr_qa', sha: 'a' };
-  const state = (agentPr, prs) => ({ evidenceContract: true, agents: [{ role: 'qa', taskKey: 'T-1', threadId: 'thr_qa', pr: agentPr }], prs });
-  // It finished on PR #7, so PR #9 hasn't had QA.
-  const finished = state(null, [pr(7, done), pr(9)]);
-  assert.match(qaHold(finished, pr(9)), /wasn't assigned/);
-  assert.match(qaNextStep(finished, pr(9)), /bb factory qa-skip T-1 --pr 9/);
-  // Assigned for PR #7 by number.
-  assert.match(qaHold(state(7, [pr(7), pr(9)]), pr(9)), /wasn't assigned/);
-  assert.match(qaHold(state(7, [pr(7), pr(9)]), pr(7)), /hasn't recorded/);
-  // Assigned before any PR, with no verdict yet: it counts for the PR that opened.
-  assert.match(qaHold(state(null, [pr(9)]), pr(9)), /hasn't recorded/);
-  assert.match(qaNextStep(state(null, [pr(9)]), pr(9)), /Wait for QA to finish/);
-});
-
-test('the Lead can skip QA on a new PR when QA ran on an earlier one', async t => {
-  const reason = ['--reason', 'Only a docs typo, nothing to exercise'];
-  const { bb, harness } = await contractFixture(t, { initial: { agents: [builderAgent, qaAgent, leadAgent], prs: [prRecord({ state: 'closed', qa: passed() }), secondPr()] } });
-  const result = await harness.behavior.runCli(['qa-skip', 'TEST-1', ...reason], { threadId: 'thr_lead' });
-  assert.equal(result.exitCode, 0, result.stderr);
-  assert.equal((await readPrs(bb))[1].qa.verdict, 'skipped');
 });
 
 test('a commit from a branch with no open PR yet gets advice that helps', async t => {
@@ -3098,55 +3052,86 @@ test('closing a PR while its QA is unfinished doesn\'t let the Lead skip QA', as
   assert.match((await leadSkip(harness)).stderr, /only the person can skip it/);
 });
 
-test('a later pass replaces an earlier failure, so the Lead can skip on a new PR', async t => {
-  const prs = [prRecord({ state: 'closed', qa: failedQa() }), secondPr({ state: 'closed', number: 8, url: 'u8', qa: passedQa() }), secondPr()];
-  const { harness } = await contractFixture(t, { initial: { agents: [builderAgent, qaAgent, leadAgent], prs } });
-  assert.equal((await leadSkip(harness)).exitCode, 0);
-  // The order is by time, not by PR number.
-  const reversed = [prRecord({ state: 'closed', qa: failedQa('2026-11-03T00:00:00.000Z') }), secondPr({ state: 'closed', number: 8, url: 'u8', qa: passedQa() }), secondPr()];
-  const later = await contractFixture(t, { initial: { agents: [builderAgent, qaAgent, leadAgent], prs: reversed } });
-  assert.match((await leadSkip(later.harness)).stderr, /only the person can skip it/);
-});
-
-test('the hold advice matches: no skip offered after an earlier failure or unfinished run', () => {
-  const pr = (number, qa = null) => ({ number, taskKey: 'T-1', headSha: 'h', qa, state: 'open' });
-  const agent = (over = {}) => ({ role: 'qa', taskKey: 'T-1', threadId: 'thr_qa', pr: 7, ...over });
-  const base = { evidenceContract: true };
-  const failed = qaNextStep({ ...base, agents: [agent()], prs: [pr(7, { verdict: 'fail', threadId: 'thr_qa', at: '1' }), pr(9)] }, pr(9));
-  assert.match(failed, /An earlier QA run on this task failed or didn't finish, so only the person can skip it/);
-  assert.match(failed, /bb factory assign T-1 --role qa --pr 9/);
-  assert.doesNotMatch(failed, /bb factory qa-skip/);
-  const unfinished = qaNextStep({ ...base, agents: [agent()], prs: [pr(7), pr(9)] }, pr(9));
-  assert.doesNotMatch(unfinished, /bb factory qa-skip/);
-  const passed = qaNextStep({ ...base, agents: [agent()], prs: [pr(7, { verdict: 'pass', threadId: 'thr_qa', at: '1' }), pr(9)] }, pr(9));
-  assert.match(passed, /bb factory qa-skip T-1 --pr 9/);
-});
-
-test('a QA thread assigned for one PR can only record on that PR', async t => {
-  const agent = { ...qaAgent, pr: 9 };
-  const qa = (harness, sha, ...rest) => harness.behavior.runCli(['qa', 'TEST-1', '--verdict', 'pass', '--sha', sha, ...rest], { threadId: 'thr_qa' });
-  const { bb, harness } = await contractFixture(t, { initial: { agents: [builderAgent, agent, leadAgent], prs: [prRecord({ qa: failedQa() }), secondPr()] } });
-  const refused = await qa(harness, SHA_A, '--pr', '7');
-  assert.match(refused.stderr, /was assigned for PR #9, so it can't record on PR #7/);
-  assert.equal((await readPrs(bb))[0].qa.verdict, 'fail', 'PR #7\'s failure stands');
-  assert.equal((await qa(harness, SHA_B, '--pr', '9')).exitCode, 0, 'naming its own PR is fine');
-  assert.equal((await readPrs(bb))[1].qa.verdict, 'pass');
-});
-
-test('if a QA thread\'s PR has closed, its verdict goes nowhere, not to another PR', async t => {
-  const qa = (harness, sha) => harness.behavior.runCli(['qa', 'TEST-1', '--verdict', 'pass', '--sha', sha], { threadId: 'thr_qa' });
-  const { bb, harness } = await contractFixture(t, { initial: { agents: [builderAgent, { ...qaAgent, pr: 7 }, leadAgent], prs: [prRecord({ state: 'closed' }), secondPr()] } });
-  assert.match((await qa(harness, SHA_B)).stderr, /PR #7 isn't open any more/);
-  const prs = await readPrs(bb);
-  assert.equal(prs[0].qa ?? null, null);
-  assert.equal(prs[1].qa ?? null, null, 'PR #9 gets no pass from a thread assigned for PR #7');
-  assert.equal((await storedFactory(bb)).qaResults['TEST-1'], undefined);
-});
-
 test('a pass on another PR doesn\'t clear this PR\'s own failure, or QA running for it', async t => {
   const passedElsewhere = secondPr({ number: 8, url: 'u8', qa: { ...passedQa(), threadId: 'thr_qa2' } });
   const ownFailure = await contractFixture(t, { initial: { agents: [builderAgent, { ...qaAgent, threadId: 'thr_qa2', pr: 8 }, leadAgent], prs: [passedElsewhere, secondPr({ qa: { ...failedQa(), threadId: 'thr_old' } })] } });
   assert.match((await leadSkip(ownFailure.harness, '--pr', '9')).stderr, /only the person can skip it/);
   const running = await contractFixture(t, { initial: { agents: [builderAgent, { ...qaAgent, threadId: 'thr_for_9', pr: 9 }, { ...qaAgent, threadId: 'thr_qa2', pr: 8 }, leadAgent], prs: [passedElsewhere, secondPr()] } });
   assert.match((await leadSkip(running.harness, '--pr', '9')).stderr, /only the person can skip it/);
+});
+
+// ----- One QA thread per task -----
+
+test('once QA was assigned on a task, only the person can skip it, on any PR', async t => {
+  const reason = 'Only a docs typo, nothing to exercise';
+  const { bb, harness } = await contractFixture(t, { initial: { agents: [builderAgent, qaAgent, leadAgent], prs: [prRecord({ state: 'closed', qa: passedQa() }), secondPr()] } });
+  const state = await storedFactory(bb);
+  assert.match(qaHold({ evidenceContract: true, agents: state.agents }, state.prs[1]), /hasn't recorded a verdict for this PR/);
+  const advice = qaNextStep({ evidenceContract: true, agents: state.agents }, state.prs[1]);
+  assert.match(advice, /or it was checking another PR, assign QA again with `bb factory assign TEST-1 --role qa`/);
+  assert.doesNotMatch(advice, /bb factory qa-skip/);
+  assert.match((await leadSkip(harness)).stderr, /QA was assigned on TEST-1, so only the person can skip it/);
+  assert.equal((await harness.behavior.runCli(['qa-skip', 'TEST-1', '--reason', reason])).exitCode, 0, 'the person can');
+});
+
+test('one QA thread can record on each open PR, by commit, without being assigned again', async t => {
+  const { bb, harness, spawns } = await contractFixture(t, { initial: { agents: [builderAgent, qaAgent, leadAgent], prs: [prRecord(), secondPr()] } });
+  const qa = (sha, verdict) => harness.behavior.runCli(['qa', 'TEST-1', '--verdict', verdict, '--sha', sha], { threadId: 'thr_qa' });
+  assert.equal((await qa(SHA_A, 'pass')).exitCode, 0);
+  assert.equal((await qa(SHA_B, 'fail')).exitCode, 0);
+  const prs = await readPrs(bb);
+  assert.equal(prs[0].qa.verdict, 'pass');
+  assert.equal(prs[1].qa.verdict, 'fail');
+  assert.equal(spawns.length, 0);
+});
+
+test('assigning QA clears the result with one PR open, and with several keeps passes', async t => {
+  const one = await contractFixture(t, { extra: { qa: passedQa() }, initial: { agents: [builderAgent, leadAgent] } });
+  assert.equal((await one.harness.behavior.runCli(['assign', 'TEST-1', '--role', 'qa'])).exitCode, 0);
+  assert.equal((await readPrs(one.bb))[0].qa, null);
+  const closed = prRecord({ number: 5, state: 'closed', qa: failedQa() });
+  const several = await contractFixture(t, { initial: { agents: [builderAgent, leadAgent], prs: [prRecord({ qa: passedQa(), qaHoldNotifiedSha: SHA_A }), secondPr({ qa: failedQa(), qaHoldNotifiedSha: SHA_B }), closed] } });
+  assert.equal((await several.harness.behavior.runCli(['assign', 'TEST-1', '--role', 'qa'])).exitCode, 0);
+  const prs = await readPrs(several.bb);
+  assert.equal(prs[0].qa.verdict, 'pass', 'a pass stays');
+  assert.equal(prs[0].qaHoldNotifiedSha, null);
+  assert.equal(prs[1].qa, null, 'a failure is cleared');
+  assert.equal(prs[1].qaHoldNotifiedSha, null);
+  assert.equal(prs[2].qa.verdict, 'fail', 'a closed PR keeps its record');
+});
+
+test('the Factory page can assign QA on a task with two open PRs', async t => {
+  const { harness, spawns } = await contractFixture(t, { initial: { agents: [builderAgent, leadAgent], prs: [prRecord(), secondPr()] } });
+  await harness.behavior.callRpc('task_assign', { taskKey: 'TEST-1', role: 'qa', instructions: null });
+  assert.equal(spawns.at(-1).pluginMetadata.role, 'qa');
+});
+
+test('--pr on assign is for reviewers again, and a QA thread stays free to record on a later PR', async t => {
+  const { bb, harness } = await contractFixture(t, { initial: { agents: [builderAgent, leadAgent] } });
+  assert.match((await harness.behavior.runCli(['assign', 'TEST-1', '--role', 'qa', '--pr', '7'])).stderr, /--pr only applies to review1, review2 or security/);
+  assert.equal((await harness.behavior.runCli(['assign', 'TEST-1', '--role', 'qa'])).exitCode, 0);
+  assert.equal((await storedFactory(bb)).agents.at(-1).pr, null);
+});
+
+test('a hand-run scan asks for a Scan comment, and the final scan for a Final scan comment', async t => {
+  const told = async (phase) => {
+    const fetchMock = t.mock.method(globalThis, 'fetch', async () => new Response(JSON.stringify({ status: 'completed', markdown: 'x', issues: [] }), { status: 200 }));
+    const { messages } = await watchOnce(t, {
+      pr: { number: 7, headSha: SHA_A, isDraft: true, deep: false, shadow: false, scans: [{ phase, sha: SHA_A, scanId: 'scan_1', status: 'running', startedAt: '2026-11-01T00:00:00Z', error: null }], reviews: bothApprove(SHA_A).map(review => ({ ...review, threadId: 'thr_sec' })) },
+      live: { headRefOid: SHA_A },
+      settings: { rafterApiKey: 'k' },
+    });
+    fetchMock.mock.restore();
+    return messages.map(message => message.input[0].text).join('\n');
+  };
+  const hand = await told('open');
+  assert.match(hand, /post a short "Scan: no new blocking findings" comment/);
+  assert.doesNotMatch(hand, /Final scan/);
+  assert.match(await told('ready'), /post a short "Final scan: no new blocking findings" comment/);
+});
+
+test('assigning QA also clears a verdict still waiting for its PR', async t => {
+  const { bb, harness } = await contractFixture(t, { initial: { agents: [builderAgent, leadAgent], prs: [], qaResults: { 'TEST-1': { ...passedQa(), sha: 'deadbeef' } } } });
+  assert.equal((await harness.behavior.runCli(['assign', 'TEST-1', '--role', 'qa'])).exitCode, 0);
+  assert.equal((await storedFactory(bb)).qaResults['TEST-1'], undefined);
 });
