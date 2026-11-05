@@ -833,7 +833,7 @@ test('under when-green the Lead merges pinned to the head, and the merge is reco
   assert.equal(result.exitCode, 0, result.stderr);
   assert.deepEqual(merges(), [['pr', 'merge', '7', '--repo', 'owner/repo', '--squash', '--match-head-commit', HEAD]]);
   const stored = await createFactoryStorage(bb.storage, value => value).read('TEST');
-  assert.deepEqual({ ...stored.prs[0].merge, at: '' }, { by: 'lead', threadId: 'thr_lead', sha: HEAD, policy: 'when-green', at: '' });
+  assert.deepEqual({ ...stored.prs[0].merge, at: '' }, { by: 'lead', threadId: 'thr_lead', sha: HEAD, policy: 'when-green', at: '', via: 'command' });
 });
 
 test('a failing gate names the reason and never reaches gh pr merge', async t => {
@@ -3531,6 +3531,255 @@ async function reopenFixture(t, pr, initial = {}, live = { isDraft: false }) {
   await result.harness.behavior.setSettings({ prReviews: true });
   return { ...result, ghCalls, bodies };
 }
+
+// ----- Merge card -----
+
+const FULL_A = 'a'.repeat(40);
+const FULL_B = 'b'.repeat(40);
+const readyForPerson = (over = {}) => prRecord({ headSha: FULL_A, isDraft: false, readyRequested: true, readySha: FULL_A, approvedNotifiedSha: FULL_A, reviews: bothApprove(FULL_A), ...over });
+const cardFixture = async (t, { prs = [readyForPerson()], initial = {}, live = null, settings = {}, unlistedState = () => 'OPEN', checks = () => greenChecks, mergeHead = () => FULL_A, mergeable = () => 'MERGEABLE' } = {}) => {
+  const ghCalls = [];
+  const sent = [];
+  const posted = [];
+  const listed = live ?? prs.map(pr => ({ number: pr.number, url: pr.url, headRefName: pr.branch, headRefOid: pr.headSha, isDraft: pr.isDraft }));
+  const result = await fixture(t, false, { repo: 'owner/repo', prs, ...initial }, {
+    threads: { list: async () => [{ id: 'thr_builder', environmentBranchName: 'build' }, { id: 'thr_builder2', environmentBranchName: 'other' }] },
+    hostRpc: async ({ input }) => {
+      ghCalls.push(input.args);
+      if (input.args[1] === 'list') return { code: 0, stderr: '', stdout: ghList(typeof listed === 'function' ? listed() : listed) };
+      if (input.args[1] === 'view' && input.args.at(-1) === 'state,isDraft,headRefOid,mergeable,statusCheckRollup') {
+        return { code: 0, stderr: '', stdout: JSON.stringify(liveView({ headRefOid: mergeHead() })) };
+      }
+      if (input.args[1] === 'view' && input.args.at(-1).startsWith('state,number')) {
+        return { code: 0, stderr: '', stdout: JSON.stringify({ state: unlistedState(), number: 7, url: 'https://example.org/7', title: 't', headRefName: 'build', headRefOid: FULL_A, isDraft: false, additions: 1, deletions: 1 }) };
+      }
+      if (input.args[1] === 'view' && input.args.at(-1) === 'title,files,statusCheckRollup,mergeable') {
+        return { code: 0, stderr: '', stdout: JSON.stringify({ title: 'Fix the thing', mergeable: mergeable(), files: [{ path: 'src/a.ts', additions: 3, deletions: 1 }], statusCheckRollup: checks() }) };
+      }
+      if (input.args[1] === 'view') return { code: 0, stderr: '', stdout: JSON.stringify({ files: [{ path: 'src/a.ts' }] }) };
+      return { code: 0, stdout: '', stderr: '' };
+    },
+    tasksRpc: async ({ method, input }) => {
+      if (method === 'notifications.send') { sent.push(input); return { ok: true, channels: [] }; }
+      if (method === 'createComment') posted.push(input.body);
+      return undefined;
+    },
+  });
+  await result.harness.behavior.setSettings({ prReviews: true, ...settings });
+  const cards = () => result.harness.behavior.pendingInteractions.filter(entry => entry.rendererId === 'merge-review');
+  const merge = (headSha = FULL_A, options = {}, number = 7) => result.harness.behavior.callRpc('merge_from_card', { prefix: 'TEST', pr: number, headSha }, options);
+  return { ...result, ghCalls, sent, posted, cards, merge, merges: () => ghCalls.filter(args => args[1] === 'merge') };
+};
+
+test('a PR ready for the person gets a merge card in the Lead\'s chat, and one notification', async t => {
+  const { harness, cards, sent, bb } = await cardFixture(t);
+  await runPasses(harness);
+  assert.equal(cards().length, 1);
+  const card = cards()[0];
+  assert.equal(card.threadId, 'thr_lead');
+  assert.equal(card.title, 'Merge PR #7 (TEST-1)?');
+  assert.equal(card.payload.number, 7);
+  assert.equal(card.payload.headSha, FULL_A);
+  assert.equal(card.payload.title, 'Fix the thing');
+  assert.deepEqual(card.payload.files, [{ path: 'src/a.ts', additions: 3, deletions: 1 }]);
+  assert.deepEqual(card.payload.approvals.map(entry => [entry.label, entry.verdict, entry.atHead]), [['Reviewer 1', 'approve', true], ['Security', 'approve', true]]);
+  assert.deepEqual(card.payload.ci, { passing: 3, total: 3, failing: [] });
+  assert.equal(sent.length, 1);
+  assert.match(sent[0].title, /TEST-1 is ready to merge/);
+  assert.equal(sent[0].threadId, 'thr_lead');
+  assert.equal((await readPrs(bb))[0].mergeNotifiedSha, FULL_A);
+  await runPasses(harness);
+  assert.equal(cards().length, 1, 'not shown twice');
+  assert.equal(sent.length, 1, 'nor notified twice');
+});
+
+test('no card when the Lead merges, the PR isn\'t ready, or cards are off', async t => {
+  const leadMerges = await cardFixture(t, { initial: { mergePolicy: 'when-green' } });
+  await runPasses(leadMerges.harness);
+  assert.equal(leadMerges.cards().length, 0, 'when-green and not large or sensitive');
+  const deep = await cardFixture(t, { prs: [readyForPerson({ deep: true })], initial: { mergePolicy: 'when-green' } });
+  await runPasses(deep.harness);
+  assert.equal(deep.cards().length, 1, 'large or sensitive still comes to the person');
+  assert.match(deep.cards()[0].payload.flagged, /only you can merge it/);
+  const draft = await cardFixture(t, { prs: [readyForPerson({ isDraft: true, readyRequested: false, readySha: null, approvedNotifiedSha: null, reviews: [{ ...approved('review1', FULL_A, 'changes'), threadId: 'thr_r1' }, approved('security', FULL_A)] })] });
+  await runPasses(draft.harness);
+  assert.equal(draft.cards().length, 0);
+  const notAnnounced = await cardFixture(t, { prs: [readyForPerson({ approvedNotifiedSha: 'older' })], settings: { mergeCards: true } });
+  assert.equal(notAnnounced.cards().length, 0);
+  const off = await cardFixture(t, { settings: { mergeCards: false } });
+  await runPasses(off.harness);
+  assert.equal(off.cards().length, 0);
+  assert.equal(off.sent.length, 0);
+});
+
+test('one card at a time per factory', async t => {
+  const second = readyForPerson({ number: 8, url: 'https://example.org/8', taskKey: 'TEST-2', branch: 'other', headSha: FULL_B, readySha: FULL_B, approvedNotifiedSha: FULL_B, reviews: bothApprove(FULL_B) });
+  const { harness, cards } = await cardFixture(t, { prs: [readyForPerson(), second] });
+  await runPasses(harness, 2);
+  assert.equal(cards().length, 1);
+  assert.equal(cards()[0].payload.number, 7);
+  harness.behavior.submitInteraction(cards()[0].id, { action: 'not-now' });
+  await runPasses(harness);
+  assert.equal(cards().length, 1);
+  assert.equal(cards()[0].payload.number, 8, 'the next one follows');
+});
+
+test('Not now keeps the card away for that commit, until someone asks to see it again', async t => {
+  const { bb, harness, cards } = await cardFixture(t);
+  await runPasses(harness);
+  harness.behavior.submitInteraction(cards()[0].id, { action: 'not-now' });
+  await runPasses(harness, 2);
+  assert.equal(cards().length, 0);
+  assert.equal((await readPrs(bb))[0].mergeCardDismissedSha, FULL_A);
+  const shown = await harness.behavior.runCli(['merge-card', 'TEST-1'], { threadId: 'thr_lead' });
+  assert.equal(shown.exitCode, 0, shown.stderr);
+  await runPasses(harness);
+  assert.equal(cards().length, 1);
+});
+
+test('cancelling the card counts as Not now', async t => {
+  const { bb, harness, cards } = await cardFixture(t);
+  await runPasses(harness);
+  harness.behavior.cancelInteraction(cards()[0].id);
+  await runPasses(harness);
+  assert.equal(cards().length, 0);
+  assert.equal((await readPrs(bb))[0].mergeCardDismissedSha, FULL_A);
+});
+
+test('answering the card, even with "merged", never merges, and the card comes back', async t => {
+  const { bb, harness, cards, merges, sent } = await cardFixture(t);
+  await runPasses(harness);
+  harness.behavior.submitInteraction(cards()[0].id, { action: 'merged' });
+  await runPasses(harness, 2);
+  assert.equal(merges().length, 0);
+  assert.equal((await readPrs(bb))[0].mergeCardDismissedSha ?? null, null);
+  assert.equal(cards().length, 1, 'still not merged, so it is offered again');
+  assert.equal(sent.length, 1, 'without a second notification');
+});
+
+test('a new commit takes the card back', async t => {
+  let head = FULL_A;
+  const { harness, cards } = await cardFixture(t, { live: () => [{ number: 7, headRefOid: head, isDraft: false }] });
+  await runPasses(harness);
+  assert.equal(cards().length, 1);
+  head = FULL_B;
+  await runPasses(harness);
+  assert.equal(cards().length, 0, 'the old commit\'s card is withdrawn');
+});
+
+test('Merge on the card runs the gated merge for that commit and records it', async t => {
+  const { harness, merge, merges, bb, posted, cards } = await cardFixture(t);
+  await runPasses(harness);
+  assert.equal(cards().length, 1);
+  const result = await merge();
+  assert.equal(result.ok, true, result.message);
+  assert.equal(merges().length, 1);
+  assert.ok(merges()[0].includes('--match-head-commit') && merges()[0].includes(FULL_A));
+  const stored = (await readPrs(bb))[0].merge;
+  assert.equal(stored.by, 'person');
+  assert.equal(stored.via, 'card');
+  assert.ok(posted.some(body => /from the merge card, run by the person/.test(body)), posted.join('\n'));
+});
+
+test('Merge on the card refuses a moved head, a failed gate and another plugin', async t => {
+  const moved = await cardFixture(t, { mergeHead: () => FULL_B });
+  await runPasses(moved.harness);
+  const refused = await moved.merge();
+  assert.equal(refused.ok, false);
+  assert.match(refused.message, /new commits since this card was shown/);
+  assert.equal(moved.merges().length, 0);
+  // Marked ready by hand, so the QA hold doesn't send it back to draft, and its card still shows.
+  const qa = await cardFixture(t, { prs: [readyForPerson({ readyRequested: false, readySha: null })], initial: { evidenceContract: true, qaResults: {}, agents: [builderAgent, leadAgent] } });
+  await runPasses(qa.harness);
+  assert.equal(qa.cards().length, 1);
+  const held = await qa.merge();
+  assert.equal(held.ok, false);
+  assert.match(held.message, /QA wasn't assigned/);
+  assert.equal(qa.merges().length, 0);
+  const plugin = await cardFixture(t);
+  await runPasses(plugin.harness);
+  const other = await plugin.merge(FULL_A, { experimental_caller: { kind: 'plugin', pluginId: 'other' } });
+  assert.equal(other.ok, false);
+  assert.match(other.message, /Only bb's own interface/);
+  assert.equal(plugin.merges().length, 0);
+});
+
+test('Merge only works while a card for that exact PR and commit is showing, with cards on', async t => {
+  const none = await cardFixture(t, { checks: () => [{ name: 'test', conclusion: 'FAILURE' }] });
+  await runPasses(none.harness);
+  assert.equal(none.cards().length, 0);
+  const noCard = await none.merge();
+  assert.equal(noCard.ok, false);
+  assert.match(noCard.message, /no merge card showing for PR #7 at commit aaaaaaa, so it wasn't merged/);
+  assert.equal(none.merges().length, 0);
+
+  // PR #8 is ready too, but the one card showing is #7's.
+  const second = readyForPerson({ number: 8, url: 'https://example.org/8', taskKey: 'TEST-2', branch: 'other' });
+  const shown = await cardFixture(t, { prs: [readyForPerson(), second] });
+  await runPasses(shown.harness);
+  assert.equal(shown.cards().length, 1);
+  const otherCommit = await shown.merge(FULL_B);
+  assert.equal(otherCommit.ok, false);
+  assert.match(otherCommit.message, /no merge card showing for PR #7 at commit bbbbbbb/, 'another commit');
+  const otherPr = await shown.merge(FULL_A, {}, 8);
+  assert.equal(otherPr.ok, false);
+  assert.match(otherPr.message, /no merge card showing for PR #8/, 'another PR');
+  assert.equal(shown.merges().length, 0);
+
+  shown.harness.behavior.submitInteraction(shown.cards()[0].id, { action: 'not-now' });
+  await runPasses(shown.harness);
+  assert.equal((await shown.merge()).ok, false, 'after Not now');
+  assert.equal(shown.merges().length, 0);
+
+  const off = await cardFixture(t);
+  await runPasses(off.harness);
+  await off.harness.behavior.setSettings({ prReviews: true, mergeCards: false });
+  assert.equal((await off.merge()).ok, false, 'cards turned off');
+  assert.equal(off.merges().length, 0);
+});
+
+test('a PR merged on GitHub while its card shows takes the card back', async t => {
+  let merged = false;
+  const { harness, cards } = await cardFixture(t, { live: () => (merged ? [] : [{ number: 7, headRefOid: FULL_A, isDraft: false }]), unlistedState: () => (merged ? 'MERGED' : 'OPEN') });
+  await runPasses(harness);
+  assert.equal(cards().length, 1);
+  merged = true;
+  await runPasses(harness);
+  assert.equal(cards().length, 0);
+});
+
+test('the card waits until every CI check passes', async t => {
+  let current = [{ name: 'test', conclusion: 'SUCCESS' }, { name: 'Security Scan', conclusion: 'FAILURE' }];
+  const { harness, cards, sent } = await cardFixture(t, { checks: () => current });
+  await runPasses(harness);
+  assert.equal(cards().length, 0, 'a failing check');
+  assert.equal(sent.length, 0, 'and no notification');
+  current = [{ name: 'test', conclusion: 'SUCCESS' }, { name: 'Security Scan', state: 'PENDING' }];
+  await runPasses(harness);
+  assert.equal(cards().length, 0, 'a check still running');
+  current = [];
+  await runPasses(harness);
+  assert.equal(cards().length, 0, 'no checks reported yet');
+  current = greenChecks;
+  await runPasses(harness);
+  assert.equal(cards().length, 1);
+  assert.equal(sent.length, 1);
+});
+
+test('the card waits until GitHub can merge the PR', async t => {
+  let state = 'UNKNOWN';
+  const { harness, cards, sent } = await cardFixture(t, { mergeable: () => state });
+  await runPasses(harness);
+  assert.equal(cards().length, 0, 'GitHub still working it out, as right after another merge');
+  state = 'CONFLICTING';
+  await runPasses(harness);
+  assert.equal(cards().length, 0, 'a conflict');
+  assert.equal(sent.length, 0, 'and no notification');
+  state = 'MERGEABLE';
+  await runPasses(harness);
+  assert.equal(cards().length, 1);
+  assert.equal(sent.length, 1);
+});
 
 test('a Builder may merge the base branch into its own branch, and still never force-pushes or merges a PR', () => {
   const brief = workerPrompt({ role: 'build', factoryName: 'F', prefix: 'T', task: { key: 'T-1', title: 't', description: 'd' }, instructions: null, builderThreadId: null });

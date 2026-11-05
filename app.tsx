@@ -17,7 +17,7 @@ import {
   useRealtime,
   useRpc,
 } from "@get-bb/plugin-sdk/app";
-import type { ExperimentalProviderModelPickerValue, PluginSidebarThread } from "@get-bb/plugin-sdk/app";
+import type { ExperimentalProviderModelPickerValue, PluginPendingInteractionProps, PluginSidebarThread } from "@get-bb/plugin-sdk/app";
 import type {
   Agent,
   AgentExec,
@@ -27,6 +27,7 @@ import type {
   FactoryDoctorReport,
   FactoryHealth,
   FactorySummary,
+  MergeCardPayload,
   NightlyReport,
   PrSummary,
   RunReport,
@@ -2165,6 +2166,138 @@ function Alert({ children }: { children: ReactNode }) {
   );
 }
 
+// ----- Merge card -----
+//
+// Shown in the Lead's chat when a PR is ready for the person to merge. Merge runs the same checks as
+// bb factory merge, on GitHub's live state. Answering the card never merges by itself.
+
+function readMergeCard(payload: unknown): MergeCardPayload | null {
+  if (typeof payload !== "object" || payload === null) return null;
+  const card = payload as Partial<MergeCardPayload>;
+  if (typeof card.prefix !== "string" || typeof card.number !== "number" || typeof card.headSha !== "string") return null;
+  return {
+    prefix: card.prefix,
+    taskKey: String(card.taskKey ?? ""),
+    number: card.number,
+    title: String(card.title ?? ""),
+    url: String(card.url ?? ""),
+    headSha: card.headSha,
+    flagged: typeof card.flagged === "string" ? card.flagged : null,
+    approvals: Array.isArray(card.approvals) ? card.approvals : [],
+    qa: typeof card.qa === "string" ? card.qa : null,
+    ci: card.ci ?? null,
+    scan: typeof card.scan === "string" ? card.scan : null,
+    overlap: typeof card.overlap === "string" ? card.overlap : null,
+    files: Array.isArray(card.files) ? card.files : [],
+    moreFiles: typeof card.moreFiles === "number" ? card.moreFiles : 0,
+  };
+}
+
+function MergeCardRow({ label, children, tone }: { label: string; children: ReactNode; tone?: "good" | "warn" | "bad" }) {
+  return (
+    <div className="flex items-baseline gap-3 py-1 text-sm">
+      <span className="w-24 shrink-0 text-muted-foreground">{label}</span>
+      <span className={cn("min-w-0", tone === "bad" ? "text-destructive" : tone === "warn" ? "text-amber-600 dark:text-amber-400" : "")}>{children}</span>
+    </div>
+  );
+}
+
+function MergeCard({ interaction, submit }: PluginPendingInteractionProps) {
+  const rpc = useRpc<typeof rpcContract>();
+  const navigate = useBbNavigate();
+  const card = readMergeCard(interaction.payload);
+  const [busy, setBusy] = useState<"merge" | "dismiss" | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  if (card === null) {
+    return (
+      <div className="p-3 text-sm">
+        This merge card can't be read.{" "}
+        <Button size="sm" variant="ghost" onClick={() => void submit({ action: "not-now" })}>Close</Button>
+      </div>
+    );
+  }
+  const allApproved = card.approvals.length > 0 && card.approvals.every((entry) => entry.verdict === "approve" && entry.atHead);
+  const ciGreen = card.ci !== null && card.ci.total > 0 && card.ci.failing.length === 0;
+  const merge = async () => {
+    setBusy("merge");
+    setError(null);
+    try {
+      const result = await rpc.call("merge_from_card", { prefix: card.prefix, pr: card.number, headSha: card.headSha });
+      if (result.ok) {
+        await submit({ action: "merged" });
+        return;
+      }
+      setError(result.message);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    }
+    setBusy(null);
+  };
+  return (
+    <div className="flex max-h-[70vh] flex-col gap-3 overflow-y-auto p-3">
+      <div>
+        <div className="text-sm font-medium">
+          {card.taskKey} · PR #{card.number} is ready to merge
+        </div>
+        {card.title === "" ? null : <div className="text-sm text-muted-foreground">{card.title}</div>}
+      </div>
+      {card.flagged === null ? null : <div className="rounded border border-border px-2 py-1 text-sm">{card.flagged}</div>}
+      <div className="divide-y divide-border">
+        <MergeCardRow label="Reviewers" tone={allApproved ? "good" : "bad"}>
+          {card.approvals.map((entry) => `${entry.label} ${entry.verdict === "approve" ? (entry.atHead ? "✓" : "✓ (older commit)") : entry.verdict}`).join(" · ") || "None recorded"}
+        </MergeCardRow>
+        {card.qa === null ? null : <MergeCardRow label="QA" tone={/haven't had QA|Failed|No QA/.test(card.qa) ? "warn" : "good"}>{card.qa}</MergeCardRow>}
+        <MergeCardRow label="CI" tone={ciGreen ? "good" : "bad"}>
+          {card.ci === null ? "Couldn't read the checks" : card.ci.total === 0 ? "No checks reported yet" : ciGreen ? `All ${card.ci.total} passing` : `Not green: ${card.ci.failing.join(", ")}`}
+        </MergeCardRow>
+        {card.scan === null ? null : <MergeCardRow label="Final scan" tone={card.scan.startsWith("Completed") ? "good" : "warn"}>{card.scan}</MergeCardRow>}
+        {card.overlap === null ? null : <MergeCardRow label="Overlap" tone="warn">{card.overlap}</MergeCardRow>}
+      </div>
+      <div>
+        <div className="mb-1 text-sm text-muted-foreground">
+          {card.files.length + card.moreFiles} changed file{card.files.length + card.moreFiles === 1 ? "" : "s"}
+        </div>
+        <ul className="space-y-0.5 text-sm">
+          {card.files.map((file) => (
+            <li key={file.path} className="flex justify-between gap-3">
+              <span className="min-w-0 truncate font-mono text-xs">{file.path}</span>
+              <span className="shrink-0 font-mono text-xs">
+                <span className="text-green-600 dark:text-green-400">+{file.additions}</span>{" "}
+                <span className="text-destructive">−{file.deletions}</span>
+              </span>
+            </li>
+          ))}
+          {card.moreFiles === 0 ? null : <li className="text-xs text-muted-foreground">and {card.moreFiles} more</li>}
+        </ul>
+        {card.url === "" ? null : (
+          <Button size="sm" variant="ghost" className="mt-1 px-0" onClick={() => navigate.openUrl(`${card.url}/files`)}>
+            See the full diff on GitHub
+          </Button>
+        )}
+      </div>
+      {error === null ? null : <div className="text-sm text-destructive">{error}</div>}
+      <div className="flex justify-end gap-2">
+        <Button
+          variant="ghost"
+          disabled={busy !== null}
+          onClick={() => {
+            setBusy("dismiss");
+            void submit({ action: "not-now" });
+          }}
+        >
+          Not now
+        </Button>
+        <Button disabled={busy !== null} onClick={() => void merge()}>
+          {busy === "merge" ? "Merging…" : "Merge"}
+        </Button>
+      </div>
+      <div className="text-xs text-muted-foreground">
+        Merge checks approvals, QA, CI and scans again on GitHub, for commit {card.headSha.slice(0, 7)} only.
+      </div>
+    </div>
+  );
+}
+
 export default definePluginApp((app) => {
   app.slots.settingsSection({
     id: "agents",
@@ -2172,6 +2305,7 @@ export default definePluginApp((app) => {
     description: "The provider, model and reasoning level each factory agent runs on.",
     component: AgentsSettings,
   });
+  app.slots.pendingInteraction({ id: "merge-review", component: MergeCard });
   app.slots.navPanel({
     id: "factory",
     title: "Factory",
