@@ -134,6 +134,12 @@ keep working as before until you turn it on, from outside an agent thread:
   After 5, it's told to bring the PR to you instead of sending it back to the builder. This is
   guidance to the Lead, not a hard stop.
 
+- **Ready means ready.** If a PR the factory marked ready gets new commits, requested changes or a
+  hold, the factory puts it back to draft and says why on the PR, then marks it ready again once
+  that's resolved. This is a signal rather than a lock: anyone can still mark it ready and merge it
+  on GitHub, and a PR you marked ready by hand is left alone. Only `bb factory merge` checks the
+  gates. To enforce them on GitHub, use branch protection.
+
 Turning it on affects open PRs too: an approved PR without QA is held until QA passes or is
 skipped, and the Lead is told.
 

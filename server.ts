@@ -136,6 +136,8 @@ const prSchema = z.object({
   closedAt: z.string().nullable().default(null),
   /** The head whose full set of approvals was last announced, so a ready PR that is approved again is announced too. */
   approvedNotifiedSha: z.string().nullable().default(null),
+  /** The commit the factory last marked ready. A different head means the ready state no longer stands. */
+  readySha: z.string().nullable().default(null),
   /** The head the Lead was last told about a QA hold on, so it hears once per commit. */
   qaHoldNotifiedSha: z.string().nullable().default(null),
   /** Work a push still owes. It is saved with the new head, so a failure partway through is retried on the next pass. */
@@ -1667,6 +1669,28 @@ export default async function plugin(bb: BbPluginApi) {
       recommendedActions.push({ id: warning.id, title: warning.title, detail: warning.detail, command: "bb factory agents", tone: "warn" });
     }
 
+    const { repo } = await projectHost(factory);
+    if (repo === null) {
+      recommendedActions.push({
+        id: "no-github-remote",
+        title: "This project has no GitHub remote that bb knows about, so pull requests aren't being reviewed",
+        detail: "The factory can only track PRs on GitHub. If you added the remote after creating the project, bb won't have noticed it: run the command with the project's source id from `bb project show`, keeping the same path.",
+        command: `bb project source update ${factory.bbProjectId} <source-id> --path ${inspected.projectPath ?? "<path>"}`,
+        tone: "warn",
+      });
+    }
+    // The latest scan decides, so this clears itself once scans work again.
+    const latestScan = factory.prs.flatMap((pr) => pr.scans).sort((a, b) => a.startedAt.localeCompare(b.startedAt)).at(-1);
+    if ((await rafterKey()) !== null && latestScan?.status === "failed" && /quota/i.test(latestScan.error ?? "")) {
+      recommendedActions.push({
+        id: "rafter-quota",
+        title: "Rafter scans are failing because the quota is used up",
+        detail: "PRs aren't being scanned, and the Security reviewer is reviewing by hand. Add quota, or remove the Rafter API key in the plugin settings to turn scans off.",
+        command: "bb factory rafter check",
+        tone: "warn",
+      });
+    }
+
     if (recommendedActions.length === 0) {
       recommendedActions.push({
         id: "aligned",
@@ -2484,6 +2508,7 @@ ${sections.join("\n\n---\n\n")}`;
         readyAt: null,
         closedAt: null,
         approvedNotifiedSha: null,
+        readySha: null,
         qaHoldNotifiedSha: null,
         pushFollowUp: null,
         shadow,
@@ -2847,6 +2872,7 @@ ${sections.join("\n\n---\n\n")}`;
       if (target !== undefined) {
         target.readyRequested = true;
         target.readyAt = new Date().toISOString();
+        target.readySha = pr.headSha;
         // Show "ready" now rather than after the next poll.
         target.isDraft = false;
       }
@@ -2855,13 +2881,16 @@ ${sections.join("\n\n---\n\n")}`;
       await startScan(factory.prefix, repo, pr.number, "ready");
     }
     const labels = roles.map((role) => `${ROLES[role].label} ✓`).join(", ");
-    await prComment(hostId, repo, pr.number, `**Factory:** every reviewer approves \`${pr.headSha.slice(0, 7)}\` (${labels}). Marked ready for review${(await rafterKey()) !== null ? "; a final Rafter scan is running" : ""}. ${leadMayMerge(factory, pr) ? "The Lead may merge once its gates pass." : "Merging is up to you."}`);
+    // From what happened, not from having a key: a scan can fail to start, for one when the quota runs out.
+    const finalScan = (await findFactory(factory.prefix)).prs.find((candidate) => candidate.number === pr.number)?.scans.filter((scan) => scan.phase === "ready" && scan.sha === pr.headSha).at(-1);
+    const scanNote = finalScan?.status === "running" ? "; a final Rafter scan is running" : finalScan?.status === "failed" ? "; the final Rafter scan failed, so this commit has no final scan" : "";
+    await prComment(hostId, repo, pr.number, `**Factory:** every reviewer approves \`${pr.headSha.slice(0, 7)}\` (${labels}). Marked ready for review${scanNote}. ${leadMayMerge(factory, pr) ? "The Lead may merge once its gates pass." : "Merging is up to you."}`);
     const task = await getTaskByKey(pr.taskKey);
     await comment(task.id, `[PR #${pr.number}](${pr.url}) approved by ${labels} and marked ready for review.`);
     // If anything here fails, the PR is already ready, so maybeAnnounceReapproval delivers this on a
     // later pass. The same goes for a running final scan: the PR can't merge until it clears, so the
     // merge instruction waits, and this commit doesn't count as announced yet.
-    const scanning = (await findFactory(factory.prefix)).prs.find((candidate) => candidate.number === pr.number)?.scans.some((scan) => scan.status === "running") ?? false;
+    const scanning = finalScan?.status === "running";
     await deliverThenMark(
       factory,
       pr.number,
@@ -2869,6 +2898,39 @@ ${sections.join("\n\n---\n\n")}`;
       (target) => { if (!scanning) target.approvedNotifiedSha = pr.headSha; },
     );
     await warnMergeOverlap(factory, hostId, repo, pr);
+  }
+
+  /**
+   * Under the evidence contract, put a PR the factory marked ready back to draft once that no longer
+   * holds, so GitHub shows what the gates would say. A pending verdict on the same commit, such as the
+   * final scan's re-review, doesn't count, and neither does a PR a person marked ready by hand. Returns
+   * true if it did, so the rest of the pass leaves this PR alone. Draft is a signal, not a lock: someone
+   * can still mark the PR ready and merge it on GitHub.
+   */
+  async function maybeReturnToDraft(factory: Factory, hostId: string, repo: string, pr: Pr): Promise<boolean> {
+    if (!factory.evidenceContract || pr.isDraft || !pr.readyRequested) return false;
+    const { shadowBlocks, shadowMode } = await settings.get();
+    const qa = qaHold(factory, pr.taskKey, pr.headSha);
+    const reason =
+      requiredReviewRoles(pr).some((role) => latestReview(pr, role)?.verdict === "changes") ? "a reviewer requested changes"
+      : qa !== null ? qa
+      : shadowHolds(pr, shadowBlocks, shadowMode) ? "the shadow reviewer's block is open"
+      : pr.readySha !== pr.headSha && !approvalsCover(pr, pr.headSha) ? "new commits need review"
+      : null;
+    if (reason === null) return false;
+    await gh(hostId, ["pr", "ready", String(pr.number), "--repo", repo, "--undo"]);
+    await mutateFactory(factory.prefix, (current) => {
+      const target = current.prs.find((candidate) => candidate.number === pr.number);
+      if (target === undefined) return;
+      target.isDraft = true;
+      target.readyRequested = false;
+      target.readySha = null;
+      target.approvedNotifiedSha = null;
+    });
+    await prComment(hostId, repo, pr.number, `**Factory:** put back to draft at \`${pr.headSha.slice(0, 7)}\`: ${reason}. It will be marked ready again once that's resolved, so don't merge it until then.`);
+    const task = await getTaskByKey(pr.taskKey);
+    await comment(task.id, `[PR #${pr.number}](${pr.url}) put back to draft at \`${pr.headSha.slice(0, 7)}\`: ${reason}.`);
+    return true;
   }
 
   /**
@@ -3033,6 +3095,7 @@ ${sections.join("\n\n---\n\n")}`;
         await retryMissingShadow(factory, pr);
         await refreshStaleVerdicts(factory, pr);
         await maybeReportRound(factory, pr.number);
+        if (await maybeReturnToDraft(factory, hostId, repo, pr)) return;
         await maybeAnnounceReapproval(factory, pr);
         await maybeMarkReady(factory, hostId, repo, pr);
       });
