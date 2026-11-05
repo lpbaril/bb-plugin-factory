@@ -311,7 +311,7 @@ export function qaNextStep(factory: QaState, pr: QaPr): string {
   if (result?.verdict === "fail") return `Send the failure to the builder, then assign QA again with ${assign}. Only the person can skip QA that failed.`;
   if (qaStarted(factory, taskKey)) {
     return result === null
-      ? `Wait for QA to finish. If it was checking another PR, ask its thread to record on this one too. If its thread has stopped, assign QA again with ${assign}, which clears the results on all this task's open PRs. Only the person can skip QA once it's been assigned on a task.`
+      ? `If QA's thread is still running, wait for it, or if it was checking another PR, ask it to record on this one too. If its thread has stopped, assign QA again with ${assign}, which clears the results on all this task's open PRs. Only the person can skip QA once it's been assigned on a task.`
       : `Assign QA again with ${assign}. Only the person can skip QA once it's been assigned on a task.`;
   }
   return `Assign QA with ${assign}, or if this commit doesn't need it, record why with \`bb factory qa-skip ${taskKey} --pr ${pr.number} --reason "<why>"\`.`;
@@ -376,7 +376,7 @@ export function mergeOverlapNote(prs: Pick<Pr, "number" | "overlapNotified">[], 
   const known = overlaps.filter(told);
   const parts: string[] = [];
   if (fresh.length > 0) {
-    parts.push(`Merge-train note: ${fresh.map((overlap) => `${name(overlap)} shares ${overlap.fileCount} file(s)`).join("; ")}. Merging either PR first likely conflicts the other, so suggest an order to the person, and after each merge have the other builder merge the base branch into its branch and re-check.`);
+    parts.push(`Merge-train note: ${fresh.map((overlap) => `${name(overlap)} shares ${overlap.fileCount} file(s)`).join("; ")}. Merging either PR first may conflict with the other, so suggest an order to the person, and after each merge have the other builder merge the base branch into its branch and re-check.`);
   }
   if (known.length > 0) parts.push(`It still shares files with ${known.map(name).join(" and ")}.`);
   return parts.join(" ");
@@ -2918,8 +2918,8 @@ ${sections.join("\n\n---\n\n")}`;
   }
 
   /**
-   * Other open PRs touching the same files as this freshly approved one. Merging either first likely
-   * conflicts the other (a merge-from-main push, a full CI run and a re-review round). A failed lookup
+   * Other open PRs touching the same files as this freshly approved one. Merging either first may
+   * conflict with the other (a merge-from-main push, a full CI run and a re-review round). A failed lookup
    * reports no overlap: this is advice, and shouldn't hold up saying the PR is ready.
    */
   async function findMergeOverlaps(factory: Factory, hostId: string, repo: string, pr: Pr): Promise<MergeOverlap[]> {
@@ -2942,6 +2942,18 @@ ${sections.join("\n\n---\n\n")}`;
       if (fileCount > 0) overlaps.push({ number: other.number, taskKey: other.taskKey, fileCount });
     }
     return overlaps;
+  }
+  /** Whether this commit is the PR's head on GitHub, for a push the watcher hasn't reached yet. A failed lookup says no. */
+  async function liveHeadIs(factory: Factory, pr: Pr, sha: string): Promise<boolean> {
+    try {
+      const { hostId, repo } = await projectHost(factory);
+      if (repo === null) return false;
+      const view = JSON.parse(await gh(hostId, ["pr", "view", String(pr.number), "--repo", repo, "--json", "headRefOid"])) as { headRefOid?: string };
+      return view.headRefOid?.startsWith(sha) === true;
+    } catch (error) {
+      bb.log.warn(`could not read the head of PR #${pr.number}: ${String(error)}`);
+      return false;
+    }
   }
   /** A failed lookup still gives a note, without the count: this shouldn't hold up saying the PR is ready. */
   async function currentQaCarryNote(factory: Factory, hostId: string, repo: string, pr: Pr): Promise<string> {
@@ -3046,7 +3058,7 @@ ${sections.join("\n\n---\n\n")}`;
       : `; this PR's one final Rafter scan ran at \`${finalScan.sha.slice(0, 7)}\`, so this commit wasn't scanned`;
     const overlaps = await findMergeOverlaps(factory, hostId, repo, pr);
     const qaNote = await currentQaCarryNote(factory, hostId, repo, pr);
-    const overlapComment = overlaps.length === 0 ? "" : ` It shares files with ${overlaps.map((overlap) => `#${overlap.number}`).join(" and ")}, so merging either first likely conflicts the other.`;
+    const overlapComment = overlaps.length === 0 ? "" : ` It shares files with ${overlaps.map((overlap) => `#${overlap.number}`).join(" and ")}, so merging either first may conflict with the other.`;
     await prComment(hostId, repo, pr.number, `**Factory:** every reviewer approves \`${pr.headSha.slice(0, 7)}\` (${labels}). Marked ready for review${scanNote}. ${leadMayMerge(factory, pr) ? "The Lead may merge once its gates pass." : scanning ? "Merging is up to you once it finishes." : "Merging is up to you."}${overlapComment}${qaNote === "" ? "" : ` ${qaNote}`}`);
     const task = await getTaskByKey(pr.taskKey);
     await comment(task.id, `[PR #${pr.number}](${pr.url}) approved by ${labels} and marked ready for review.`);
@@ -3212,14 +3224,16 @@ ${sections.join("\n\n---\n\n")}`;
       target.state = "open";
       target.closedAt = null;
       target.qa = null;
-      target.readyRequested = false;
+      // Still "marked ready by the factory", so the draft path runs and says why on the PR. A PR that's
+      // a draft again has to be able to reach the ready gate.
+      target.readyRequested = target.readyRequested && !target.isDraft;
       target.readySha = null;
       target.approvedNotifiedSha = null;
       target.qaHoldNotifiedSha = null;
       target.draftNotice = null;
     });
     await comment((await getTaskByKey(pr.taskKey)).id, `[PR #${pr.number}](${pr.url}) was reopened.`);
-    await tellLead(factory, `[factory] PR #${pr.number} (${pr.taskKey}) was reopened, so the factory is tracking it again.${factory.evidenceContract ? " Its QA result was cleared, so it needs QA or a recorded reason before it can be marked ready or merged." : ""}`);
+    await tellLead(factory, `[factory] PR #${pr.number} (${pr.taskKey}) was reopened, so the factory is tracking it again.${factory.evidenceContract ? ` Its QA result was cleared. ${qaNextStep(factory, { ...pr, qa: null })}` : ""}`);
   }
 
   const PR_FAILURE_ALERT_PASSES = 5;
@@ -4392,7 +4406,7 @@ ${findings}`;
             const onOpenPr = taskPrs.some((pr) => pr.state === "open" && prKnowsCommit(pr, sha));
             const closedOwner = input.options.pr === undefined && !onOpenPr ? taskPrs.filter((pr) => pr.state !== "open" && prKnowsCommit(pr, sha)).at(-1) ?? null : null;
             const open = closedOwner === null ? qaTargetPr(factory, task.key, input.options.pr, sha) : null;
-            if (open !== null && !prKnowsCommit(open, sha)) {
+            if (open !== null && !prKnowsCommit(open, sha) && !(await liveHeadIs(factory, open, sha))) {
               throw new PluginCliError(`${sha.slice(0, 7)} isn't a commit of PR #${open.number}.`, {
                 code: "qa_sha_unknown",
                 hint: "Pass git rev-parse HEAD from the builder's worktree. If a push just landed, try again in a few minutes. If it's on a branch whose PR isn't open yet, record the verdict once it is.",
@@ -4444,7 +4458,7 @@ ${findings}`;
             if (isLead && qaStarted(factory, task.key)) {
               const hold = qaHold(factory, open);
               // With no hold there's nothing to do, and assigning QA again would wipe the skip that's there.
-              throw new PluginCliError(`${hold ?? `QA was assigned on ${task.key}`}, so only the person can skip it.`, { code: "qa_skip_person_only", ...(hold === null ? {} : { hint: qaNextStep(factory, open) }) });
+              throw new PluginCliError(hold === null ? `QA was assigned on ${task.key}, so only the person can skip it.` : `${hold}.`, { code: "qa_skip_person_only", ...(hold === null ? {} : { hint: qaNextStep(factory, open) }) });
             }
             await mutateFactory(factory.prefix, (current) => {
               const target = current.prs.find((candidate) => candidate.number === open.number);
