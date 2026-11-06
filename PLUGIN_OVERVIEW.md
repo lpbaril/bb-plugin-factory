@@ -18,16 +18,16 @@ Agents use the `bb factory` command: `create`, `start`, `doctor`, `init-specs`, 
 ## Requirements
 
 - A Git repository added to bb as a project.
-- Accounts for the agent CLIs you pick per role. Agents use their own subscription or API quota, and several run at once.
+- Accounts for the agent CLIs you pick per role. Agents use their own subscription or API quota, several at once.
 - For PR review: a GitHub remote and the `gh` CLI signed in on the project's machine. The factory only reviews same-repository PRs that your `gh` account opened.
 - Optional: a Rafter account (https://rafter.so). Scans send the PR branch to Rafter's servers and use your scan quota, two scans per PR.
 
 ## Safety
 
-- You merge by default. Set a factory to `when-green` and its Lead may merge once approvals and CI pass on the exact head, except large or sensitive PRs. This is a rule, not a security boundary.
+- You merge by default. Under `when-green` the Lead may merge once approvals and required checks pass on the exact head, except large or sensitive PRs. This is a rule, not a security boundary.
 - New agents start in auto mode, so commands outside the sandbox ask for approval. Setting Agent permissions to full removes every approval: agents can then run any command on the machine.
 - A verdict counts only when the reviewer thread the factory started for that PR records it, so a builder can't approve its own work.
-- The plugin's host worker runs only `gh pr list`, `view`, `ready`, `comment` and `merge`.
+- The plugin's host worker runs only `gh pr list`, `view`, `checks`, `ready`, `comment` and `merge`.
 - Rafter output and PR content are passed to reviewers as untrusted data.
 
 ## Credits

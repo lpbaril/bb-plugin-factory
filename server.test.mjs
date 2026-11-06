@@ -10,7 +10,7 @@ registerHooks({ resolve(specifier, context, next) {
   }
   return next(specifier, context);
 } });
-const { default: plugin, supervisorAction, turnsFromEvents, creditUsage, mergeBlockers, mergeOverlapNote, migrateQaResults, qaCarryNote, leadMayMerge, rosterWarnings, computeHealth, qaHold, qaNextStep, parseCoverage, changeRounds, fixLoopAdvice } = await import('./server.ts');
+const { default: plugin, supervisorAction, turnsFromEvents, creditUsage, mergeBlockers, sortChecks, mergeOverlapNote, migrateQaResults, qaCarryNote, leadMayMerge, rosterWarnings, computeHealth, qaHold, qaNextStep, parseCoverage, changeRounds, fixLoopAdvice } = await import('./server.ts');
 const { leadCharter, leadPrompt, reReviewMessage, workerPrompt, workerReminder } = await import('./roles.ts');
 const { createFactoryStorage } = await import('./factory-storage.ts');
 
@@ -3537,7 +3537,7 @@ async function reopenFixture(t, pr, initial = {}, live = { isDraft: false }) {
 const FULL_A = 'a'.repeat(40);
 const FULL_B = 'b'.repeat(40);
 const readyForPerson = (over = {}) => prRecord({ headSha: FULL_A, isDraft: false, readyRequested: true, readySha: FULL_A, approvedNotifiedSha: FULL_A, reviews: bothApprove(FULL_A), ...over });
-const cardFixture = async (t, { prs = [readyForPerson()], initial = {}, live = null, settings = {}, unlistedState = () => 'OPEN', checks = () => greenChecks, mergeHead = () => FULL_A, mergeable = () => 'MERGEABLE' } = {}) => {
+const cardFixture = async (t, { prs = [readyForPerson()], initial = {}, live = null, settings = {}, unlistedState = () => 'OPEN', checks = () => greenChecks, mergeHead = () => FULL_A, mergeable = () => 'MERGEABLE', required = () => null } = {}) => {
   const ghCalls = [];
   const sent = [];
   const posted = [];
@@ -3548,7 +3548,11 @@ const cardFixture = async (t, { prs = [readyForPerson()], initial = {}, live = n
       ghCalls.push(input.args);
       if (input.args[1] === 'list') return { code: 0, stderr: '', stdout: ghList(typeof listed === 'function' ? listed() : listed) };
       if (input.args[1] === 'view' && input.args.at(-1) === 'state,isDraft,headRefOid,mergeable,statusCheckRollup') {
-        return { code: 0, stderr: '', stdout: JSON.stringify(liveView({ headRefOid: mergeHead() })) };
+        return { code: 0, stderr: '', stdout: JSON.stringify(liveView({ headRefOid: mergeHead(), statusCheckRollup: checks() })) };
+      }
+      if (input.args[1] === 'checks') {
+        const names = required();
+        return names === null ? { code: 1, stdout: '', stderr: "no required checks reported on the 'build' branch" } : { code: 8, stderr: '', stdout: JSON.stringify(names.map(name => ({ name }))) };
       }
       if (input.args[1] === 'view' && input.args.at(-1).startsWith('state,number')) {
         return { code: 0, stderr: '', stdout: JSON.stringify({ state: unlistedState(), number: 7, url: 'https://example.org/7', title: 't', headRefName: 'build', headRefOid: FULL_A, isDraft: false, additions: 1, deletions: 1 }) };
@@ -3583,7 +3587,7 @@ test('a PR ready for the person gets a merge card in the Lead\'s chat, and one n
   assert.equal(card.payload.title, 'Fix the thing');
   assert.deepEqual(card.payload.files, [{ path: 'src/a.ts', additions: 3, deletions: 1 }]);
   assert.deepEqual(card.payload.approvals.map(entry => [entry.label, entry.verdict, entry.atHead]), [['Reviewer 1', 'approve', true], ['Security', 'approve', true]]);
-  assert.deepEqual(card.payload.ci, { passing: 3, total: 3, failing: [] });
+  assert.deepEqual(card.payload.ci, { passing: 3, total: 3, failing: [], optionalFailing: [] });
   assert.equal(sent.length, 1);
   assert.match(sent[0].title, /TEST-1 is ready to merge/);
   assert.equal(sent[0].threadId, 'thr_lead');
@@ -3818,4 +3822,85 @@ test('if the PR\'s worktree is gone, a Builder gets a new worktree rather than f
   assert.equal((await harness.behavior.runCli(['assign', 'TEST-1', '--role', 'build'])).exitCode, 0);
   assert.equal(spawns.at(-1).environment.type, 'host');
   assert.doesNotMatch(spawns.at(-1).prompt, /already open/);
+});
+
+// ----- Only the checks GitHub requires -----
+
+const securityRed = [{ name: 'test', conclusion: 'SUCCESS' }, { name: 'Security Scan', conclusion: 'FAILURE' }];
+
+test('sortChecks counts only required checks when the base branch has them', () => {
+  const checks = [...securityRed, { name: 'lint', state: 'PENDING' }];
+  assert.deepEqual(sortChecks(checks, null), { counted: checks, failing: ['Security Scan', 'lint'], missing: [], optionalFailing: [] });
+  const sorted = sortChecks(checks, new Set(['test', 'deploy']));
+  assert.deepEqual(sorted.counted.map(check => check.name), ['test']);
+  assert.deepEqual(sorted.failing, []);
+  assert.deepEqual(sorted.missing, ['deploy']);
+  assert.deepEqual(sorted.optionalFailing, ['Security Scan', 'lint']);
+});
+
+test('the merge gate ignores a failing optional check, and waits for a missing required one', () => {
+  const pr = readyPr();
+  const view = liveView({ statusCheckRollup: securityRed });
+  assert.match(mergeBlockers(pr, view, false).join('; '), /CI isn't green: Security Scan/, 'no required checks set: every check counts');
+  assert.equal(mergeBlockers(pr, view, false, 'off', new Set(['test'])).length, 0);
+  assert.match(mergeBlockers(pr, view, false, 'off', new Set(['test', 'Security Scan'])).join('; '), /CI isn't green: Security Scan/);
+  assert.match(mergeBlockers(pr, view, false, 'off', new Set(['test', 'deploy'])).join('; '), /required checks haven't reported on the head yet: deploy/);
+});
+
+test('a failing optional check doesn\'t hold the card, and the card shows it', async t => {
+  const { harness, cards } = await cardFixture(t, { checks: () => securityRed, required: () => ['test'] });
+  await runPasses(harness);
+  assert.equal(cards().length, 1);
+  assert.deepEqual(cards()[0].payload.ci, { passing: 1, total: 1, failing: [], optionalFailing: ['Security Scan'] });
+});
+
+test('bb factory merge from the card goes ahead past a failing optional check', async t => {
+  const { harness, merge, merges } = await cardFixture(t, { checks: () => securityRed, required: () => ['test'] });
+  await runPasses(harness);
+  const result = await merge();
+  assert.equal(result.ok, true, result.message);
+  assert.equal(merges().length, 1);
+});
+
+test('a failing required check holds the card, and the Lead hears why once', async t => {
+  const { harness, cards, messages } = await cardFixture(t, { checks: () => securityRed, required: () => ['test', 'Security Scan'] });
+  await runPasses(harness, 2);
+  assert.equal(cards().length, 0);
+  const held = messages.map(message => message.input[0].text).filter(text => /merge card is held/.test(text));
+  assert.equal(held.length, 1);
+  assert.match(held[0], /PR #7 \(TEST-1\) is ready for the person, but its merge card is held: a check that counts for merging is failing: Security Scan\. Tell the person why there's no card yet/);
+});
+
+test('a conflict holds the card and is reported, but a wait isn\'t', async t => {
+  const conflict = await cardFixture(t, { mergeable: () => 'CONFLICTING' });
+  await runPasses(conflict.harness);
+  assert.ok(conflict.messages.some(message => /merge card is held: GitHub reports a conflict with the base branch/.test(message.input[0].text)));
+  const unknown = await cardFixture(t, { mergeable: () => 'UNKNOWN' });
+  await runPasses(unknown.harness);
+  assert.ok(!unknown.messages.some(message => /merge card is held/.test(message.input[0].text)));
+  const running = await cardFixture(t, { checks: () => [{ name: 'test', state: 'PENDING' }], required: () => ['test'] });
+  await runPasses(running.harness);
+  assert.equal(running.cards().length, 0);
+  assert.ok(!running.messages.some(message => /merge card is held/.test(message.input[0].text)), 'CI still running ends on its own');
+});
+
+test('a new reason on the same commit is reported again', async t => {
+  let current = 'CONFLICTING';
+  const { harness, messages } = await cardFixture(t, { mergeable: () => current, checks: () => securityRed, required: () => ['test', 'Security Scan'] });
+  await runPasses(harness);
+  current = 'MERGEABLE';
+  await runPasses(harness);
+  const held = messages.map(message => message.input[0].text).filter(text => /merge card is held/.test(text));
+  assert.equal(held.length, 2);
+  assert.match(held[1], /Security Scan/);
+});
+
+test('an empty list of required checks means every check counts, not none', async t => {
+  const { harness, cards, merges } = await cardFixture(t, { checks: () => securityRed, required: () => [] });
+  await runPasses(harness);
+  assert.equal(cards().length, 0, 'a failing check still holds the card');
+  const refused = await harness.behavior.runCli(['merge', 'TEST-1']);
+  assert.notEqual(refused.exitCode, 0);
+  assert.match(refused.stderr, /CI isn't green: Security Scan/);
+  assert.equal(merges().length, 0);
 });

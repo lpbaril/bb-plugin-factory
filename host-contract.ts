@@ -10,6 +10,7 @@ export const GH_ALLOWED = [
   ["pr", "ready"],
   ["pr", "comment"],
   ["pr", "merge"],
+  ["pr", "checks"],
 ] as const;
 
 export const repoInspectionSchema = z.object({
