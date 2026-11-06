@@ -2186,7 +2186,12 @@ function readMergeCard(payload: unknown): MergeCardPayload | null {
     approvals: Array.isArray(card.approvals) ? card.approvals : [],
     // Messages elsewhere use Markdown code marks, which this card shows as plain text.
     qa: typeof card.qa === "string" ? card.qa.replace(/`/g, "") : null,
-    ci: card.ci ?? null,
+    // A card shown before this flag existed is read from its words.
+    qaOk: typeof card.qaOk === "boolean" ? card.qaOk : typeof card.qa === "string" && !/haven't had QA|hasn't had QA|Failed|No QA/.test(card.qa),
+    ci: {
+      total: typeof card.ci?.total === "number" ? card.ci.total : 0,
+      optionalFailing: Array.isArray(card.ci?.optionalFailing) ? card.ci.optionalFailing : [],
+    },
     scan: typeof card.scan === "string" ? card.scan : null,
     overlap: typeof card.overlap === "string" ? card.overlap : null,
     files: Array.isArray(card.files) ? card.files : [],
@@ -2218,8 +2223,7 @@ function MergeCard({ interaction, submit }: PluginPendingInteractionProps) {
     );
   }
   const allApproved = card.approvals.length > 0 && card.approvals.every((entry) => entry.verdict === "approve" && entry.atHead);
-  const ciGreen = card.ci !== null && card.ci.total > 0 && card.ci.failing.length === 0;
-  const optionalFailing = card.ci !== null && Array.isArray(card.ci.optionalFailing) ? card.ci.optionalFailing : [];
+  const optionalFailing = card.ci.optionalFailing;
   const merge = async () => {
     setBusy("merge");
     setError(null);
@@ -2248,9 +2252,10 @@ function MergeCard({ interaction, submit }: PluginPendingInteractionProps) {
         <MergeCardRow label="Reviewers" tone={allApproved ? "good" : "bad"}>
           {card.approvals.map((entry) => `${entry.label} ${entry.verdict === "approve" ? (entry.atHead ? "✓" : "✓ (older commit)") : entry.verdict}`).join(" · ") || "None recorded"}
         </MergeCardRow>
-        {card.qa === null ? null : <MergeCardRow label="QA" tone={/haven't had QA|Failed|No QA/.test(card.qa) ? "warn" : "good"}>{card.qa}</MergeCardRow>}
-        <MergeCardRow label="CI" tone={ciGreen ? "good" : "bad"}>
-          {card.ci === null ? "Couldn't read the checks" : card.ci.total === 0 ? "No checks reported yet" : ciGreen ? `All ${card.ci.total} ${optionalFailing.length === 0 ? "" : "required "}passing` : `Not green: ${card.ci.failing.join(", ")}`}
+        {card.qa === null ? null : <MergeCardRow label="QA" tone={card.qaOk ? "good" : "warn"}>{card.qa}</MergeCardRow>}
+        {/* The factory shows a card only once every check that counts passes. */}
+        <MergeCardRow label="CI" tone="good">
+          {`All ${card.ci.total} ${optionalFailing.length === 0 ? "" : "required "}passing`}
         </MergeCardRow>
         {optionalFailing.length === 0 ? null : (
           <MergeCardRow label="Optional" tone="warn">
