@@ -95,18 +95,20 @@ from outside an agent thread: `bb factory merge-policy APP [person|when-green]`.
 
 `bb factory merge` squash-merges only when the PR is open and not a draft, GitHub
 reports it mergeable, every required reviewer approved the exact head, any shadow
-block is cleared, no Rafter scan is running, and CI on the head reports checks that
-all passed. It pins the merge to that head and records who ran it. You can run it
+block is cleared, no Rafter scan is running, and the checks GitHub requires on the base
+branch all passed on the head. If the base branch requires none, every check counts. A
+failing optional check doesn't hold a merge. It pins the merge to that head and records who ran it. You can run it
 too under either policy, or merge on GitHub yourself.
 
-**Merge card.** When a PR is ready for you to merge, with CI green and no conflict on GitHub, the factory shows a card in the
+**Merge card.** When a PR is ready for you to merge, with its required checks passing and no conflict on GitHub, the factory shows a card in the
 Lead's chat and sends a notification to your phone and desktop. The card lists the
 reviewers' approvals, QA, CI, the final scan, any overlap with other open PRs, and
 the changed files, with a link to the full diff on GitHub. Tap **Merge** to run the
 same checks as `bb factory merge` for that exact commit, or **Not now** to close it.
 While the card waits, it takes the place of the chat's message box. One card shows at
 a time per factory, a new commit takes it back, and `bb factory merge-card APP-12`
-shows it again. Turn it off with the **Offer a merge card in the Lead's chat** setting.
+shows it again. If a failing required check or a conflict holds the card back, the Lead is
+told why, so it can tell you. Failing optional checks are listed on the card. Turn it off with the **Offer a merge card in the Lead's chat** setting.
 Answering the card some other way never merges, and Merge only works while a card
 for that exact PR and commit is showing. Still, the card isn't a lock: while it shows,
 an agent could make the same call.

@@ -2219,6 +2219,7 @@ function MergeCard({ interaction, submit }: PluginPendingInteractionProps) {
   }
   const allApproved = card.approvals.length > 0 && card.approvals.every((entry) => entry.verdict === "approve" && entry.atHead);
   const ciGreen = card.ci !== null && card.ci.total > 0 && card.ci.failing.length === 0;
+  const optionalFailing = card.ci !== null && Array.isArray(card.ci.optionalFailing) ? card.ci.optionalFailing : [];
   const merge = async () => {
     setBusy("merge");
     setError(null);
@@ -2249,8 +2250,13 @@ function MergeCard({ interaction, submit }: PluginPendingInteractionProps) {
         </MergeCardRow>
         {card.qa === null ? null : <MergeCardRow label="QA" tone={/haven't had QA|Failed|No QA/.test(card.qa) ? "warn" : "good"}>{card.qa}</MergeCardRow>}
         <MergeCardRow label="CI" tone={ciGreen ? "good" : "bad"}>
-          {card.ci === null ? "Couldn't read the checks" : card.ci.total === 0 ? "No checks reported yet" : ciGreen ? `All ${card.ci.total} passing` : `Not green: ${card.ci.failing.join(", ")}`}
+          {card.ci === null ? "Couldn't read the checks" : card.ci.total === 0 ? "No checks reported yet" : ciGreen ? `All ${card.ci.total} ${optionalFailing.length === 0 ? "" : "required "}passing` : `Not green: ${card.ci.failing.join(", ")}`}
         </MergeCardRow>
+        {optionalFailing.length === 0 ? null : (
+          <MergeCardRow label="Optional" tone="warn">
+            Failing, but GitHub doesn't require them: {optionalFailing.join(", ")}
+          </MergeCardRow>
+        )}
         {card.scan === null ? null : <MergeCardRow label="Final scan" tone={card.scan.startsWith("Completed") ? "good" : "warn"}>{card.scan}</MergeCardRow>}
         {card.overlap === null ? null : <MergeCardRow label="Overlap" tone="warn">{card.overlap}</MergeCardRow>}
       </div>

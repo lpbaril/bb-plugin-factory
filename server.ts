@@ -163,6 +163,8 @@ const prSchema = z.object({
   overlapNotified: z.array(z.number()).default([]),
   /** The commit whose merge card the person dismissed. It isn't offered again for that commit unless someone asks. */
   mergeCardDismissedSha: z.string().nullable().default(null),
+  /** The last reason the Lead heard for a held merge card, with its commit, so each is said once. */
+  mergeCardHeldNotice: z.string().nullable().default(null),
   /** The commit the person was last notified about, so a card shown again after a restart doesn't notify again. */
   mergeNotifiedSha: z.string().nullable().default(null),
   /** Touches paths the shadow reviewer covers in "sensitive" mode. */
@@ -224,11 +226,32 @@ function shadowHolds(pr: Pick<Pr, "reviews" | "shadow"> & { pushFollowUp?: Pr["p
  * passes. Approvals must be on the exact head: the ready gate alone doesn't
  * promise that, because new commits re-request only some reviewers.
  */
+type CheckRun = NonNullable<z.infer<typeof prMergeViewSchema>["statusCheckRollup"]>[number];
+const checkName = (check: CheckRun) => check.name ?? check.context ?? "unnamed";
+const checkPassed = (check: CheckRun) => PASSING_CHECKS.includes(check.conclusion ?? check.state ?? "");
+
+/**
+ * Sorts a PR's checks the way GitHub does when it decides whether a merge is allowed. With required
+ * checks set on the base branch, only those count, and a required check not reported yet is
+ * missing. Without any, every check counts. Optional failing checks are only shown.
+ */
+export function sortChecks(checks: CheckRun[], required: ReadonlySet<string> | null): { counted: CheckRun[]; failing: string[]; missing: string[]; optionalFailing: string[] } {
+  const counted = required === null ? checks : checks.filter((check) => required.has(checkName(check)));
+  const reported = new Set(checks.map(checkName));
+  return {
+    counted,
+    failing: counted.filter((check) => !checkPassed(check)).map(checkName),
+    missing: required === null ? [] : [...required].filter((name) => !reported.has(name)),
+    optionalFailing: required === null ? [] : checks.filter((check) => !required.has(checkName(check)) && !checkPassed(check)).map(checkName),
+  };
+}
+
 export function mergeBlockers(
   pr: Pick<Pr, "deep" | "reviews" | "scans" | "shadow"> & { pushFollowUp?: Pr["pushFollowUp"] },
   view: z.infer<typeof prMergeViewSchema>,
   shadowBlocks: boolean,
   shadowMode = "off",
+  required: ReadonlySet<string> | null = null,
 ): string[] {
   const blockers: string[] = [];
   if (view.state !== "OPEN") blockers.push(`it is ${view.state.toLowerCase()}`);
@@ -241,11 +264,11 @@ export function mergeBlockers(
   }
   if (shadowHolds(pr, shadowBlocks, shadowMode)) blockers.push("the shadow reviewer's block is open");
   if (pr.scans.some((scan) => scan.status === "running")) blockers.push("a Rafter scan is still running");
-  const checks = view.statusCheckRollup ?? [];
+  const sorted = sortChecks(view.statusCheckRollup ?? [], required);
   // A head just pushed has no checks yet, so none is not the same as green.
-  if (checks.length === 0) blockers.push("no CI checks are reported on the head");
-  const failing = checks.filter((check) => !PASSING_CHECKS.includes(check.conclusion ?? check.state ?? ""));
-  if (failing.length > 0) blockers.push(`CI isn't green: ${failing.slice(0, 5).map((check) => check.name ?? check.context ?? "unnamed").join(", ")}`);
+  if (required === null && sorted.counted.length === 0) blockers.push("no CI checks are reported on the head");
+  if (sorted.missing.length > 0) blockers.push(`required checks haven't reported on the head yet: ${sorted.missing.slice(0, 5).join(", ")}`);
+  if (sorted.failing.length > 0) blockers.push(`CI isn't green: ${sorted.failing.slice(0, 5).join(", ")}`);
   return blockers;
 }
 
@@ -378,7 +401,7 @@ export type MergeCardPayload = {
   flagged: string | null;
   approvals: { label: string; verdict: string; atHead: boolean }[];
   qa: string | null;
-  ci: { passing: number; total: number; failing: string[] } | null;
+  ci: { passing: number; total: number; failing: string[]; optionalFailing: string[] } | null;
   scan: string | null;
   overlap: string | null;
   files: { path: string; additions: number; deletions: number }[];
@@ -2676,6 +2699,7 @@ ${sections.join("\n\n---\n\n")}`;
         qaFailureNotifiedAt: null,
         overlapNotified: [],
         mergeCardDismissedSha: null,
+        mergeCardHeldNotice: null,
         mergeNotifiedSha: null,
         pushFollowUp: null,
         shadow,
@@ -2996,6 +3020,22 @@ ${sections.join("\n\n---\n\n")}`;
       return false;
     }
   }
+  /**
+   * The checks GitHub requires before this PR can merge, or null when the base branch requires none,
+   * in which case every check counts. A failed lookup also counts every check, which is the strict side.
+   */
+  async function requiredChecks(hostId: string, repo: string, number: number): Promise<Set<string> | null> {
+    try {
+      const result = await host.call("gh", { args: ["pr", "checks", String(number), "--repo", repo, "--required", "--json", "name"], stdin: null }, { hostId, timeoutMs: 150_000 });
+      // gh exits non-zero while checks fail or run, and still prints the list.
+      if (/no required checks/i.test(result.stderr) || result.stdout.trim() === "") return null;
+      const names = z.array(z.object({ name: z.string() })).parse(JSON.parse(result.stdout)).map((check) => check.name);
+      return names.length === 0 ? null : new Set(names);
+    } catch (error) {
+      bb.log.warn(`could not read the required checks of PR #${number}: ${String(error)}`);
+      return null;
+    }
+  }
   /** A failed lookup still gives a note, without the count: this shouldn't hold up saying the PR is ready. */
   async function currentQaCarryNote(factory: Factory, hostId: string, repo: string, pr: Pr): Promise<string> {
     if (!factory.evidenceContract || qaCarryNote(pr.qa, pr.headSha, null) === "") return "";
@@ -3059,18 +3099,26 @@ ${sections.join("\n\n---\n\n")}`;
       && pr.approvedNotifiedSha === pr.headSha && pr.mergeCardDismissedSha !== pr.headSha;
   }
 
-  /** Null until GitHub can merge the PR and every CI check passes: a merge before that would be refused. */
-  async function mergeCardPayload(factory: Factory, hostId: string, repo: string, pr: Pr): Promise<MergeCardPayload | null> {
+  /**
+   * The card, or why it's held: a merge would be refused while GitHub can't merge the PR or a check
+   * that counts isn't green. A held reason that won't clear on its own is worth telling the Lead.
+   */
+  async function mergeCardPayload(factory: Factory, hostId: string, repo: string, pr: Pr): Promise<{ payload: MergeCardPayload } | { held: string; lasting: boolean }> {
     let view: { title?: string; mergeable?: string; files?: { path: string; additions?: number; deletions?: number }[]; statusCheckRollup?: z.infer<typeof prMergeViewSchema>["statusCheckRollup"] } = {};
     try {
       view = JSON.parse(await gh(hostId, ["pr", "view", String(pr.number), "--repo", repo, "--json", "title,files,statusCheckRollup,mergeable"]));
     } catch (error) {
       bb.log.warn(`could not read PR #${pr.number} for its merge card: ${String(error)}`);
     }
-    // Also not while GitHub reports a conflict or is still working it out, as it does right after another merge.
-    if (view.mergeable !== "MERGEABLE") return null;
-    const checks = view.statusCheckRollup ?? null;
-    if (checks === null || checks.length === 0 || checks.some((check) => !PASSING_CHECKS.includes(check.conclusion ?? check.state ?? ""))) return null;
+    // GitHub works this out again after every merge, so "unknown" is only a wait.
+    if (view.mergeable === "CONFLICTING") return { held: "GitHub reports a conflict with the base branch", lasting: true };
+    if (view.mergeable !== "MERGEABLE") return { held: "GitHub is still checking whether it can merge", lasting: false };
+    const checks = view.statusCheckRollup ?? [];
+    const sorted = sortChecks(checks, await requiredChecks(hostId, repo, pr.number));
+    const stillRunning = sorted.counted.filter((check) => !checkPassed(check) && (check.conclusion ?? "") === "" && check.state !== "FAILURE" && check.state !== "ERROR").map(checkName);
+    const failed = sorted.failing.filter((name) => !stillRunning.includes(name));
+    if (failed.length > 0) return { held: `${failed.length === 1 ? "a check that counts for merging is failing" : "checks that count for merging are failing"}: ${failed.slice(0, 5).join(", ")}`, lasting: true };
+    if (sorted.counted.length === 0 || sorted.missing.length > 0 || stillRunning.length > 0) return { held: "CI is still running", lasting: false };
     const files = (view.files ?? []).map((file) => ({ path: file.path, additions: file.additions ?? 0, deletions: file.deletions ?? 0 }));
     const scan = pr.scans.filter((candidate) => candidate.phase === "ready").at(-1);
     const overlaps = await findMergeOverlaps(factory, hostId, repo, pr);
@@ -3078,7 +3126,7 @@ ${sections.join("\n\n---\n\n")}`;
       : pr.qa == null ? "No QA result"
       : pr.qa.verdict === "skipped" ? "Skipped for this commit, with a recorded reason"
       : (await currentQaCarryNote(factory, hostId, repo, pr)) || `${pr.qa.verdict === "pass" ? "Passed" : "Failed"} at this commit`;
-    return {
+    return { payload: {
       prefix: factory.prefix,
       taskKey: pr.taskKey,
       number: pr.number,
@@ -3092,15 +3140,28 @@ ${sections.join("\n\n---\n\n")}`;
       }),
       qa: qaText,
       ci: {
-        passing: checks.filter((check) => PASSING_CHECKS.includes(check.conclusion ?? check.state ?? "")).length,
-        total: checks.length,
-        failing: checks.filter((check) => !PASSING_CHECKS.includes(check.conclusion ?? check.state ?? "")).slice(0, 5).map((check) => (check.name ?? check.context ?? "unnamed").slice(0, 100)),
+        passing: sorted.counted.filter(checkPassed).length,
+        total: sorted.counted.length,
+        failing: [],
+        optionalFailing: sorted.optionalFailing.slice(0, 5).map((name) => name.slice(0, 100)),
       },
       scan: scan === undefined ? null : `${scan.status === "completed" ? "Completed" : scan.status === "failed" ? "Failed" : "Running"} at ${scan.sha.slice(0, 7)}${scan.sha === pr.headSha ? "" : ", not the latest commit"}`,
       overlap: overlaps.length === 0 ? null : `Shares files with ${overlaps.map((overlap) => `#${overlap.number} (${overlap.taskKey})`).join(" and ")}, so merging either first may conflict with the other.`,
       files: files.slice(0, 60),
       moreFiles: Math.max(0, files.length - 60),
-    };
+    } };
+  }
+
+  /**
+   * The Lead was told the PR is ready for the person, so when the card can't follow, it hears why, once
+   * per commit and reason. A wait that ends on its own, such as CI still running, isn't worth a message.
+   */
+  async function reportMergeCardHeld(factory: Factory, pr: Pr, reason: string, lasting: boolean): Promise<void> {
+    const key = `${pr.headSha}|${reason}`;
+    if (!lasting || pr.mergeCardHeldNotice === key) return;
+    await deliverThenMark(factory, pr.number, `[factory] PR #${pr.number} (${pr.taskKey}) is ready for the person, but its merge card is held: ${reason}. Tell the person why there's no card yet. Once that's fixed, the card appears in this chat. Merging it on GitHub instead skips the factory's checks.`, (target) => {
+      target.mergeCardHeldNotice = key;
+    });
   }
 
   async function notifyMergeReady(factory: Factory, pr: Pr): Promise<void> {
@@ -3134,8 +3195,12 @@ ${sections.join("\n\n---\n\n")}`;
       openMergeCards.delete(prefix);
     }
     if (pr === undefined || !mergeCardDue(factory, pr) || factory.leadThreadId === null) return;
-    const payload = await mergeCardPayload(factory, hostId, repo, pr);
-    if (payload === null) return;
+    const built = await mergeCardPayload(factory, hostId, repo, pr);
+    if ("held" in built) {
+      await reportMergeCardHeld(factory, pr, built.held, built.lasting);
+      return;
+    }
+    const { payload } = built;
     const controller = new AbortController();
     const sha = pr.headSha;
     let waiting: Promise<{ outcome: "submitted"; value: unknown } | { outcome: "cancelled"; reason: string }>;
@@ -3682,7 +3747,7 @@ ${sections.join("\n\n---\n\n")}`;
       throw new PluginCliError(`PR #${pr.number} has new commits since this card was shown, so it wasn't merged. A new card comes once they're reviewed.`, { code: "merge_head_moved" });
     }
     const { shadowBlocks, shadowMode } = await settings.get();
-    const blockers = mergeBlockers(pr, view, shadowBlocks, shadowMode);
+    const blockers = mergeBlockers(pr, view, shadowBlocks, shadowMode, await requiredChecks(hostId, repo, pr.number));
     // The watcher hasn't caught up, so what's stored for this PR is from before it closed.
     if (pr.state === "closed" && view.state === "OPEN") blockers.push("it was reopened and the factory hasn't caught up yet, so try again in a couple of minutes");
     const qa = qaHold(factory, { ...pr, headSha: view.headRefOid });

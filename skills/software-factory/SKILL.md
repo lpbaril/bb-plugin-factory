@@ -159,7 +159,7 @@ skip docs-only changes. PRs stay drafts until every reviewer approves, so
 | `bb factory qa APP-12 --verdict pass\|fail --sha <commit> [--pr N]` | Latest QA thread only: record QA's verdict on the task's PR. |
 | `bb factory qa-skip APP-12 --reason "..." [--pr N]` | Lead or person: record why the open PR's current commit doesn't need QA. Only the person can skip QA once it's been assigned on the task. |
 | `bb factory evidence-contract APP [on\|off]` | Show the evidence contract, or set it (person only). |
-| `bb factory merge APP-12 [--pr N]` | Lead under the `when-green` policy, or the person: squash-merge after checking approvals and CI on the exact head. Large or sensitive PRs are the person's only. Fix what it names if it refuses. |
+| `bb factory merge APP-12 [--pr N]` | Lead under the `when-green` policy, or the person: squash-merge after checking approvals and the checks GitHub requires (every check, if none are required) on the exact head. Large or sensitive PRs are the person's only. Fix what it names if it refuses. |
 | `bb factory merge-card APP-12` | Show the merge card again in the Lead's chat after the person chose Not now. It only shows the card: merging stays with the person. |
 | `bb factory merge-policy APP [person\|when-green]` | Show the policy. Only the person can set it, from outside an agent thread. |
 | `bb factory nightly [APP]` | Show the latest nightly check's findings. |
