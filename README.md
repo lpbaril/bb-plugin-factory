@@ -97,7 +97,7 @@ from outside an agent thread: `bb factory merge-policy APP [person|when-green]`.
 reports it mergeable, every required reviewer approved the exact head, any shadow
 block is cleared, no Rafter scan is running, and the checks GitHub requires on the base
 branch all passed on the head. If the base branch requires none, every check counts. A
-failing optional check doesn't hold a merge. GitHub's own branch rules must also allow it:
+failing optional check doesn't hold a merge, and when a check ran more than once on the head, only its latest run counts. GitHub's own branch rules must also allow it:
 a PR GitHub reports as blocked (for example a required check that hasn't started yet) or
 behind its base isn't merged. It pins the merge to that head and records who ran it. You can run it
 too under either policy, or merge on GitHub yourself.

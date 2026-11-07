@@ -10,7 +10,7 @@ registerHooks({ resolve(specifier, context, next) {
   }
   return next(specifier, context);
 } });
-const { default: plugin, supervisorAction, turnsFromEvents, creditUsage, mergeBlockers, sortChecks, mergeOverlapNote, migrateQaResults, qaCarryNote, leadMayMerge, rosterWarnings, computeHealth, parseDay, prsOpenedBetween, qaHold, qaNextStep, parseCoverage, changeRounds, fixLoopAdvice } = await import('./server.ts');
+const { default: plugin, supervisorAction, turnsFromEvents, creditUsage, mergeBlockers, sortChecks, latestRuns, mergeOverlapNote, migrateQaResults, qaCarryNote, leadMayMerge, rosterWarnings, computeHealth, parseDay, prsOpenedBetween, qaHold, qaNextStep, parseCoverage, changeRounds, fixLoopAdvice } = await import('./server.ts');
 const { leadCharter, leadPrompt, reReviewMessage, workerPrompt, workerReminder } = await import('./roles.ts');
 const { createFactoryStorage } = await import('./factory-storage.ts');
 
@@ -3941,6 +3941,41 @@ test('the merge gate ignores a failing optional check, and follows GitHub\'s bra
   const failingAndBlocked = mergeBlockers(pr, { ...view, mergeStateStatus: 'BLOCKED' }, false, 'off', new Set(['test', 'Security Scan']));
   assert.ok(!failingAndBlocked.some(text => /rules for the base branch/.test(text)), 'a failing check already explains BLOCKED');
   for (const state of ['CLEAN', 'UNSTABLE', 'HAS_HOOKS', null, undefined]) assert.equal(mergeBlockers(pr, { ...view, mergeStateStatus: state }, false, 'off', new Set(['test'])).length, 0, String(state));
+});
+
+// PR #1269 on BOS: the first CI run on a commit was cancelled when a second started.
+const rerun = [
+  { name: 'Backend Tests', workflowName: 'CI', status: 'COMPLETED', conclusion: 'CANCELLED', startedAt: '2026-11-07T15:39:24Z', completedAt: '2026-11-07T15:41:12Z' },
+  { name: 'Backend Tests', workflowName: 'CI', status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-11-07T15:41:28Z', completedAt: '2026-11-07T15:53:29Z' },
+  { name: 'Backend Lint', workflowName: 'CI', conclusion: 'SUCCESS', startedAt: '2026-11-07T15:41:28Z' },
+];
+
+test('only the latest run of each check counts, as on GitHub', () => {
+  assert.deepEqual(latestRuns(rerun).map(check => check.conclusion), ['SUCCESS', 'SUCCESS']);
+  assert.deepEqual(latestRuns([rerun[1], rerun[0]]).map(check => check.conclusion), ['SUCCESS'], 'by start time, not list order');
+  const queued = { name: 'Backend Tests', workflowName: 'CI', status: 'QUEUED', conclusion: '', startedAt: '0001-01-01T00:00:00Z' };
+  assert.equal(latestRuns([rerun[1], queued])[0], queued, 'a re-run that hasn\'t started is the newest');
+  const otherWorkflow = { name: 'Backend Tests', workflowName: 'Nightly', conclusion: 'FAILURE', startedAt: '2026-11-07T15:00:00Z' };
+  assert.equal(latestRuns([...rerun, otherWorkflow]).length, 3, 'the same name in another workflow is another check');
+  const statuses = [{ context: 'ci/legacy', state: 'FAILURE' }, { context: 'ci/legacy', state: 'SUCCESS' }];
+  assert.deepEqual(latestRuns(statuses).map(check => check.state), ['SUCCESS'], 'without times, the later one in the list');
+  assert.deepEqual(sortChecks(rerun, new Set(['Backend Tests', 'Backend Lint'])).failing, []);
+  assert.deepEqual(mergeBlockers(readyPr(), liveView({ statusCheckRollup: rerun }), false, 'off', new Set(['Backend Tests'])), []);
+  assert.match(mergeBlockers(readyPr(), liveView({ statusCheckRollup: [rerun[1], { ...rerun[0], startedAt: '2026-11-07T16:00:00Z', conclusion: 'FAILURE' }] }), false).join('; '), /CI isn't green: Backend Tests/, 'a newer failing run still fails');
+});
+
+test('a check cancelled by a newer run doesn\'t hold the card, and a queued re-run waits quietly', async t => {
+  const { harness, cards, messages, merge, merges } = await cardFixture(t, { checks: () => rerun, required: () => ['Backend Tests', 'Backend Lint'] });
+  await runPasses(harness);
+  assert.equal(cards().length, 1);
+  assert.deepEqual(cards()[0].payload.ci, { total: 2, optionalFailing: [] });
+  assert.ok(!messages.some(message => /merge card is held/.test(message.input[0].text)));
+  assert.equal((await merge()).ok, true);
+  assert.equal(merges().length, 1);
+  const queued = await cardFixture(t, { checks: () => [...rerun, { name: 'Backend Tests', workflowName: 'CI', status: 'QUEUED', conclusion: '', startedAt: '0001-01-01T00:00:00Z' }], required: () => ['Backend Tests'] });
+  await runPasses(queued.harness);
+  assert.equal(queued.cards().length, 0);
+  assert.ok(!queued.messages.some(message => /merge card is held/.test(message.input[0].text)), 'CI still running ends on its own');
 });
 
 test('a failing optional check doesn\'t hold the card, and the card shows it', async t => {
