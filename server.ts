@@ -190,6 +190,9 @@ const prMergeViewSchema = z.object({
     context: z.string().nullish(),
     conclusion: z.string().nullish(),
     state: z.string().nullish(),
+    workflowName: z.string().nullish(),
+    startedAt: z.string().nullish(),
+    completedAt: z.string().nullish(),
   })).nullish(),
 });
 const PASSING_CHECKS = ["SUCCESS", "NEUTRAL", "SKIPPED"];
@@ -233,12 +236,33 @@ const checkName = (check: CheckRun) => check.name ?? check.context ?? "unnamed";
 const checkPassed = (check: CheckRun) => PASSING_CHECKS.includes(check.conclusion ?? check.state ?? "");
 
 /**
+ * GitHub reports every run of a check on the commit, so a run cancelled when a newer one started is
+ * still listed. Like GitHub, only the latest run of each check counts: a check is one name in one
+ * workflow, and the latest run is the one that started last. A run with no start time is newer than
+ * one with, since it hasn't started yet; between two without, the later one in the list wins.
+ */
+export function latestRuns(checks: CheckRun[]): CheckRun[] {
+  const latest = new Map<string, { check: CheckRun; index: number }>();
+  const started = (check: CheckRun) => {
+    const time = Date.parse(check.startedAt ?? "");
+    return Number.isFinite(time) && time > 0 ? time : Number.POSITIVE_INFINITY;
+  };
+  checks.forEach((check, index) => {
+    const key = `${check.workflowName ?? ""}\u0000${checkName(check)}`;
+    const previous = latest.get(key);
+    if (previous === undefined || started(check) >= started(previous.check)) latest.set(key, { check, index });
+  });
+  return [...latest.values()].sort((a, b) => a.index - b.index).map((entry) => entry.check);
+}
+
+/**
  * Sorts a PR's checks the way GitHub does when it decides whether a merge is allowed. With required
  * checks set on the base branch, only those count. Without any, every check counts. Optional failing
  * checks are only shown. GitHub lists only the required checks that have reported, so one that
  * hasn't started shows up in the PR's merge state (BLOCKED), not here.
  */
-export function sortChecks(checks: CheckRun[], required: ReadonlySet<string> | null): { counted: CheckRun[]; failing: string[]; optionalFailing: string[] } {
+export function sortChecks(reported: CheckRun[], required: ReadonlySet<string> | null): { counted: CheckRun[]; failing: string[]; optionalFailing: string[] } {
+  const checks = latestRuns(reported);
   const counted = required === null ? checks : checks.filter((check) => required.has(checkName(check)));
   return {
     counted,
