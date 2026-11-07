@@ -10,7 +10,7 @@ registerHooks({ resolve(specifier, context, next) {
   }
   return next(specifier, context);
 } });
-const { default: plugin, supervisorAction, turnsFromEvents, creditUsage, mergeBlockers, sortChecks, mergeOverlapNote, migrateQaResults, qaCarryNote, leadMayMerge, rosterWarnings, computeHealth, qaHold, qaNextStep, parseCoverage, changeRounds, fixLoopAdvice } = await import('./server.ts');
+const { default: plugin, supervisorAction, turnsFromEvents, creditUsage, mergeBlockers, sortChecks, mergeOverlapNote, migrateQaResults, qaCarryNote, leadMayMerge, rosterWarnings, computeHealth, parseDay, prsOpenedBetween, qaHold, qaNextStep, parseCoverage, changeRounds, fixLoopAdvice } = await import('./server.ts');
 const { leadCharter, leadPrompt, reReviewMessage, workerPrompt, workerReminder } = await import('./roles.ts');
 const { createFactoryStorage } = await import('./factory-storage.ts');
 
@@ -1178,6 +1178,66 @@ test('health: an empty factory reports no data rather than zeros', async t => {
   assert.equal(health.prs, 0);
   assert.equal(health.roundsPerMergedPr.median, null);
   assert.match((await harness.behavior.runCli(['health', 'TEST'])).stdout, /no data yet/);
+});
+
+// ----- Health for a date window -----
+
+// Local clock times, so the tests hold in any time zone.
+const local = (day, hour = 0, minute = 0) => new Date(2026, 10, day, hour, minute).toISOString();
+
+test('parseDay reads YYYY-MM-DD as local midnight and refuses anything else', () => {
+  assert.equal(parseDay('2026-11-05'), new Date(2026, 10, 5).getTime());
+  assert.equal(parseDay(' 2026-11-05 '), new Date(2026, 10, 5).getTime());
+  for (const bad of ['2026-02-30', '2026-13-01', '2026-1-5', '11/05/2026', '2026-11-05T10:00', '', 'yesterday']) assert.equal(parseDay(bad), null, bad);
+});
+
+test('prsOpenedBetween keeps PRs from since up to before, and counts the undated ones', () => {
+  const prs = [{ openedAt: local(4, 23, 59) }, { openedAt: local(5, 0, 0) }, { openedAt: local(6, 12) }, { openedAt: '' }];
+  const since = parseDay('2026-11-05');
+  const before = parseDay('2026-11-06');
+  assert.deepEqual(prsOpenedBetween(prs, null, null), { prs, undated: 0 }, 'no window: every PR, none left out');
+  assert.deepEqual(prsOpenedBetween(prs, since, null), { prs: [prs[1], prs[2]], undated: 1 });
+  assert.deepEqual(prsOpenedBetween(prs, null, since), { prs: [prs[0]], undated: 1 });
+  assert.deepEqual(prsOpenedBetween(prs, since, before), { prs: [prs[1]], undated: 1 });
+});
+
+test('bb factory health --since and --before split the numbers at a day', async t => {
+  const prs = [
+    prRecord(healthPr({ number: 1, taskKey: 'TEST-1', openedAt: local(3), reviews: [approved('review1', SHA_A, 'changes'), approved('review1', SHA_B)] })),
+    prRecord(healthPr({ number: 2, taskKey: 'TEST-2', openedAt: local(4, 23, 30), reviews: [approved('review1', SHA_A, 'changes'), approved('review1', SHA_B)] })),
+    prRecord(healthPr({ number: 3, taskKey: 'TEST-3', openedAt: local(5, 9), reviews: [approved('review1', SHA_B)] })),
+    prRecord(healthPr({ number: 4, taskKey: 'TEST-4', openedAt: local(6, 9), state: 'open', reviews: [approved('review1', SHA_B)] })),
+    prRecord(healthPr({ number: 5, taskKey: 'TEST-5', openedAt: '', reviews: [approved('review1', SHA_B)] })),
+  ];
+  const { harness } = await fixture(t, false, { prs });
+  const all = JSON.parse((await harness.behavior.runCli(['health', 'TEST', '--json'])).stdout);
+  assert.equal(all.prs, 5);
+  assert.equal(all.undated, 0);
+  const after = JSON.parse((await harness.behavior.runCli(['health', 'TEST', '--since', '2026-11-05', '--json'])).stdout);
+  assert.deepEqual([after.prs, after.merged, after.open, after.since, after.before, after.undated], [2, 1, 1, '2026-11-05', null, 1]);
+  assert.deepEqual(after.changesRequested, { prs: 0, sample: 2 });
+  assert.deepEqual(after.roundsPerMergedPr, { median: 1, sample: 1 });
+  const beforeIt = JSON.parse((await harness.behavior.runCli(['health', 'TEST', '--before', '2026-11-05', '--json'])).stdout);
+  assert.deepEqual([beforeIt.prs, beforeIt.merged], [2, 2]);
+  assert.deepEqual(beforeIt.changesRequested, { prs: 2, sample: 2 });
+  assert.deepEqual(beforeIt.roundsPerMergedPr, { median: 2, sample: 2 });
+  const text = (await harness.behavior.runCli(['health', 'TEST', '--since', '2026-11-05', '--before', '2026-11-06'])).stdout;
+  assert.match(text, /^Health for TEST, PRs opened from 2026-11-05 and before 2026-11-06: 1 PR\(s\), 0 open, 1 merged/);
+  assert.match(text, /Left out: 1 PR\(s\) with no open date/);
+  assert.doesNotMatch((await harness.behavior.runCli(['health', 'TEST'])).stdout, /Left out|PRs opened/, 'no window: same output as before');
+  const fromPage = await harness.behavior.callRpc('factory_health', { prefix: 'TEST', since: '2026-11-05' });
+  assert.equal(fromPage.prs, 2);
+});
+
+test('bb factory health refuses a date it can\'t read, and a window with nothing in it', async t => {
+  const { harness } = await fixture(t);
+  const bad = await harness.behavior.runCli(['health', 'TEST', '--since', '11/05/2026']);
+  assert.notEqual(bad.exitCode, 0);
+  assert.match(bad.stderr, /--since must be a date written YYYY-MM-DD, such as 2026-11-05/);
+  assert.match((await harness.behavior.runCli(['health', 'TEST', '--before', '2026-02-30'])).stderr, /--before must be a date written YYYY-MM-DD/);
+  const empty = await harness.behavior.runCli(['health', 'TEST', '--since', '2026-11-06', '--before', '2026-11-06']);
+  assert.notEqual(empty.exitCode, 0);
+  assert.match(empty.stderr, /--since 2026-11-06 isn't before --before 2026-11-06/);
 });
 
 // ----- Security review of Phase 0 -----
