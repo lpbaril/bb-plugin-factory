@@ -171,8 +171,9 @@ merging. Each number shows its sample size, because a small history can swing on
 PRs from before this view estimate time to ready from their last approval on the head.
 
 To compare before and after a change, such as turning on the evidence contract, count only
-PRs opened in a window: `--since 2026-11-05` from that day and `--before 2026-11-05` before
-it. Days are YYYY-MM-DD, from midnight on the machine bb runs on. A PR with no open date
+PRs opened in a window: on the Factory page, pick the days in **Health**, or run
+`bb factory health APP --since 2026-11-05` for that day on and `--before 2026-11-05` for
+before it. Days are YYYY-MM-DD, from midnight on the machine bb runs on. A PR with no open date
 can't be placed in a window, so it's left out and counted.
 
 ## Run ledger
