@@ -170,6 +170,11 @@ from open to ready, tokens per merged task excluding cached input, and PRs close
 merging. Each number shows its sample size, because a small history can swing on one PR.
 PRs from before this view estimate time to ready from their last approval on the head.
 
+To compare before and after a change, such as turning on the evidence contract, count only
+PRs opened in a window: `--since 2026-11-05` from that day and `--before 2026-11-05` before
+it. Days are YYYY-MM-DD, from midnight on the machine bb runs on. A PR with no open date
+can't be placed in a window, so it's left out and counted.
+
 ## Run ledger
 
 Factory records every finished turn of every factory agent: its task, role,

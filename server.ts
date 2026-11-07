@@ -509,6 +509,34 @@ const median = (values: number[]): number | null => {
 
 const REQUIRED_REVIEW_ROLES: readonly PrReviewRole[] = ["review1", "review2", "security"];
 
+/** A YYYY-MM-DD day as midnight on this machine's clock, or null when it isn't a real date. */
+export function parseDay(value: string): number | null {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value.trim());
+  if (match === null) return null;
+  const [year, month, day] = [Number(match[1]), Number(match[2]), Number(match[3])];
+  const date = new Date(year, month - 1, day);
+  // new Date rolls 2026-02-30 over into March, so a date that moved wasn't real.
+  return date.getFullYear() === year && date.getMonth() === month - 1 && date.getDate() === day ? date.getTime() : null;
+}
+
+/**
+ * The PRs opened in a window: from `since` (inclusive) to `before` (exclusive), either end open.
+ * A PR with no open date can't be placed, so with either end set it's left out and counted.
+ */
+export function prsOpenedBetween<T extends Pick<Pr, "openedAt">>(prs: readonly T[], since: number | null, before: number | null): { prs: T[]; undated: number } {
+  if (since === null && before === null) return { prs: [...prs], undated: 0 };
+  let undated = 0;
+  const inside = prs.filter((pr) => {
+    const opened = Date.parse(pr.openedAt);
+    if (!Number.isFinite(opened)) {
+      undated += 1;
+      return false;
+    }
+    return (since === null || opened >= since) && (before === null || opened < before);
+  });
+  return { prs: inside, undated };
+}
+
 /**
  * The redesign's baseline: how much rework a PR takes and what a merged task costs. Each number
  * carries its sample size, because a factory's history is small enough for one PR to move a median.
@@ -543,6 +571,9 @@ export function computeHealth(prs: readonly Pr[], tokensByTask: ReadonlyMap<stri
     changesRequested: { prs: reviewed.filter((pr) => countedVerdicts(pr).some((review) => review.verdict === "changes")).length, sample: reviewed.length },
     timeToReadyMs: { median: median(readyDurations), sample: readyDurations.length },
     tokensPerMergedTask: { median: median(taskTokens), sample: taskTokens.length },
+    since: null,
+    before: null,
+    undated: 0,
   };
 }
 
@@ -616,6 +647,11 @@ const factoryHealthSchema = z.object({
   changesRequested: z.object({ prs: z.number(), sample: z.number() }),
   timeToReadyMs: healthMeasureSchema,
   tokensPerMergedTask: healthMeasureSchema,
+  /** The window the numbers cover, as given: PRs opened from `since`, and before `before`. */
+  since: z.string().nullable().default(null),
+  before: z.string().nullable().default(null),
+  /** PRs left out of a window because they have no open date. */
+  undated: z.number().default(0),
 });
 export type FactoryHealth = z.infer<typeof factoryHealthSchema>;
 
@@ -863,7 +899,7 @@ export const rpcContract = defineRpcContract({
     output: runReportSchema,
   },
   factory_health: {
-    input: z.object({ prefix: z.string() }),
+    input: z.object({ prefix: z.string(), since: z.string().nullish(), before: z.string().nullish() }),
     output: factoryHealthSchema,
   },
   lead_start: {
@@ -4143,17 +4179,36 @@ ${findings}`;
     return lines.join("\n");
   }
 
+  /** Health for the PRs opened in a window; both days are YYYY-MM-DD, and either can be left out. */
+  function healthFor(factory: Factory, since: string | null, before: string | null): FactoryHealth {
+    const day = (value: string | null, flag: string): number | null => {
+      if (value === null) return null;
+      const parsed = parseDay(value);
+      if (parsed === null) throw new PluginCliError(`${flag} must be a date written YYYY-MM-DD, such as 2026-11-05.`, { code: "invalid_date" });
+      return parsed;
+    };
+    const from = day(since, "--since");
+    const until = day(before, "--before");
+    if (from !== null && until !== null && from >= until) {
+      throw new PluginCliError(`--since ${since} isn't before --before ${before}, so no PR could be in that window.`, { code: "invalid_date" });
+    }
+    const window = prsOpenedBetween(factory.prs, from, until);
+    return { ...computeHealth(window.prs, factoryStorage.tokensByTask(factory.prefix)), since: from === null ? null : since!.trim(), before: until === null ? null : before!.trim(), undated: window.undated };
+  }
+
   function formatHealth(prefix: string, health: FactoryHealth): string {
     const number = (value: number) => value.toLocaleString("en-US");
     const measure = (m: { median: number | null; sample: number }, unit: (value: number) => string) =>
       m.median === null ? "no data yet" : `${unit(m.median)} (median of ${m.sample})`;
     const { changesRequested: changes } = health;
+    const window = [health.since === null ? null : `from ${health.since}`, health.before === null ? null : `before ${health.before}`].filter((part) => part !== null).join(" and ");
     return [
-      `Health for ${prefix}: ${health.prs} PR(s), ${health.open} open, ${health.merged} merged, ${health.closedUnmerged} closed without merging.`,
+      `Health for ${prefix}${window === "" ? "" : `, PRs opened ${window}`}: ${health.prs} PR(s), ${health.open} open, ${health.merged} merged, ${health.closedUnmerged} closed without merging.`,
       `  Review rounds per merged PR: ${measure(health.roundsPerMergedPr, number)}`,
       `  PRs with changes requested: ${changes.sample === 0 ? "no data yet" : `${Math.round((changes.prs / changes.sample) * 100)}% (${changes.prs} of ${changes.sample})`}`,
       `  Time from open to ready: ${measure(health.timeToReadyMs, (ms) => `${Math.round(ms / 60_000)} min`)}`,
       `  Tokens per merged task, excluding cached: ${measure(health.tokensPerMergedTask, (value) => number(Math.round(value)))}`,
+      ...(health.undated === 0 ? [] : [`  Left out: ${health.undated} PR(s) with no open date, which can't be placed in the window.`]),
     ].join("\n");
   }
 
@@ -4301,10 +4356,7 @@ ${findings}`;
       return dismissed;
     },
     factory_runs: async ({ prefix, taskKey }) => runReport(await findFactory(prefix), taskKey),
-    factory_health: async ({ prefix }) => {
-      const factory = await findFactory(prefix);
-      return computeHealth(factory.prs, factoryStorage.tokensByTask(factory.prefix));
-    },
+    factory_health: async ({ prefix, since, before }) => healthFor(await findFactory(prefix), since ?? null, before ?? null),
     factory_doctor: async ({ prefix }) => computeDoctorReport(await findFactory(prefix)),
     factory_set_mode: async ({ prefix, projectMode }) => {
       const updated = await mutateFactory(prefix, (factory) => {
@@ -5021,12 +5073,16 @@ ${findings}`;
           },
         }),
         health: cliCommand({
-          summary: "Show how much rework PRs take and what merged tasks cost, with sample sizes",
+          summary: "Show how much rework PRs take and what merged tasks cost, with sample sizes, optionally for PRs opened in a date window",
           positionals: [{ name: "factory", description: "Factory prefix", required: true }],
-          options: { json },
+          options: {
+            since: { type: "string", description: "Only PRs opened on or after this day, YYYY-MM-DD, from midnight on this machine's clock" },
+            before: { type: "string", description: "Only PRs opened before this day, YYYY-MM-DD. With --since the same day, it gives the PRs before and after a change" },
+            json,
+          },
           async run(input) {
             const factory = await findFactory(input.positionals.factory);
-            const health = computeHealth(factory.prs, factoryStorage.tokensByTask(factory.prefix));
+            const health = healthFor(factory, input.options.since ?? null, input.options.before ?? null);
             return { exitCode: 0, stdout: input.options.json ? JSON.stringify(health) : formatHealth(factory.prefix, health) };
           },
         }),
