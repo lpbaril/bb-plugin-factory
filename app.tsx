@@ -652,16 +652,21 @@ function HealthDialog({ open, prefix, onClose }: { open: boolean; prefix: string
   const rpc = useRpc<typeof rpcContract>();
   const [health, setHealth] = useState<FactoryHealth | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Days as YYYY-MM-DD, or "" for no limit: PRs opened from `since`, and before `before`.
+  const [since, setSince] = useState("");
+  const [before, setBefore] = useState("");
+  const emptyWindow = since !== "" && before !== "" && since >= before;
   useEffect(() => {
-    if (!open) return;
+    if (!open || emptyWindow) return;
     let cancelled = false;
     setError(null);
-    rpc.call("factory_health", { prefix }).then(
+    rpc.call("factory_health", { prefix, since: since === "" ? null : since, before: before === "" ? null : before }).then(
       (next) => { if (!cancelled) setHealth(next); },
       (cause) => { if (!cancelled) setError(errorText(cause)); },
     );
     return () => { cancelled = true; };
-  }, [rpc, open, prefix]);
+  }, [rpc, open, prefix, since, before, emptyWindow]);
+  const windowed = since !== "" || before !== "";
   const rows: { label: string; value: string; sample: string; note: string }[] =
     health === null
       ? []
@@ -706,11 +711,30 @@ function HealthDialog({ open, prefix, onClose }: { open: boolean; prefix: string
             How much rework PRs take and what merged tasks cost. Numbers are medians, so check the sample size: with few PRs, one can move a number a lot.
           </DialogDescription>
         </DialogHeader>
-        {error === null ? null : <Alert>{error}</Alert>}
-        {health === null ? (
+        <div className="flex flex-wrap items-end gap-3">
+          <label className="block space-y-1 text-xs">
+            <span className="font-medium">PRs opened from</span>
+            <Input type="date" value={since} max={before === "" ? undefined : before} onChange={(event) => setSince(event.target.value)} aria-label="PRs opened from" />
+          </label>
+          <label className="block space-y-1 text-xs">
+            <span className="font-medium">and before</span>
+            <Input type="date" value={before} min={since === "" ? undefined : since} onChange={(event) => setBefore(event.target.value)} aria-label="PRs opened before" />
+          </label>
+          {windowed ? (
+            <Button size="sm" variant="ghost" onClick={() => { setSince(""); setBefore(""); }}>All PRs</Button>
+          ) : null}
+        </div>
+        <div className="text-xs text-muted-foreground">
+          {windowed
+            ? "Counts PRs by the day they were opened, from midnight on the machine bb runs on. To compare before and after a change, set the day of the change as the start, then as the end."
+            : "All PRs. Pick days to compare before and after a change, such as turning on the evidence contract."}
+        </div>
+        {emptyWindow ? <Alert>The start day must come before the end day, or no PR could be in the window.</Alert> : null}
+        {error === null || emptyWindow ? null : <Alert>{error}</Alert>}
+        {emptyWindow ? null : health === null ? (
           error === null ? <EmptyState>Loading health…</EmptyState> : null
         ) : health.prs === 0 ? (
-          <EmptyState>No pull requests yet. Numbers appear as the factory reviews PRs.</EmptyState>
+          <EmptyState>{windowed ? "No pull requests were opened in this window." : "No pull requests yet. Numbers appear as the factory reviews PRs."}</EmptyState>
         ) : (
           <ul className="divide-y divide-border text-sm">
             {rows.map((row) => (
@@ -727,6 +751,9 @@ function HealthDialog({ open, prefix, onClose }: { open: boolean; prefix: string
             ))}
           </ul>
         )}
+        {!emptyWindow && health !== null && health.undated > 0 ? (
+          <div className="text-xs text-muted-foreground">Left out: {health.undated} PR{health.undated === 1 ? "" : "s"} with no open date, which can't be placed in the window.</div>
+        ) : null}
       </DialogContent>
     </Dialog>
   );
