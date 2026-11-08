@@ -48,7 +48,7 @@ async function fixture(t, fallback = false, initial = {}, overrides = {}) {
     sdk: {
       ...(overrides.environments === undefined ? {} : { environments: overrides.environments }),
       projects: { get: async () => ({ name: 'Test', gitRemoteUrl: overrides.gitRemoteUrl === undefined ? 'https://github.com/owner/repo.git' : overrides.gitRemoteUrl, sources: [{ hostId: 'host_test', isDefault: true, path: overrides.projectPath ?? null }] }), ...overrides.projects },
-      providers: { models: async () => ({ models: [] }) },
+      providers: { models: async () => ({ models: [] }), ...overrides.providers },
       threads: {
         get: async () => makeThreadResponse({ id: 'thr_builder', environmentId: 'env_builder' }),
         spawn: async args => {
@@ -4601,12 +4601,12 @@ test('designRoundState: only Blockers and Majors hold a plan, until resolved and
 test('designGate holds a Builder until the current READY plan has passed', () => {
   const plan = over => ({ taskKey: 'T-1', threadId: 'thr_p', commentId: 'c2', designRequired: true, reviewedCommentId: null, ...over });
   const round = over => ({ taskKey: 'T-1', round: 1, planCommentId: 'c2', depth: 'core', startedAt: '', lenses: designLenses(false), findings: [], outcome: null, ...over });
-  designGate({ plans: [plan({ designRequired: false })], designRounds: [] }, 'T-1');
-  designGate({ plans: [plan({ reviewedCommentId: 'c2' })], designRounds: [] }, 'T-1');
-  assert.throws(() => designGate({ plans: [plan()], designRounds: [round()] }, 'T-1'), error => error.code === 'design_review_pending' && /still reading it \(round 1\)/.test(error.message));
-  assert.throws(() => designGate({ plans: [plan({ reviewedCommentId: 'c1' })], designRounds: [round()] }, 'T-1'), /hasn't passed design review/, 'a pass on an older plan doesn\'t count');
-  assert.throws(() => designGate({ plans: [plan()], designRounds: [round({ lenses: designLenses(), findings: [designFinding({ resolution: { as: 'escalate', note: 'x', at: '' } })] })] }, 'T-1'), error => /design-decide/.test(error.hint));
-  designGate({ plans: [plan()], designRounds: [round({ lenses: designLenses(), findings: [] })] }, 'T-1');
+  designGate({ designReviewEnabled: true, plans: [plan({ designRequired: false })], designRounds: [] }, 'T-1');
+  designGate({ designReviewEnabled: true, plans: [plan({ reviewedCommentId: 'c2' })], designRounds: [] }, 'T-1');
+  assert.throws(() => designGate({ designReviewEnabled: true, plans: [plan()], designRounds: [round()] }, 'T-1'), error => error.code === 'design_review_pending' && /still reading it \(round 1\)/.test(error.message));
+  assert.throws(() => designGate({ designReviewEnabled: true, plans: [plan({ reviewedCommentId: 'c1' })], designRounds: [round()] }, 'T-1'), /hasn't passed design review/, 'a pass on an older plan doesn\'t count');
+  assert.throws(() => designGate({ designReviewEnabled: true, plans: [plan()], designRounds: [round({ lenses: designLenses(), findings: [designFinding({ resolution: { as: 'escalate', note: 'x', at: '' } })] })] }, 'T-1'), error => /design-decide/.test(error.hint));
+  designGate({ designReviewEnabled: true, plans: [plan()], designRounds: [round({ lenses: designLenses(), findings: [] })] }, 'T-1');
 });
 
 const plannerAgent = { threadId: 'thr_planner', role: 'plan', taskKey: 'TEST-1', providerId: 'claude-code', createdAt: '', pr: null };
@@ -4629,6 +4629,7 @@ async function designFixture(t, initial = {}, overrides = {}) {
     environments: overrides.environments,
     hostRpc: overrides.hostRpc,
     projectPath: overrides.projectPath,
+    providers: overrides.providers,
   });
   const read = async () => createFactoryStorage(result.bb.storage, value => value).read('TEST');
   const say = (threadId, text) => sent.filter(message => message.threadId === threadId).map(message => message.input[0].text).filter(body => text === undefined || text.test(body));
@@ -4889,7 +4890,7 @@ test('parsePersonQuestions reads "For the person" lines from Open questions only
 });
 
 test('personQuestionsGate holds a Builder until each question is answered, and after a changed answer', () => {
-  const plan = questions => ({ plans: [{ taskKey: 'T-1', threadId: 'thr_p', commentId: 'c1', designRequired: true, reviewedCommentId: 'c1', personQuestions: questions }] });
+  const plan = questions => ({ designReviewEnabled: true, plans: [{ taskKey: 'T-1', threadId: 'thr_p', commentId: 'c1', designRequired: true, reviewedCommentId: 'c1', personQuestions: questions }] });
   const q = over => ({ id: 'Q1', text: 'Round to what?', assumed: 'up', answer: null, notifiedAt: null, ...over });
   assert.throws(() => personQuestionsGate(plan([q()]), 'T-1'), error => error.code === 'person_questions_open' && /plan-answer T-1 keep --question <id>/.test(error.hint));
   personQuestionsGate(plan([q({ answer: { choice: 'keep', text: null, by: 'lead', at: '' } })]), 'T-1');
@@ -4952,4 +4953,165 @@ test('the Planner and the Lead are told how questions for the person work', () =
   assert.match(workerReminder({ role: 'plan', factoryName: 'F', taskKey: 'T-1', designReview: true }), /For the person: Q1/);
   assert.match(leadPrompt({ factoryName: 'F', prefix: 'F', goal: null, designReview: true }), /bb factory plan-answer <KEY> keep --question <id>/);
   assert.match(leadCharter({ factoryName: 'F', prefix: 'F', designReview: true }), /bb factory plan-answer/);
+});
+
+// ----- Review of PR #14 -----
+
+const blockerRound = async (fx, over = {}) => {
+  await fx.markReady('plan_1', over.body);
+  await fx.record('thr_d1', 'Zoom Out', finding(1, 'Major', 'Reinvents the parser'));
+  await fx.record('thr_d2', 'Comprehension');
+  await fx.record('thr_d3', 'Codebase Details');
+};
+
+test('the same plan can\'t be reviewed again to shake off findings', async t => {
+  const fx = await designFixture(t);
+  await blockerRound(fx);
+  const again = await fx.harness.behavior.runCli(['plan-ready', 'TEST-1', '--comment', 'plan_1'], { threadId: 'thr_planner' });
+  assert.match(again.stderr, /already the READY plan/);
+  const unresolved = await fx.markReady('plan_2', readyPlan('\nReuse parse_args.'));
+  assert.match(unresolved.stderr, /Resolve each Blocker and Major of design review round 1 first: 1\.zoom-out\.1/);
+  await fx.harness.behavior.runCli(['design-resolve', 'TEST-1', '--finding', '1.zoom-out.1', '--as', 'fix', '--note', 'Use the existing parser'], { threadId: 'thr_planner' });
+  const copy = await fx.markReady('plan_3', readyPlan());
+  assert.match(copy.stderr, /same as the one design review round 1 found problems in/, 'a new comment with the same text');
+  assert.equal((await fx.markReady('plan_4', readyPlan('\nReuse parse_args.'))).exitCode, 0);
+  assert.equal((await fx.read()).designRounds.length, 2);
+});
+
+test('a round that has ended can\'t have its findings changed', async t => {
+  const fx = await designFixture(t);
+  await blockerRound(fx);
+  const resolve = as => fx.harness.behavior.runCli(['design-resolve', 'TEST-1', '--finding', '1.zoom-out.1', '--as', as, '--note', 'tip.py:12 already parses this'], { threadId: 'thr_planner' });
+  assert.equal((await resolve('contest')).exitCode, 0);
+  assert.equal(fx.say('thr_lead', /passed design review/).length, 1);
+  const late = await resolve('fix');
+  assert.match(late.stderr, /round 1 of TEST-1 has ended \(resolved\), so its findings can't change/);
+  assert.equal((await fx.harness.behavior.runCli(['assign', 'TEST-1', '--role', 'build'])).exitCode, 0, 'the gate stays as it was agreed');
+});
+
+test('an escalation answered after the round ended is refused', async t => {
+  const fx = await designFixture(t);
+  await blockerRound(fx);
+  await fx.harness.behavior.runCli(['design-resolve', 'TEST-1', '--finding', '1.zoom-out.1', '--as', 'escalate', '--note', 'Only the person knows this'], { threadId: 'thr_planner' });
+  await fx.harness.behavior.runCli(['design-decide', 'TEST-1', 'keep', '--finding', '1.zoom-out.1'], { threadId: 'thr_lead' });
+  assert.match((await fx.harness.behavior.runCli(['design-decide', 'TEST-1', 'fix', '--finding', '1.zoom-out.1'], { threadId: 'thr_lead' })).stderr, /has ended \(resolved\), so the answer can't change/);
+});
+
+test('a finding in the wrong heading format, or "no findings" in a sentence, isn\'t read as clean', () => {
+  const body = text => `Factory design review: Zoom Out, round 1\n\n${text}${checked}`;
+  assert.match(parseDesignFindings(body('### 1. [Major] auth bypass\nWhere: x'), 'zoom-out').error, /"### 1\. \[Major\] auth bypass" isn't in the finding format/);
+  assert.match(parseDesignFindings(body('### Finding 1 (Blocker): auth bypass'), 'zoom-out').error, /isn't in the finding format/);
+  assert.match(parseDesignFindings(body('Mostly fine, no findings outside scope.'), 'zoom-out').error, /"No findings\." on its own line/);
+  assert.deepEqual(parseDesignFindings(body('**No findings.**'), 'zoom-out'), { findings: [] });
+});
+
+test('parsePersonQuestions never drops a question when ids clash', () => {
+  const body = withQuestions('- For the person: Should we round up?\n- For the person: Q1. Which currency?\n- For the person: Q1. And which symbol?\n- For the person: Q3. Round per person?');
+  assert.deepEqual(parsePersonQuestions(body).map(question => [question.id, question.text]), [['Q2', 'Should we round up?'], ['Q1', 'Which currency?'], ['Q4', 'And which symbol?'], ['Q3', 'Round per person?']]);
+});
+
+test('an answer that kept the assumption carries over to the same question in the next plan', async t => {
+  const fx = await designFixture(t);
+  const q = '- For the person: Q1. Round to what amount? Assumed: the next whole unit.';
+  await fx.markReady('plan_1', withQuestions(`${q}\n- For the person: Q2. Show the rounding? Assumed: yes.`));
+  await fx.harness.behavior.runCli(['plan-answer', 'TEST-1', 'keep', '--question', 'Q1'], { threadId: 'thr_lead' });
+  await fx.harness.behavior.runCli(['plan-answer', 'TEST-1', 'keep', '--question', 'Q2'], { threadId: 'thr_lead' });
+  for (const [threadId, lens] of [['thr_d1', 'Zoom Out'], ['thr_d2', 'Comprehension'], ['thr_d3', 'Codebase Details']]) await fx.record(threadId, lens);
+  await fx.markReady('plan_2', withQuestions(`${q}\n- For the person: Q2. Show the rounding on its own line? Assumed: yes.`).replace('Change tip.py.', 'Change tip.py and README.md.'));
+  const questions = (await fx.read()).plans[0].personQuestions;
+  assert.equal(questions[0].answer.choice, 'keep', 'the same question, word for word');
+  assert.equal(questions[1].answer, null, 'a reworded one is asked again');
+  assert.equal(fx.say('thr_lead', /only the person can answer/).length, 2, 'and the Lead hears about it');
+});
+
+test('a new READY plan or an accepted plan stops the old round\'s reviewers still reading', async t => {
+  const fx = await designFixture(t);
+  await fx.markReady();
+  await fx.record('thr_d1', 'Zoom Out', finding(1, 'Major', 'Reinvents the parser'));
+  await fx.harness.behavior.runCli(['design-resolve', 'TEST-1', '--finding', '1.zoom-out.1', '--as', 'fix', '--note', 'yes'], { threadId: 'thr_planner' });
+  await fx.markReady('plan_2', readyPlan('\nReuse parse_args.'));
+  assert.deepEqual(fx.stopped, ['thr_d2', 'thr_d3'], 'the two still reading; the one that recorded is left alone');
+  await fx.harness.behavior.runCli(['design-accept', 'TEST-1', '--reason', 'The person is happy with it'], { threadId: 'thr_lead' });
+  assert.deepEqual(fx.stopped, ['thr_d2', 'thr_d3', 'thr_d4', 'thr_d5', 'thr_d6']);
+});
+
+test('design reviewers fall back to the Planner\'s provider when theirs isn\'t available, and never block', async t => {
+  const fx = await designFixture(t, {}, { providers: { list: async () => [{ id: 'claude-code', available: true }, { id: 'codex', available: false }] } });
+  await fx.markReady();
+  assert.deepEqual(fx.spawns.map(spawn => spawn.providerId), ['claude-code', 'claude-code', 'claude-code'], JSON.stringify(fx.spawns.map(spawn => spawn.providerId)));
+  assert.ok(fx.posted.some(body => /The design reviewer seat's provider isn't available here, so they run on the Planner's \(claude-code\)/.test(body)));
+  const reminder = workerReminder({ role: 'designreview', factoryName: 'F', taskKey: 'T-1' });
+  assert.doesNotMatch(reminder, /bb factory block/);
+  assert.match(reminder, /never block the task/);
+  assert.match(designReviewPrompt({ factoryName: 'F', prefix: 'F', task: { key: 'T-1', title: 't' }, lens: 'zoom-out', round: 1, planCommentId: 'c' }), /Never block or move the task/);
+});
+
+test('turning design review off lets plans held by it go ahead', async t => {
+  const fx = await designFixture(t);
+  await fx.markReady('plan_1', withQuestions('- For the person: Q1. Round to what?'));
+  assert.notEqual((await fx.harness.behavior.runCli(['assign', 'TEST-1', '--role', 'build'])).exitCode, 0);
+  await fx.harness.behavior.runCli(['design-review', 'TEST', 'off']);
+  assert.equal((await fx.harness.behavior.runCli(['assign', 'TEST-1', '--role', 'build'])).exitCode, 0);
+});
+
+test('a reviewer\'s cleanup picks up where it failed, and a reviewer bb no longer lists is left alone', async t => {
+  const lens = (threadId, over = {}) => ({ lens: 'zoom-out', threadId, findingsCommentId: 'c', recordedAt: '', quietNotifiedAt: null, worktreeDeletedAt: null, cleanedAt: null, ...over });
+  const round = { taskKey: 'TEST-1', round: 1, planCommentId: 'plan_1', depth: 'core', startedAt: '', findings: [], outcome: 'clean', outcomeNotifiedAt: '2026-11-08T00:00:00Z', lenses: [lens('thr_r1'), lens('thr_gone')] };
+  let branchFails = true;
+  const deleted = [];
+  const branches = [];
+  const fx = await designFixture(t, { designRounds: [round] }, {
+    threads: {
+      list: async ({ threadIds = [] }) => threadIds.filter(id => id === 'thr_r1').map(id => ({ id, environmentIsWorktree: true, environmentBranchName: `bb/test-1-design-review-zoom-out-round-1-x-${id}` })),
+      get: async ({ threadId }) => makeThreadResponse({ id: threadId, status: 'idle', environmentId: `env_${threadId}`, archivedAt: 1 }),
+    },
+    environments: { delete: async ({ environmentId }) => { if (deleted.includes(environmentId)) throw new Error('404'); deleted.push(environmentId); return { ok: true }; } },
+    hostRpc: async ({ method, input }) => { if (method === 'delete_explorer_branch') { branches.push(input.branch); if (branchFails) throw new Error('timeout'); return { deleted: true, missing: false, error: null }; } return { code: 0, stdout: '[]', stderr: '' }; },
+    projectPath: '/repo/sand',
+  });
+  await exploreWatch(fx.harness);
+  let lenses = (await fx.read()).designRounds[0].lenses;
+  assert.ok(lenses[0].worktreeDeletedAt !== null && lenses[0].cleanedAt === null, 'the worktree went, the branch didn\'t');
+  assert.ok(lenses[1].cleanedAt !== null, 'bb doesn\'t list it: nothing to delete');
+  branchFails = false;
+  await exploreWatch(fx.harness);
+  lenses = (await fx.read()).designRounds[0].lenses;
+  assert.deepEqual(deleted, ['env_thr_r1'], 'the worktree isn\'t deleted twice');
+  assert.equal(branches.length, 2);
+  assert.ok(lenses[0].cleanedAt !== null);
+});
+
+test('the doctor leaves out plans still in design review, and idle design reviewers aren\'t stalled workers', async t => {
+  const agents = [
+    { threadId: 'thr_plan', role: 'plan', taskKey: 'TEST-1', providerId: 'codex', createdAt: '', pr: null },
+    { threadId: 'thr_dr', role: 'designreview', taskKey: 'TEST-1', providerId: 'codex', createdAt: '', pr: null },
+    { threadId: 'thr_plan2', role: 'plan', taskKey: 'TEST-2', providerId: 'codex', createdAt: '', pr: null },
+  ];
+  const plans = [
+    { taskKey: 'TEST-1', threadId: 'thr_plan', commentId: 'c1', designRequired: true, reviewedCommentId: null },
+    { taskKey: 'TEST-2', threadId: 'thr_plan2', commentId: 'c2', designRequired: true, reviewedCommentId: 'c2' },
+  ];
+  const designRounds = [{ taskKey: 'TEST-1', round: 1, planCommentId: 'c1', depth: 'core', startedAt: '', lenses: designLenses(false), findings: [], outcome: null }];
+  const { harness } = await nightlyFixture(t, () => [boardTask('TEST-1', 'in_progress'), boardTask('TEST-2', 'in_progress')], { agents, plans, designRounds, designReviewEnabled: true });
+  const health = await healthOf(harness);
+  assert.deepEqual(health.readyPlansAwaitingBuilder.map(task => task.taskKey), ['TEST-2']);
+  assert.deepEqual(health.inProgressWithoutLiveWorker, []);
+});
+
+test('"plan passed" is posted and sent once, even when the watch and the last report race', async t => {
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const fx = await designFixture(t, {}, { threads: { send: async args => { if (/passed design review/.test(args.input[0].text)) { fx2.sent.push(args); await gate; } return {}; } } });
+  const fx2 = { sent: [] };
+  await fx.markReady();
+  await fx.record('thr_d1', 'Zoom Out');
+  await fx.record('thr_d2', 'Comprehension');
+  const last = fx.record('thr_d3', 'Codebase Details');
+  await new Promise(resolve => setTimeout(resolve, 50));
+  const watching = exploreWatch(fx.harness);
+  await new Promise(resolve => setTimeout(resolve, 50));
+  release();
+  await Promise.all([last, watching]);
+  assert.equal(fx2.sent.length, 1);
+  assert.equal(fx.posted.filter(body => /^\*\*Design review passed\*\*/.test(body)).length, 1);
 });

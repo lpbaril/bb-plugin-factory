@@ -139,14 +139,17 @@ Google's [Elephant & Goldfish Model](https://github.com/google/elephant-goldfish
   `bb factory design-resolve`: **fix**, **contest** with evidence the reviewer could
   have read, **escalate** when only you know the answer, or **decline** for Nits. A
   Comprehension finding can't be contested.
-- A Builder can't start until no Blocker or Major is unsettled. After a fix, the
-  Planner posts a new READY plan, which starts the next round. A round with no
-  unsettled Blocker or Major ends the review.
+- A Builder can't start until no Blocker or Major is unsettled. The Planner resolves
+  every Blocker and Major first, then posts a new READY plan after a fix, which starts
+  the next round and stops the old round's reviewers still reading. The same plan
+  can't be marked ready again to shake off its findings. A round with no unsettled
+  Blocker or Major ends the review, and its findings can't change after that.
 - Only escalations reach you, through the Lead or as Keep and Fix buttons on the task
   on the Factory page. So do the plan's own questions for you: the Planner lists each
   one under "## Open questions" as `- For the person: Q1. <question> Assumed: <what the
   plan builds on>`. The Lead gets them as soon as the plan is READY, and no Builder
-  starts until you've answered each, through the Lead (`bb factory plan-answer APP-12
+  starts until you've answered each (an answer that kept the plan's assumption carries
+  over to the same question in the next plan), through the Lead (`bb factory plan-answer APP-12
   keep|change --question Q1`) or on the task. A different answer sends the plan back to
   the Planner for a new READY plan. After 5 rounds, the Lead brings the plan to you: you can accept it
   as it is (`bb factory design-accept APP-12 --reason "..."`) or send it back.
@@ -159,7 +162,8 @@ Google's [Elephant & Goldfish Model](https://github.com/google/elephant-goldfish
 Design review is on for new factories. Existing factories turn it on from outside an
 agent thread: `bb factory design-review APP on`. It applies to plans marked ready from
 then on. The design reviewer seat in Agents defaults to Codex, a provider other than
-the Planner's.
+the Planner's; if that provider isn't available, reviewers run on the Planner's and
+the task says so. Turning design review off lets plans it was holding go ahead.
 
 The Lead escalates technical disputes and substantive replanning to the Planner,
 and product decisions to you. It cannot waive review gates. New PR reviewers
