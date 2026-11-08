@@ -64,10 +64,15 @@ test('the host worker deletes only an Explorer\'s branch, and not one still chec
   for (const branch of ['bb/app-15-builder-add-tax-thr_def456', 'bb/app-18-builder-add-file-explorer-thr_abc123', 'main', 'master', '-D', 'bb/app-16-explorer-../../x-thr_abc123', 'bb/app-16-explorer-x --force-thr_abc123']) {
     const result = await del(branch);
     assert.equal(result.deleted, false, branch);
-    assert.match(result.error, /isn't the branch of Explorer thr_abc123/, branch);
+    assert.match(result.error, /isn't the branch of Explorer or design reviewer thr_abc123/, branch);
   }
   git('branch', 'bb/app-19-explorer-other-thr_zzz999');
-  assert.match((await del('bb/app-19-explorer-other-thr_zzz999')).error, /isn't the branch of Explorer thr_abc123/, 'another Explorer\'s branch');
+  assert.match((await del('bb/app-19-explorer-other-thr_zzz999')).error, /isn't the branch of Explorer or design reviewer thr_abc123/, 'another Explorer\'s branch');
+  const reviewer = 'bb/app-20-design-review-zoom-out-round-1-x-thr_abc123';
+  git('branch', reviewer);
+  assert.deepEqual(await del(reviewer), { deleted: true, missing: false, error: null }, 'a design reviewer\'s branch');
+  git('branch', 'bb/app-21-planner-design-review-thr_abc123');
+  assert.equal((await del('bb/app-21-planner-design-review-thr_abc123')).deleted, false, 'a Planner\'s branch, even with "design-review" in its title');
   assert.notEqual(git('branch', '--list', 'bb/app-18-builder-add-file-explorer-thr_abc123').trim(), '');
   assert.notEqual(git('branch', '--list', 'bb/app-15-builder-add-tax-thr_def456').trim(), '', 'a Builder\'s branch stays');
   const busy = 'bb/app-17-explorer-still-here-thr_abc123';

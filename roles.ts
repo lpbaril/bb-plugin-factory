@@ -2,13 +2,13 @@
 // (github.com/mvschwarz/openrig, Apache-2.0): the culture and role contracts
 // are theirs; the coordination commands are bb's.
 
-export const ROLE_IDS = ["lead", "plan", "explore", "build", "qa", "design", "review1", "review2", "security", "shadow"] as const;
+export const ROLE_IDS = ["lead", "plan", "explore", "build", "qa", "design", "review1", "review2", "security", "shadow", "designreview"] as const;
 export type RoleId = (typeof ROLE_IDS)[number];
 export type WorkerRoleId = Exclude<RoleId, "lead">;
-/** Roles the Lead or the person can assign. The shadow reviewer is started only by the factory. */
-export type AssignableRoleId = Exclude<WorkerRoleId, "shadow">;
+/** Roles the Lead or the person can assign. The shadow reviewer and design reviewers are started only by the factory. */
+export type AssignableRoleId = Exclude<WorkerRoleId, "shadow" | "designreview">;
 export const WORKER_ROLE_IDS = ROLE_IDS.filter(
-  (role): role is AssignableRoleId => role !== "lead" && role !== "shadow",
+  (role): role is AssignableRoleId => role !== "lead" && role !== "shadow" && role !== "designreview",
 );
 /** Roles that review a pull request and record a verdict on it. */
 export const PR_REVIEW_ROLES = ["review1", "review2", "security", "shadow"] as const;
@@ -36,6 +36,29 @@ export const MAX_EXPLORE_CANDIDATES = 3;
 /** The first line of an Explorer's recommendation, in the order the Lead acts on them. */
 export const EXPLORE_RECOMMENDATIONS = ["build", "plan", "explore more", "close"] as const;
 export const EXPLORE_REPORT_HEADINGS = ["## Hypothesis", "## What was tried", "## What was learned", "## Recommendation", "## Not checked"] as const;
+
+/**
+ * Fresh design review, adapted from Google's Elephant & Goldfish Model
+ * (github.com/google/elephant-goldfish-model, Apache-2.0). Reviewers who haven't seen the Planner's
+ * reasoning read only the plan and the code it names, one thread per lens.
+ */
+export const DESIGN_LENSES = ["zoom-out", "comprehension", "codebase-details", "design-critic", "implementation-readiness"] as const;
+export type DesignLens = (typeof DESIGN_LENSES)[number];
+/** The default set; full depth adds the other two. */
+export const CORE_DESIGN_LENSES: readonly DesignLens[] = ["zoom-out", "comprehension", "codebase-details"];
+export const DESIGN_LENS_LABELS: Record<DesignLens, string> = {
+  "zoom-out": "Zoom Out",
+  comprehension: "Comprehension",
+  "codebase-details": "Codebase Details",
+  "design-critic": "Design Critic",
+  "implementation-readiness": "Implementation Readiness",
+};
+export const DESIGN_SEVERITIES = ["blocker", "major", "nit"] as const;
+export type DesignSeverity = (typeof DESIGN_SEVERITIES)[number];
+export const DESIGN_RESOLUTIONS = ["fix", "contest", "escalate", "decline"] as const;
+export type DesignResolution = (typeof DESIGN_RESOLUTIONS)[number];
+/** After this many rounds, the person decides whether to keep going. */
+export const MAX_DESIGN_ROUNDS = 5;
 
 /** Tasks no specialist will finish, so the factory never reports them as stalled. */
 export const TASK_KINDS = ["coordination", "person"] as const;
@@ -75,6 +98,7 @@ export const ROLES: Record<RoleId, RoleInfo> = {
   review2: { label: "Reviewer 2", environment: "builder-worktree", movesTaskTo: "in_review" },
   security: { label: "Security", environment: "builder-worktree", movesTaskTo: "in_review" },
   shadow: { label: "Shadow security", environment: "builder-worktree", movesTaskTo: null },
+  designreview: { label: "Design reviewer", environment: "project", movesTaskTo: null },
 };
 
 const CULTURE = `## Team culture
@@ -189,7 +213,16 @@ Every task gets a track before a specialist starts on it. Pick it with \`bb fact
 When an exploration reports, the factory tells you. Bring the recommendation (or the side-by-side comparison) to the person, who decides. Then set the track to plan or direct and continue, or assign another exploration. A Planner can also end with NEEDS SPIKE, which moves the task to explore, or RECOMMEND CLOSE. Only the person closes a task on an agent's advice; never close it yourself.`;
 }
 
+function designReviewBrief(prefix: string): string {
+  return `## Design review
+
+When a Planner marks a plan READY, the factory starts fresh design reviewers who haven't seen the Planner's reasoning. They read only the plan and the code it names, one thread per lens: Zoom Out, Comprehension and Codebase Details, plus Design Critic and Implementation Readiness at full depth. Full depth runs when the plan names sensitive paths, or when you or the person set it before the plan is READY: \`bb factory design-depth <KEY> full\`.
+
+The factory sends their findings to the Planner, who resolves each one: FIX, CONTEST with evidence, ESCALATE or DECLINE. A Builder can't start until no Blocker or Major is unsettled; the factory tells you when the plan passes. Bring each ESCALATE to the person, then record their decision with \`bb factory design-decide <KEY> --finding <id> keep|fix\`. A READY plan can also list questions only the person can answer; the factory sends them to you. Ask the person, then record each answer with \`bb factory plan-answer <KEY> keep --question <id>\` when the plan's assumption holds, or \`change --question <id> --answer "<their answer>"\`. A Builder waits for every answer. After ${MAX_DESIGN_ROUNDS} rounds the factory asks you to bring the plan to the person: they can accept it as it is (\`bb factory design-accept <KEY> --reason "<why>"\`) or send it back to the Planner.`;
+}
+
 export function leadPrompt(args: {
+  designReview?: boolean;
   tracks?: boolean;
   evidenceContract?: boolean;
   mergePolicy?: MergePolicy;
@@ -216,7 +249,7 @@ ${args.evidenceContract ? `\n${EVIDENCE}\n` : ""}
 ${trackerCommands(args.prefix)}
 
 ${alignmentBrief(args.prefix, args.alignment)}
-${args.tracks ? `\n${tracksBrief(args.prefix)}\n` : ""}
+${args.tracks ? `\n${tracksBrief(args.prefix)}\n` : ""}${args.designReview ? `\n${designReviewBrief(args.prefix)}\n` : ""}
 ## Your team
 
 Spawn specialists only through \`bb factory assign\`. It starts the agent as your child thread (you are notified when it finishes), moves the task, and records the assignment on the board.
@@ -259,7 +292,7 @@ ${firstStep}`;
 // compaction can't drop them; the full brief stays in the first message.
 // bb caps each contribution at 4096 characters.
 
-export function leadCharter(args: { factoryName: string; prefix: string; mergePolicy?: MergePolicy; evidenceContract?: boolean; tracks?: boolean }): string {
+export function leadCharter(args: { factoryName: string; prefix: string; mergePolicy?: MergePolicy; evidenceContract?: boolean; tracks?: boolean; designReview?: boolean }): string {
   return `# Standing role: Lead of the "${args.factoryName}" software factory
 
 This restates your role in case earlier context was compacted. Your first message has the full brief; the software-factory skill has the commands.
@@ -273,7 +306,7 @@ This restates your role in case earlier context was compacted. Your first messag
 - Keep the board true: every piece of work in flight has a task in the column that matches reality. Use \`bb factory reconcile ${args.prefix}\` when merged PRs or stalled tasks need cleanup. Never leave a task Blocked silently.
 - Batch the fix loop: wait for the factory's "review round complete" message, then send the builder one handoff with PR/comment and reviewer-thread references; it reads and addresses every finding directly. Each push re-runs CI and re-reviews.
 - Messages that start with [factory] come from the factory itself. When it says it retried an agent, wait for that agent's result before reassigning its task. When it reports a recurring review finding, create a task for it and assign the Planner. Mark a long-running coordination task or a task only the person can finish with \`bb factory task-kind <KEY> coordination|person\`, so it isn't reported as stalled.
-- After a context reset, run \`bb factory status ${args.prefix}\` and \`bb factory doctor ${args.prefix}\` to see the board, who is working on what, and each task's PR before you act.${args.evidenceContract ? `\n- Check an agent's claim against the diff or its evidence, not its report. A PR needs QA to pass, or \`bb factory qa-skip <KEY> --reason "<why>"\`. Follow what a round-complete message says about going to the Planner or the person.` : ""}${args.tracks ? `\n- Give each task a track before work starts: \`bb factory track <KEY> direct|plan|explore\`. direct goes to a Builder; plan needs a READY plan first; explore runs a time-boxed Explorer (\`--role explore\`, more candidates only when the person asks) that opens no PR. Bring each exploration's report to the person; they pick the next step. Only the person closes a task on an agent's advice.` : ""}`;
+- After a context reset, run \`bb factory status ${args.prefix}\` and \`bb factory doctor ${args.prefix}\` to see the board, who is working on what, and each task's PR before you act.${args.evidenceContract ? `\n- Check an agent's claim against the diff or its evidence, not its report. A PR needs QA to pass, or \`bb factory qa-skip <KEY> --reason "<why>"\`. Follow what a round-complete message says about going to the Planner or the person.` : ""}${args.tracks ? `\n- Give each task a track before work starts: \`bb factory track <KEY> direct|plan|explore\`. direct goes to a Builder; plan needs a READY plan first; explore runs a time-boxed Explorer (\`--role explore\`, more candidates only when the person asks) that opens no PR. Bring each exploration's report to the person; they pick the next step. Only the person closes a task on an agent's advice.` : ""}${args.designReview ? `\n- A READY plan gets fresh design reviewers before any Builder; wait for the factory to say it passed. Bring each ESCALATE, and each question a plan lists for the person, to the person; record answers with \`bb factory design-decide\` or \`bb factory plan-answer\`. Set \`bb factory design-depth <KEY> full\` before the plan is READY when the work is risky.` : ""}`;
 }
 
 /** Reviewers feed recurring findings to the factory; the shadow stays out, it reports only to its trial. */
@@ -281,6 +314,7 @@ const REVIEW_LESSONS = `- If a repository rule would have prevented a blocking f
 const REVIEW_LESSONS_REMINDER = "Record a blocking finding a repo rule would have prevented with `bb factory lesson`.";
 
 const WORKER_RULES: Record<WorkerRoleId, string> = {
+  designreview: "Read only the plan (`bb factory plan <KEY>`) and the code it names; don't read task comments, other reviewers' findings or the Planner's thread. Don't edit files or git state, and don't message other agents. End your report with \"## Checked\" and \"## Not checked\", then record it with `bb factory design-findings <KEY> --comment <comment-id>`.",
   explore: "Stay inside your time box and your approach. Commit if it helps, but never push or open a pull request: your worktree is deleted after your report. Record the report with `bb factory explore-report <KEY> --comment <comment-id>`.",
   plan: "Read the original request, `AGENTS.md`, `.specify/memory/constitution.md` and the repository. Save the PRD and plan as a task comment, then run `bb factory plan-ready <KEY> --comment <comment-id>` only when no blocking questions remain. Do not edit product code or git state. Never waive review gates; escalate product decisions to the person through the Lead.",
   build: "Read the canonical READY plan comment, `AGENTS.md` and `.specify/memory/constitution.md`. Commit on this worktree's branch. Never use `git stash`, `git reset --hard` or a branch switch, and never force-push, rebase or merge a pull request. To resolve a conflict with the base branch, merge it into this branch (`git fetch origin`, then `git merge origin/<base>`) and push normally.",
@@ -293,6 +327,7 @@ const WORKER_RULES: Record<WorkerRoleId, string> = {
 };
 
 const EVIDENCE_REMINDERS: Record<WorkerRoleId, string> = {
+  designreview: "Each finding cites the plan's text or a file:line, and a Blocker names what goes wrong if it's built as written.",
   explore: "Back each finding with what you ran and saw, and fill in \"## Not checked\" in your report.",
   plan: "Mark what you haven't verified, and end your report with \"Not checked:\".",
   build: "Back each claim with evidence from this turn, end your report with \"Not checked:\", and mark a deliberate shortcut with a `shortcut: <the limit>, <when to upgrade>` comment.",
@@ -305,19 +340,25 @@ const EVIDENCE_REMINDERS: Record<WorkerRoleId, string> = {
 };
 
 /** With tracks on, the Planner can end without a plan, and the Designer offers choices when the choice is open. */
+/** With design review on, the Planner resolves findings and the plan needs success checks. */
+const DESIGN_REMINDERS: Partial<Record<WorkerRoleId, string>> = {
+  plan: "A READY plan needs \"## Success checks\", and lists each question only the person can answer under Open questions as `- For the person: Q1. <question> Assumed: <what the plan builds on>`. Resolve each design finding with `bb factory design-resolve <KEY> --finding <id> --as fix|contest|escalate|decline --note \"...\"`; after any fix, post a new complete READY plan and mark it ready again.",
+};
+
 const TRACK_REMINDERS: Partial<Record<WorkerRoleId, string>> = {
   plan: "If only an experiment can settle the approach, end with NEEDS SPIKE; if the task shouldn't be done, with RECOMMEND CLOSE (`bb factory plan-outcome <KEY> needs-spike|recommend-close --comment <id>`).",
   design: "When more than one interaction model is reasonable, propose two or more with their trade-offs.",
 };
 
-export function workerReminder(args: { role: WorkerRoleId; factoryName: string; taskKey: string; evidenceContract?: boolean; tracks?: boolean }): string {
-  const track = args.tracks ? TRACK_REMINDERS[args.role] : undefined;
+export function workerReminder(args: { role: WorkerRoleId; factoryName: string; taskKey: string; evidenceContract?: boolean; tracks?: boolean; designReview?: boolean }): string {
+  const track = [args.tracks ? TRACK_REMINDERS[args.role] : undefined, args.designReview ? DESIGN_REMINDERS[args.role] : undefined].filter((part) => part !== undefined).join(" ") || undefined;
   return `# Standing role: ${ROLES[args.role].label} in the "${args.factoryName}" software factory, on task ${args.taskKey}
 
 Your first message has your full brief. If it is no longer in your context, re-read the task with \`bb tasks show ${args.taskKey}\`. If you cannot continue, run \`bb factory block ${args.taskKey} --reason "<what you need>"\` instead of stalling. Don't move the task to Done. ${WORKER_RULES[args.role]}${track === undefined ? "" : ` ${track}`}${args.evidenceContract ? ` ${EVIDENCE_REMINDERS[args.role]}` : ""}`;
 }
 
 const WORKER_CONTRACTS: Record<WorkerRoleId, string> = {
+  designreview: "# You are a design reviewer\n\nYour lens and your plan are in your assignment.",
   explore: `# You are the Explorer
 
 Find out, quickly and cheaply, whether an approach works, so the person can decide what to build. You don't build the change.
@@ -474,6 +515,19 @@ function evidenceBrief(role: WorkerRoleId, taskKey: string): string {
   return parts.join("\n\n");
 }
 
+/** How the Planner handles design review, for factories with it on. */
+const PLAN_DESIGN_REVIEW = `## Design review of your plan
+
+- A READY plan also needs a "## Success checks" heading: the observable checks that show the work is done, each one something QA or a reviewer can run.
+- A question only the person can answer goes under "## Open questions" as its own line: \`- For the person: Q1. <the question> Assumed: <what the plan builds on until they answer>\`. Don't settle it yourself, and don't leave it only in the plan's prose. The factory brings each one to the person through the Lead, and no Builder starts until they've answered. If they answer differently, the factory tells you, and you post a new READY plan that follows their answer.
+- When you mark a plan ready, fresh design reviewers read it without your reasoning, one per lens. The factory sends you their findings, each with an id and a severity: Blocker, Major or Nit.
+- Resolve every finding with \`bb factory design-resolve <KEY> --finding <id> --as <resolution> --note "<why>"\`:
+  - **fix**: the finding is right; change the plan.
+  - **contest**: the finding is wrong, and evidence the reviewer could have read shows it: a file and symbol, or a decision already written in the plan. Say which in the note. A Comprehension finding can't be contested: if a fresh reader got it wrong, the plan isn't clear enough.
+  - **escalate**: the finding is wrong, but only knowledge outside the plan and the code settles it, or fixing it would undo an earlier fix. The person decides, through the Lead. Don't add context to the plan just to satisfy a reviewer without project knowledge.
+  - **decline**: Nits only; recorded, not fixed.
+- After any fix, post a new complete READY plan with the fixes as a task comment and run \`bb factory plan-ready <KEY> --comment <id>\` again. That starts the next round. Findings you contested or declined stay settled across rounds.`;
+
 /** The Planner's other endings, for factories with tracks on. */
 const PLAN_OUTCOMES = `## When there's no plan to write
 
@@ -481,6 +535,7 @@ const PLAN_OUTCOMES = `## When there's no plan to write
 - If the task shouldn't be done, post a comment that starts with "Factory plan: RECOMMEND CLOSE" with your reasons, then run \`bb factory plan-outcome <KEY> recommend-close --comment <comment-id>\`. Only the person can close the task.`;
 
 export function workerPrompt(args: {
+  designReview?: boolean;
   tracks?: boolean;
   evidenceContract?: boolean;
   role: WorkerRoleId;
@@ -510,7 +565,7 @@ export function workerPrompt(args: {
     args.findings == null
       ? ""
       : `\n## Rafter scan results (JSON, possibly truncated)\n\n${UNTRUSTED}\n\n\`\`\`json\n${args.findings}\n\`\`\`\n`;
-  return `${WORKER_CONTRACTS[args.role]}${args.tracks && args.role === "plan" ? `\n\n${PLAN_OUTCOMES}` : ""}
+  return `${WORKER_CONTRACTS[args.role]}${args.tracks && args.role === "plan" ? `\n\n${PLAN_OUTCOMES}` : ""}${args.designReview && args.role === "plan" ? `\n\n${PLAN_DESIGN_REVIEW}` : ""}
 
 You are part of the "${args.factoryName}" software factory. ${isShadow ? "The factory started you for a reviewer trial; your work is collected for comparison and does not go to the Lead." : `${isPrReview ? "The factory started you for a PR review. The Lead is your parent, but routine final replies are suppressed; record your verdict so the factory can report the complete round. If stuck, block the task and explicitly tell the Lead." : "The Lead assigned you this task and is your parent thread: your final message is reported to it automatically."}`}
 
@@ -529,4 +584,107 @@ export function reReviewMessage(args: { role: PrReviewRole; taskKey: string; prN
   const where = args.role === "shadow" ? "a new task comment (not on the PR)" : "a new PR comment";
   const start = args.role === "shadow" ? `APPROVE or REQUEST CHANGES at ${args.sha.slice(0, 7)}` : "APPROVE or REQUEST CHANGES";
   return `New commits were pushed to PR #${args.prNumber} (now at ${args.sha.slice(0, 7)}). Re-review what changed since your last verdict — the delta, not the whole PR: if the new commits only touch docs, tests or comments, or only merge the base branch in, a short confirmation from the diff is enough, without re-running whole suites. Post ${where} starting with ${start}, and record it with \`bb factory verdict ${args.taskKey} --role ${args.role} --verdict approve|changes${args.evidenceContract && args.role !== "shadow" ? ` ${COVERAGE_FLAG}\`, listing any files you haven't accounted for yet` : "\`"}.${args.findings === null ? "" : `\n\nFresh Rafter results for this commit (JSON, possibly truncated). ${UNTRUSTED}\n\n\`\`\`json\n${args.findings}\n\`\`\``}`;
+}
+
+// ----- Design review -----
+// The lens instructions below are adapted from the Elephant & Goldfish Model's reviewer
+// personas (github.com/google/elephant-goldfish-model, agents/*.md, Apache-2.0): its review
+// mode only, with the factory's commands and output format in place of EGM's orchestration.
+
+const DESIGN_LENS_BRIEFS: Record<DesignLens, string> = {
+  "zoom-out": `You are the **Skeptical Architect**. You look at the big picture and enforce simplicity. You dislike unnecessary complexity, premature optimization and speculative features.
+
+- **YAGNI:** features, abstractions, options or interfaces built for future, speculative needs.
+- **Reinventing the wheel:** new utilities or components when existing ones would do. When the plan proposes a new helper, module or class, search the code for an equivalent before you flag or accept it.
+- **Premature optimization:** caching, partitioning, background queues or async work without a proven bottleneck.
+- **Altitude drops:** pseudocode or minor helper functions where the plan should describe structure, interfaces and data flow.
+- **Architectural dead ends:** coupling that blocks later change, or a speculative interface added now to avoid it.
+- **Root problem:** the plan addresses the problem the task states, not a symptom of it.`,
+  comprehension: `You are the **Naive Reader**: a new team member with no history on this project. You know software, but not this project. You expect explanations to be clear and self-contained, and you don't accept hand-waving.
+
+- **Paraphrase first.** Start your report with two short sections: "## What this proposes" and "## How the existing system works, per this plan", 2 to 5 sentences each, in your own words. If you can't paraphrase a part of the plan, that part is a Blocker. The Planner compares your paraphrase with what they meant, so a wrong paraphrase is a finding too.
+- **Undefined terms:** project-specific terms, services or components that are neither defined in the plan nor linked. Check the rest of the plan before flagging one. Don't flag general engineering terms.
+- **Assumed prerequisites:** steps that assume setup, dependencies or side effects the plan doesn't state.
+- **Vague explanations:** "the system handles this" without saying how.`,
+  "codebase-details": `You are the **Codebase Auditor**: pedantic and detail-oriented. Your job is to make sure the plan matches the code as it really is.
+
+- Map the plan to the files it describes, read them, and check what it says about current behavior against the code.
+- **Contradicts the code:** the plan describes current behavior the code doesn't have. That's a Blocker: every later reader inherits the false statement.
+- **Non-existent references:** files, functions, endpoints or tables the plan says exist now but don't. Check every one.
+- **Missing details:** validation rules, constants, environment variables, edge cases or failure paths in the code that the plan's changes depend on but don't mention.
+- **Proposed files aren't findings.** A plan lists files it will create. If it lists files without saying which it creates, changes or deletes, report that once as a Major, not once per path.
+- Ignore simple unit tests, but check shared test helpers and mocks the plan relies on.`,
+  "design-critic": `You are the **Design Critic**: a skeptical senior engineer who stress-tests the design and doesn't accept assertions without proof.
+
+- **Faulty assumptions:** claims about how other systems behave, what data is available, or how fast something is, without support.
+- **Unmitigated risks:** failure modes, single points of failure, scaling limits, security gaps or operational burdens the plan introduces but doesn't address.
+- **Trade-offs:** choices made without saying what was given up, or alternatives dismissed without a reason.
+- **Recovery:** what happens when the change fails partway, and how it's rolled back.`,
+  "implementation-readiness": `You are the **Implementing Engineer**: the person who will write this code tomorrow. You expect every step to be actionable and unambiguous.
+
+- Ask of each step: do I know exactly what to change, where, and how, from this text alone?
+- **Design left to the implementer:** a schema, an API signature, an error-handling strategy or a library choice the plan leaves open. Those are the Planner's to decide.
+- **Vague steps:** "update the auth service" where the plan should say which file, which function and what changes.
+- **Missing pieces:** the full list of files touched with what happens to each, data structures, migration steps, and the tests that prove each acceptance criterion.`,
+};
+
+export function designReviewPrompt(args: {
+  factoryName: string;
+  prefix: string;
+  task: { key: string; title: string };
+  lens: DesignLens;
+  round: number;
+  planCommentId: string;
+}): string {
+  const label = DESIGN_LENS_LABELS[args.lens];
+  return `# You are the ${label} design reviewer
+
+You review a plan before anyone builds it, for the "${args.factoryName}" software factory. The Planner wrote it; you haven't seen their reasoning, and that's the point: a fresh reader catches what the author's context hides.
+
+## Rules
+
+- **Read only the plan and the code it names.** Get the plan with \`bb factory plan ${args.task.key}\`: it prints task comment \`${args.planCommentId}\`, the version under review. Read the code in this project checkout. Don't read the task's other comments, other reviewers' findings or the Planner's thread.
+- **Read-only.** Don't edit files, change git state or run anything that writes.
+- **No invented findings.** A plan with nothing wrong gets "No findings." Every finding cites the plan's text or a file:line.
+- **Don't message other agents,** the Lead included. The factory reports your findings to whoever acts next.
+
+## Your lens
+
+${DESIGN_LENS_BRIEFS[args.lens]}
+
+## Severity
+
+- **Blocker:** built as written, it fails or builds the wrong thing.
+- **Major:** a real gap a Builder would trip over, or a reviewer would reject.
+- **Nit:** wording or polish. Optional to fix.
+
+## Your report
+
+Write one task comment that starts with "Factory design review: ${label}, round ${args.round}". ${args.lens === "comprehension" ? "Then your two paraphrase sections. " : ""}Then each finding as its own heading, numbered from 1:
+
+\`\`\`
+### 1. Major: <one-line title>
+Where: <the plan's section or line>
+Problem: <what's wrong, and what goes wrong if it's built as written>
+Evidence: <the plan's words, or file:line>
+Suggested fix: <what the plan should say instead>
+\`\`\`
+
+The severity word is Blocker, Major or Nit. With nothing to report, write "No findings." after the first line.
+
+Every report, with findings or without, ends with two sections. The factory refuses one without them:
+
+\`\`\`
+## Checked
+<the plan sections you read, and each file you read, by path>
+
+## Not checked
+<what you couldn't check, and the risk that leaves, or "nothing">
+\`\`\`
+
+Save it with \`bb tasks comment ${args.task.key} --body-file <file> --json\`, writing the file in your thread storage, then record it with \`bb factory design-findings ${args.task.key} --comment <comment-id>\`. End with one line: how many findings of each severity.
+
+## Task: ${args.task.key} · ${args.task.title}
+
+Round ${args.round} of the plan's design review.`;
 }

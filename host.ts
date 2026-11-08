@@ -6,7 +6,7 @@ import { mkdir, readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { experimental_defineHostEntry } from "@get-bb/plugin-sdk";
-import { GH_ALLOWED, hostContract, isExplorerBranch, type RepoInspection } from "./host-contract";
+import { GH_ALLOWED, hostContract, isDisposableBranch, type RepoInspection } from "./host-contract";
 
 function git(cwd: string, args: string[], signal?: AbortSignal): Promise<{ code: number; stderr: string }> {
   return new Promise((resolvePromise) => {
@@ -344,7 +344,7 @@ export default experimental_defineHostEntry({
       });
     },
     delete_explorer_branch: async ({ projectPath, branch, threadId }, ctx) => {
-      if (!isExplorerBranch(branch, threadId)) return { deleted: false, missing: false, error: `${branch} isn't the branch of Explorer ${threadId}` };
+      if (!isDisposableBranch(branch, threadId)) return { deleted: false, missing: false, error: `${branch} isn't the branch of Explorer or design reviewer ${threadId}` };
       const root = resolve(projectPath);
       if (!isAbsolute(projectPath) || !existsSync(root) || !statSync(root).isDirectory()) {
         return { deleted: false, missing: false, error: `${projectPath} isn't an accessible directory` };
