@@ -35,7 +35,7 @@ import type {
   rpcContract,
 } from "./server";
 import type { RepoInspection } from "./host-contract";
-import { ROLES, WORKER_ROLE_IDS, type AssignableRoleId, type ProjectMode } from "./roles";
+import { ROLES, TRACKS, WORKER_ROLE_IDS, type AssignableRoleId, type ProjectMode, type Track } from "./roles";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import {
@@ -128,6 +128,119 @@ function latestChecks(pr: PrSummary) {
   const byRole = new Map<string, PrSummary["checks"][number]>();
   for (const check of pr.checks) byRole.set(check.role, check);
   return ["review1", "review2", "security", "shadow"].flatMap((role) => byRole.get(role) ?? []);
+}
+
+// ---------- Tracks and exploration ----------
+
+const TRACK_LABEL: Record<Track, string> = { direct: "Direct", plan: "Plan", explore: "Explore" };
+const TRACK_NOTE: Record<Track, string> = {
+  direct: "Straight to a Builder.",
+  plan: "The Planner's READY plan comes before a Builder.",
+  explore: "An Explorer tries it first, with a time box and no PR. You decide what comes next.",
+};
+
+/** The track, how far exploring has got, and advice to close, as chips on a card. */
+function TrackChips({ task }: { task: BoardTask }) {
+  if (task.track === null && task.closeAdvice === null) return null;
+  const reported = task.exploration?.filter((entry) => entry.recommendation !== null).length ?? 0;
+  const total = task.exploration?.length ?? 0;
+  return (
+    <div className="flex flex-wrap items-center gap-1 text-[10px]">
+      {task.track === null ? null : (
+        <span className="rounded border border-border px-1.5 py-0.5" title={TRACK_NOTE[task.track]}>{TRACK_LABEL[task.track]}</span>
+      )}
+      {task.track !== "explore" || total === 0 ? null : (
+        <span className="rounded border border-border px-1.5 py-0.5 text-muted-foreground">
+          {reported === total ? (total === 1 ? "Reported" : `${total} reported, compare`) : `${reported} of ${total} reported`}
+        </span>
+      )}
+      {task.closeAdvice === null ? null : (
+        <span className="rounded border border-amber-500/50 px-1.5 py-0.5 text-amber-600 dark:text-amber-400">Close advised</span>
+      )}
+    </div>
+  );
+}
+
+/** The latest exploration round, one column per candidate, so the person can compare them and pick. */
+function ExplorationCompare({ task }: { task: BoardTask }) {
+  const navigate = useBbNavigate();
+  const round = task.exploration;
+  if (round === null || round.length === 0) return null;
+  return (
+    <div className="space-y-1">
+      <div className="text-xs font-medium text-muted-foreground">
+        {round.length === 1 ? "Exploration" : `Exploration: ${round.length} candidates side by side`}
+      </div>
+      <div className={cn("grid gap-2", round.length === 1 ? "grid-cols-1" : round.length === 2 ? "sm:grid-cols-2" : "sm:grid-cols-3")}>
+        {round.map((entry) => (
+          <div key={entry.threadId} className="space-y-1.5 rounded-md border border-border p-2 text-xs">
+            <div className="flex items-baseline justify-between gap-2">
+              <span className="font-medium">{round.length === 1 ? "Explorer" : `Candidate ${entry.candidate}`}</span>
+              <button type="button" className="text-muted-foreground underline-offset-2 hover:underline" onClick={() => navigate.toThread(entry.threadId, { split: true })}>
+                Open thread
+              </button>
+            </div>
+            {entry.approach === null ? null : <div className="text-muted-foreground">{entry.approach}</div>}
+            {entry.recommendation === null ? (
+              <div className="text-muted-foreground">Exploring, {entry.timeboxMinutes}-minute time box</div>
+            ) : (
+              <>
+                <div className="font-medium">Recommends {entry.recommendation}</div>
+                {entry.summary === null ? null : <div className="whitespace-pre-wrap">{entry.summary.replace(/^Recommendation:[^\n]*\n?/i, "").trim()}</div>}
+                {entry.learned === null ? null : (
+                  <div>
+                    <div className="text-muted-foreground">What was learned</div>
+                    <div className="whitespace-pre-wrap">{entry.learned}</div>
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        ))}
+      </div>
+      {round.every((entry) => entry.recommendation !== null) ? (
+        <p className="text-xs text-muted-foreground">
+          Pick how to continue below, or tell the Lead. The full reports are in the task's comments.
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
+function TrackPicker({ task }: { task: BoardTask }) {
+  const rpc = useRpc<typeof rpcContract>();
+  const [pending, setPending] = useState<Track | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const pick = async (track: Track) => {
+    setPending(track);
+    setError(null);
+    try {
+      await rpc.call("task_set_track", { taskKey: task.key, track });
+    } catch (cause) {
+      setError(errorText(cause));
+    } finally {
+      setPending(null);
+    }
+  };
+  return (
+    <div className="space-y-1">
+      <div className="text-xs font-medium text-muted-foreground">Track</div>
+      <div className="flex flex-wrap gap-1">
+        {TRACKS.map((track) => (
+          <Button key={track} size="sm" variant="outline" aria-pressed={task.track === track} disabled={task.track === track || pending !== null} onClick={() => void pick(track)}>
+            {pending === track ? "Saving…" : TRACK_LABEL[track]}
+          </Button>
+        ))}
+      </div>
+      <p className="text-xs text-muted-foreground">{task.track === null ? "No track yet: the Lead picks one when it takes the task." : TRACK_NOTE[task.track]}</p>
+      {task.closeAdvice === null ? null : (
+        <Alert>
+          The {task.closeAdvice.role === "plan" ? "Planner" : "Explorer"} recommends closing this task (comment {task.closeAdvice.commentId}). Only you can close it: move it to Done if you agree.
+        </Alert>
+      )}
+      {error === null ? null : <Alert>{error}</Alert>}
+    </div>
+  );
 }
 
 function PrChips({ pr }: { pr: PrSummary }) {
@@ -583,6 +696,7 @@ function FactoryView({ prefix }: { prefix: string }) {
       <TaskDialog
         task={openTask}
         hasLead={board.factory.leadThreadId !== null}
+        tracksEnabled={board.factory.tracksEnabled}
         live={live.filter((entry) => openTask !== null && entry.agent.taskKey === openTask.key)}
         onMove={move}
         onClose={() => setOpenTaskId(null)}
@@ -1533,6 +1647,7 @@ const TaskCard = memo(function TaskCard({
         )}
       </div>
       <div className="line-clamp-3 text-sm leading-snug">{task.title}</div>
+      <TrackChips task={task} />
       {task.pr === null ? null : <PrChips pr={task.pr} />}
       {agents.length === 0 ? null : (
         <div className="flex flex-wrap gap-1">
@@ -1590,12 +1705,14 @@ function QuickAdd({ prefix, onCreated }: { prefix: string; onCreated: () => void
 function TaskDialog({
   task,
   hasLead,
+  tracksEnabled,
   live,
   onMove,
   onClose,
 }: {
   task: BoardTask | null;
   hasLead: boolean;
+  tracksEnabled: boolean;
   live: LiveAgent[];
   onMove: (taskId: string, column: Column) => void;
   onClose: () => void;
@@ -1691,6 +1808,9 @@ function TaskDialog({
               )}
             </div>
 
+            {tracksEnabled ? <TrackPicker task={task} /> : null}
+            <ExplorationCompare task={task} />
+
             {task.pr === null ? null : (
               <div className="space-y-1">
                 <div className="text-xs font-medium text-muted-foreground">Pull request</div>
@@ -1733,7 +1853,7 @@ function TaskDialog({
                     aria-label="Notes for the agent"
                   />
                   <div className="flex flex-wrap gap-1">
-                    {WORKER_ROLE_IDS.map((role) => (
+                    {WORKER_ROLE_IDS.filter((role) => tracksEnabled || role !== "explore").map((role) => (
                       <Button
                         key={role}
                         size="sm"

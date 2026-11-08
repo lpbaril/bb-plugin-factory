@@ -6,7 +6,15 @@ import { mkdir, readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { experimental_defineHostEntry } from "@get-bb/plugin-sdk";
-import { GH_ALLOWED, hostContract, type RepoInspection } from "./host-contract";
+import { EXPLORER_BRANCH, GH_ALLOWED, hostContract, type RepoInspection } from "./host-contract";
+
+function git(cwd: string, args: string[], signal?: AbortSignal): Promise<{ code: number; stderr: string }> {
+  return new Promise((resolvePromise) => {
+    execFile("git", ["-C", cwd, ...args], { signal, timeout: 30_000, env: { ...process.env, GIT_TERMINAL_PROMPT: "0" } }, (error, _stdout, stderr) => {
+      resolvePromise({ code: error === null ? 0 : typeof error.code === "number" ? error.code : 1, stderr: String(stderr) || (error?.message ?? "") });
+    });
+  });
+}
 
 /** The daemon's PATH may not include user-level installs such as ~/.local/bin or Homebrew. */
 function findGh(): string {
@@ -334,6 +342,18 @@ export default experimental_defineHostEntry({
         if (stdin !== null) child.stdin?.end(stdin);
         else child.stdin?.end();
       });
+    },
+    delete_explorer_branch: async ({ projectPath, branch }, ctx) => {
+      if (!EXPLORER_BRANCH.test(branch)) return { deleted: false, missing: false, error: `${branch} isn't an Explorer's branch` };
+      const root = resolve(projectPath);
+      if (!isAbsolute(projectPath) || !existsSync(root) || !statSync(root).isDirectory()) {
+        return { deleted: false, missing: false, error: `${projectPath} isn't an accessible directory` };
+      }
+      const exists = await git(root, ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`], ctx.signal);
+      if (exists.code !== 0) return { deleted: false, missing: true, error: null };
+      // -D, because an Explorer's commits are never merged. git refuses a branch still checked out somewhere.
+      const removed = await git(root, ["branch", "-D", branch], ctx.signal);
+      return removed.code === 0 ? { deleted: true, missing: false, error: null } : { deleted: false, missing: false, error: removed.stderr.trim().slice(0, 500) };
     },
     inspect_repo: async ({ projectPath }, ctx) => {
       return inspectRepo(projectPath, ctx.signal);

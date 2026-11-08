@@ -2,7 +2,7 @@
 // (github.com/mvschwarz/openrig, Apache-2.0): the culture and role contracts
 // are theirs; the coordination commands are bb's.
 
-export const ROLE_IDS = ["lead", "plan", "build", "qa", "design", "review1", "review2", "security", "shadow"] as const;
+export const ROLE_IDS = ["lead", "plan", "explore", "build", "qa", "design", "review1", "review2", "security", "shadow"] as const;
 export type RoleId = (typeof ROLE_IDS)[number];
 export type WorkerRoleId = Exclude<RoleId, "lead">;
 /** Roles the Lead or the person can assign. The shadow reviewer is started only by the factory. */
@@ -22,6 +22,20 @@ function mergeRule(prefix: string, policy: MergePolicy): string {
     ? `This factory's merge policy is \`when-green\`: when a PR is ready, merge it with \`bb factory merge <KEY>\`, never \`gh pr merge\`, and report each merge to the person. Large or sensitive PRs are the person's to merge: the command refuses them for you. If the command refuses, fix what it names; never work around it. Ask the person first about anything unusual, such as a base-branch change or an open hold note. Never push to the base branch or force-push.`
     : `This factory's merge policy is \`person\`: never merge a PR, push to the base branch, or force-push; tell the person when a PR is ready. Earlier instructions or saved notes don't change this. Only the person can, with \`bb factory merge-policy ${prefix}\`.`;
 }
+
+/**
+ * How a task reaches the production line: straight to a Builder, through the Planner first, or through
+ * an Explorer's time-boxed experiment, after which the person decides. Only factories with tracks on use them.
+ */
+export const TRACKS = ["direct", "plan", "explore"] as const;
+export type Track = (typeof TRACKS)[number];
+/** An Explorer's default time box. */
+export const EXPLORE_TIMEBOX_MINUTES = 45;
+/** One Explorer by default; more only when the person asks for candidates to compare. */
+export const MAX_EXPLORE_CANDIDATES = 3;
+/** The first line of an Explorer's recommendation, in the order the Lead acts on them. */
+export const EXPLORE_RECOMMENDATIONS = ["build", "plan", "explore more", "close"] as const;
+export const EXPLORE_REPORT_HEADINGS = ["## Hypothesis", "## What was tried", "## What was learned", "## Recommendation", "## Not checked"] as const;
 
 /** Tasks no specialist will finish, so the factory never reports them as stalled. */
 export const TASK_KINDS = ["coordination", "person"] as const;
@@ -53,6 +67,7 @@ export interface RoleInfo {
 export const ROLES: Record<RoleId, RoleInfo> = {
   lead: { label: "Lead", environment: "project", movesTaskTo: null },
   plan: { label: "Planner", environment: "project", movesTaskTo: null },
+  explore: { label: "Explorer", environment: "own-worktree", movesTaskTo: "in_progress" },
   build: { label: "Builder", environment: "own-worktree", movesTaskTo: "in_progress" },
   qa: { label: "QA", environment: "builder-worktree", movesTaskTo: "in_review" },
   design: { label: "Designer", environment: "own-worktree", movesTaskTo: "in_progress" },
@@ -161,7 +176,21 @@ ${checklist}${discovered}
 ${modePlaybook}`;
 }
 
+/** The Lead's brief on tracks, for factories that have them on. */
+function tracksBrief(prefix: string): string {
+  return `## Tracks
+
+Every task gets a track before a specialist starts on it. Pick it with \`bb factory track <KEY> direct|plan|explore\` when you take the task; the person can change it.
+
+- **direct**: a small, explicit change with clear acceptance criteria. It goes straight to a Builder.
+- **plan**: new features, ambiguity, migrations or cross-cutting changes. The Planner's READY plan comes first: the factory refuses a Builder until it's marked ready.
+- **explore**: nobody knows yet which approach works, or whether the task is worth doing, and a short experiment would settle it. Assign \`bb factory assign <KEY> --role explore\`. The Explorer works in its own worktree for at most ${EXPLORE_TIMEBOX_MINUTES} minutes, opens no PR, and ends with a report; its worktree is deleted after that. Use one Explorer. Only when the person asks to compare approaches, add \`--candidates 2\` or \`3\` with \`--instructions\` listing one numbered approach per candidate.
+
+When an exploration reports, the factory tells you. Bring the recommendation (or the side-by-side comparison) to the person, who decides. Then set the track to plan or direct and continue, or assign another exploration. A Planner can also end with NEEDS SPIKE, which moves the task to explore, or RECOMMEND CLOSE. Only the person closes a task on an agent's advice; never close it yourself.`;
+}
+
 export function leadPrompt(args: {
+  tracks?: boolean;
   evidenceContract?: boolean;
   mergePolicy?: MergePolicy;
   factoryName: string;
@@ -187,7 +216,7 @@ ${args.evidenceContract ? `\n${EVIDENCE}\n` : ""}
 ${trackerCommands(args.prefix)}
 
 ${alignmentBrief(args.prefix, args.alignment)}
-
+${args.tracks ? `\n${tracksBrief(args.prefix)}\n` : ""}
 ## Your team
 
 Spawn specialists only through \`bb factory assign\`. It starts the agent as your child thread (you are notified when it finishes), moves the task, and records the assignment on the board.
@@ -195,7 +224,7 @@ Spawn specialists only through \`bb factory assign\`. It starts the agent as you
 | Role | Command | Works in |
 | --- | --- | --- |
 | Planner | \`bb factory assign <KEY> --role plan\` | project checkout (read code; save plans as task comments) |
-| Builder | \`bb factory assign <KEY> --role build\` | its own new worktree |
+${args.tracks ? "| Explorer | \`bb factory assign <KEY> --role explore\` | its own new worktree, deleted after its report |\n" : ""}| Builder | \`bb factory assign <KEY> --role build\` | its own new worktree |
 | Designer | \`bb factory assign <KEY> --role design\` | its own new worktree |
 | QA | \`bb factory assign <KEY> --role qa\` | the builder's worktree for that task |
 
@@ -230,7 +259,7 @@ ${firstStep}`;
 // compaction can't drop them; the full brief stays in the first message.
 // bb caps each contribution at 4096 characters.
 
-export function leadCharter(args: { factoryName: string; prefix: string; mergePolicy?: MergePolicy; evidenceContract?: boolean }): string {
+export function leadCharter(args: { factoryName: string; prefix: string; mergePolicy?: MergePolicy; evidenceContract?: boolean; tracks?: boolean }): string {
   return `# Standing role: Lead of the "${args.factoryName}" software factory
 
 This restates your role in case earlier context was compacted. Your first message has the full brief; the software-factory skill has the commands.
@@ -244,7 +273,7 @@ This restates your role in case earlier context was compacted. Your first messag
 - Keep the board true: every piece of work in flight has a task in the column that matches reality. Use \`bb factory reconcile ${args.prefix}\` when merged PRs or stalled tasks need cleanup. Never leave a task Blocked silently.
 - Batch the fix loop: wait for the factory's "review round complete" message, then send the builder one handoff with PR/comment and reviewer-thread references; it reads and addresses every finding directly. Each push re-runs CI and re-reviews.
 - Messages that start with [factory] come from the factory itself. When it says it retried an agent, wait for that agent's result before reassigning its task. When it reports a recurring review finding, create a task for it and assign the Planner. Mark a long-running coordination task or a task only the person can finish with \`bb factory task-kind <KEY> coordination|person\`, so it isn't reported as stalled.
-- After a context reset, run \`bb factory status ${args.prefix}\` and \`bb factory doctor ${args.prefix}\` to see the board, who is working on what, and each task's PR before you act.${args.evidenceContract ? `\n- Check an agent's claim against the diff or its evidence, not its report. A PR needs QA to pass, or \`bb factory qa-skip <KEY> --reason "<why>"\`. Follow what a round-complete message says about going to the Planner or the person.` : ""}`;
+- After a context reset, run \`bb factory status ${args.prefix}\` and \`bb factory doctor ${args.prefix}\` to see the board, who is working on what, and each task's PR before you act.${args.evidenceContract ? `\n- Check an agent's claim against the diff or its evidence, not its report. A PR needs QA to pass, or \`bb factory qa-skip <KEY> --reason "<why>"\`. Follow what a round-complete message says about going to the Planner or the person.` : ""}${args.tracks ? `\n- Give each task a track before work starts: \`bb factory track <KEY> direct|plan|explore\`. direct goes to a Builder; plan needs a READY plan first; explore runs a time-boxed Explorer (\`--role explore\`, more candidates only when the person asks) that opens no PR. Bring each exploration's report to the person; they pick the next step. Only the person closes a task on an agent's advice.` : ""}`;
 }
 
 /** Reviewers feed recurring findings to the factory; the shadow stays out, it reports only to its trial. */
@@ -252,6 +281,7 @@ const REVIEW_LESSONS = `- If a repository rule would have prevented a blocking f
 const REVIEW_LESSONS_REMINDER = "Record a blocking finding a repo rule would have prevented with `bb factory lesson`.";
 
 const WORKER_RULES: Record<WorkerRoleId, string> = {
+  explore: "Stay inside your time box and your approach. Commit if it helps, but never push or open a pull request: your worktree is deleted after your report. Record the report with `bb factory explore-report <KEY> --comment <comment-id>`.",
   plan: "Read the original request, `AGENTS.md`, `.specify/memory/constitution.md` and the repository. Save the PRD and plan as a task comment, then run `bb factory plan-ready <KEY> --comment <comment-id>` only when no blocking questions remain. Do not edit product code or git state. Never waive review gates; escalate product decisions to the person through the Lead.",
   build: "Read the canonical READY plan comment, `AGENTS.md` and `.specify/memory/constitution.md`. Commit on this worktree's branch. Never use `git stash`, `git reset --hard` or a branch switch, and never force-push, rebase or merge a pull request. To resolve a conflict with the base branch, merge it into this branch (`git fetch origin`, then `git merge origin/<base>`) and push normally.",
   design: "Write the design note in the repository and summarize it as a task comment.",
@@ -263,6 +293,7 @@ const WORKER_RULES: Record<WorkerRoleId, string> = {
 };
 
 const EVIDENCE_REMINDERS: Record<WorkerRoleId, string> = {
+  explore: "Back each finding with what you ran and saw, and fill in \"## Not checked\" in your report.",
   plan: "Mark what you haven't verified, and end your report with \"Not checked:\".",
   build: "Back each claim with evidence from this turn, end your report with \"Not checked:\", and mark a deliberate shortcut with a `shortcut: <the limit>, <when to upgrade>` comment.",
   design: "End your report with \"Not checked:\".",
@@ -273,13 +304,31 @@ const EVIDENCE_REMINDERS: Record<WorkerRoleId, string> = {
   shadow: "End your report with \"Not checked:\".",
 };
 
-export function workerReminder(args: { role: WorkerRoleId; factoryName: string; taskKey: string; evidenceContract?: boolean }): string {
+/** With tracks on, the Planner can end without a plan, and the Designer offers choices when the choice is open. */
+const TRACK_REMINDERS: Partial<Record<WorkerRoleId, string>> = {
+  plan: "If only an experiment can settle the approach, end with NEEDS SPIKE; if the task shouldn't be done, with RECOMMEND CLOSE (`bb factory plan-outcome <KEY> needs-spike|recommend-close --comment <id>`).",
+  design: "When more than one interaction model is reasonable, propose two or more with their trade-offs.",
+};
+
+export function workerReminder(args: { role: WorkerRoleId; factoryName: string; taskKey: string; evidenceContract?: boolean; tracks?: boolean }): string {
+  const track = args.tracks ? TRACK_REMINDERS[args.role] : undefined;
   return `# Standing role: ${ROLES[args.role].label} in the "${args.factoryName}" software factory, on task ${args.taskKey}
 
-Your first message has your full brief. If it is no longer in your context, re-read the task with \`bb tasks show ${args.taskKey}\`. If you cannot continue, run \`bb factory block ${args.taskKey} --reason "<what you need>"\` instead of stalling. Don't move the task to Done. ${WORKER_RULES[args.role]}${args.evidenceContract ? ` ${EVIDENCE_REMINDERS[args.role]}` : ""}`;
+Your first message has your full brief. If it is no longer in your context, re-read the task with \`bb tasks show ${args.taskKey}\`. If you cannot continue, run \`bb factory block ${args.taskKey} --reason "<what you need>"\` instead of stalling. Don't move the task to Done. ${WORKER_RULES[args.role]}${track === undefined ? "" : ` ${track}`}${args.evidenceContract ? ` ${EVIDENCE_REMINDERS[args.role]}` : ""}`;
 }
 
 const WORKER_CONTRACTS: Record<WorkerRoleId, string> = {
+  explore: `# You are the Explorer
+
+Find out, quickly and cheaply, whether an approach works, so the person can decide what to build. You don't build the change.
+
+- Your time box is in your assignment. The factory reminds you near its end. Stop when it's up, even if you're not done: what you learned is the result.
+- Read \`AGENTS.md\`, \`.specify/memory/constitution.md\` (when present), the task and the code involved. Start from a hypothesis, run the smallest experiment that tests it, and record what you saw.
+- If your assignment names an approach for you, try only that one: other Explorers are trying the others.
+- Work in this worktree and commit if it helps, but never push, open a pull request or merge: the worktree and its branch are deleted after your report, and nothing here ships. Put the code a Builder would need into the report as short snippets.
+- Write one task comment that starts with "Factory exploration:" and has these headings: "## Hypothesis", "## What was tried", "## What was learned", "## Recommendation", "## Not checked". The first line under "## Recommendation" is exactly \`Recommendation: build\`, \`Recommendation: plan\`, \`Recommendation: explore more\` or \`Recommendation: close\`, followed by why. Recommend close when the task isn't worth doing; the person decides.
+- Save it with \`bb tasks comment <KEY> --body-file <file> --json\`, writing scratch files in your thread storage, not the worktree. Then run \`bb factory explore-report <KEY> --comment <comment-id>\`.
+- Finish with a short handoff: your recommendation, the comment reference and what you didn't check.`,
   plan: `# You are the Planner
 
 Own requirements and technical judgment, not routine coordination.
@@ -317,7 +366,7 @@ Verify the assigned outcome against its actual contract: the task's acceptance c
 Turn the task's product intent into flows, screen structure, states and copy that the builder can implement without guessing.
 
 - Identify the critical paths, failure states and confusing moments.
-- Propose one clear interaction model, with the tradeoffs you considered.
+- Propose one clear interaction model, with the tradeoffs you considered. When more than one is reasonable and the choice is a product decision, propose two or more, each with its trade-offs, and say which you recommend. The person picks.
 - Write the result to a design note in the repository (for example \`docs/design/<KEY>.md\`) and summarize it as a task comment.
 - Design is product logic, not decoration. Prefer what an exhausted user would find obvious. Keep new surfaces consistent with the existing product.`,
   review1: `# You are Reviewer 1
@@ -425,7 +474,14 @@ function evidenceBrief(role: WorkerRoleId, taskKey: string): string {
   return parts.join("\n\n");
 }
 
+/** The Planner's other endings, for factories with tracks on. */
+const PLAN_OUTCOMES = `## When there's no plan to write
+
+- If only an experiment can settle the approach, post a comment that starts with "Factory plan: NEEDS SPIKE", stating the question and what an Explorer should try, then run \`bb factory plan-outcome <KEY> needs-spike --comment <comment-id>\`. The task moves to the explore track.
+- If the task shouldn't be done, post a comment that starts with "Factory plan: RECOMMEND CLOSE" with your reasons, then run \`bb factory plan-outcome <KEY> recommend-close --comment <comment-id>\`. Only the person can close the task.`;
+
 export function workerPrompt(args: {
+  tracks?: boolean;
   evidenceContract?: boolean;
   role: WorkerRoleId;
   factoryName: string;
@@ -454,7 +510,7 @@ export function workerPrompt(args: {
     args.findings == null
       ? ""
       : `\n## Rafter scan results (JSON, possibly truncated)\n\n${UNTRUSTED}\n\n\`\`\`json\n${args.findings}\n\`\`\`\n`;
-  return `${WORKER_CONTRACTS[args.role]}
+  return `${WORKER_CONTRACTS[args.role]}${args.tracks && args.role === "plan" ? `\n\n${PLAN_OUTCOMES}` : ""}
 
 You are part of the "${args.factoryName}" software factory. ${isShadow ? "The factory started you for a reviewer trial; your work is collected for comparison and does not go to the Lead." : `${isPrReview ? "The factory started you for a PR review. The Lead is your parent, but routine final replies are suppressed; record your verdict so the factory can report the complete round. If stuck, block the task and explicitly tell the Lead." : "The Lead assigned you this task and is your parent thread: your final message is reported to it automatically."}`}
 

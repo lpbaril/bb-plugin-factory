@@ -13,6 +13,13 @@ export const GH_ALLOWED = [
   ["pr", "checks"],
 ] as const;
 
+/**
+ * The only branches the host worker will delete: an Explorer's, named by bb as
+ * bb/<task>-explorer-<title>-<thread>. Builders' branches never match, and git
+ * itself refuses a branch that is still checked out.
+ */
+export const EXPLORER_BRANCH = /^bb\/[a-z0-9][a-z0-9-]*-explorer-[a-z0-9][a-z0-9_-]*$/;
+
 export const repoInspectionSchema = z.object({
   exists: z.boolean(),
   isGitRepo: z.boolean(),
@@ -45,6 +52,14 @@ export const hostContract = defineRpcContract({
       stdin: z.string().max(60_000).nullable(),
     }),
     output: z.object({ code: z.number(), stdout: z.string(), stderr: z.string() }),
+  },
+  delete_explorer_branch: {
+    input: z.object({
+      projectPath: z.string().min(1).max(4096),
+      branch: z.string().min(1).max(250),
+    }),
+    /** missing: there was no such branch, which needs nothing more. */
+    output: z.object({ deleted: z.boolean(), missing: z.boolean(), error: z.string().nullable() }),
   },
   inspect_repo: {
     input: z.object({
