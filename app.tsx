@@ -22,6 +22,7 @@ import type {
   Agent,
   AgentExec,
   AgentsView,
+  PresetPreview,
   BoardTask,
   Column,
   FactoryDoctorReport,
@@ -2333,6 +2334,7 @@ function AgentsSettings() {
           <div className="text-muted-foreground">{warning.detail}</div>
         </div>
       ))}
+      <PresetPicker onApplied={setView} />
       <div className="divide-y divide-border">
         {view.agents.map((row) => (
           <AgentSettingRow
@@ -2344,6 +2346,97 @@ function AgentsSettings() {
           />
         ))}
       </div>
+      {error === null ? null : <Alert>{error}</Alert>}
+    </div>
+  );
+}
+
+const PRESETS = [
+  { id: "balanced", label: "Balanced", note: "Default models and reasoning, with reviews kept on other providers" },
+  { id: "lower-cost", label: "Lower cost", note: "Less reasoning on seats that read more than they write" },
+  { id: "max-depth", label: "Maximum depth", note: "More reasoning where judgment matters, and a third provider for Reviewer 2" },
+] as const;
+
+/** A preset's proposal for each seat, with why, to tick and apply. Reviewer seats start unticked: they stay the person's choice. */
+function PresetPicker({ onApplied }: { onApplied: (view: AgentsView) => void }) {
+  const rpc = useRpc<typeof rpcContract>();
+  const [preview, setPreview] = useState<PresetPreview | null>(null);
+  const [ticked, setTicked] = useState<Set<string>>(new Set());
+  const [pending, setPending] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const load = async (preset: (typeof PRESETS)[number]["id"]) => {
+    setPending(preset);
+    setError(null);
+    try {
+      const next = await rpc.call("agents_preset_preview", { preset });
+      setPreview(next);
+      setTicked(new Set(next.seats.filter((seat) => seat.ticked).map((seat) => seat.key)));
+    } catch (cause) {
+      setError(errorText(cause));
+    } finally {
+      setPending(null);
+    }
+  };
+  const apply = async () => {
+    if (preview === null) return;
+    setPending("apply");
+    setError(null);
+    try {
+      onApplied(await rpc.call("agents_preset_apply", { preset: preview.preset, keys: [...ticked] as PresetPreview["seats"][number]["key"][] }));
+      setPreview(null);
+    } catch (cause) {
+      setError(errorText(cause));
+    } finally {
+      setPending(null);
+    }
+  };
+  const show = (exec: AgentExec) => `${exec.providerId} · ${exec.model ?? "default model"} · ${exec.reasoningLevel ?? "default reasoning"}`;
+  return (
+    <div className="space-y-2 rounded border border-border p-2.5">
+      <div className="text-xs font-medium">Presets</div>
+      <div className="flex flex-wrap gap-1">
+        {PRESETS.map((preset) => (
+          <Button key={preset.id} size="sm" variant="outline" aria-pressed={preview?.preset === preset.id} disabled={pending !== null} onClick={() => void load(preset.id)}>
+            {pending === preset.id ? "Loading…" : preset.label}
+          </Button>
+        ))}
+      </div>
+      <p className="text-xs text-muted-foreground">
+        {preview === null ? "Built from the providers and models on this machine. Nothing changes until you apply it." : PRESETS.find((preset) => preset.id === preview.preset)?.note}
+      </p>
+      {preview === null ? null : (
+        <>
+          <ul className="divide-y divide-border text-xs">
+            {preview.seats.map((seat) => (
+              <li key={seat.key} className="flex items-start gap-2 py-1.5">
+                <Checkbox
+                  checked={ticked.has(seat.key)}
+                  disabled={!seat.changed}
+                  onCheckedChange={(checked) => setTicked((current) => { const next = new Set(current); if (checked === true) next.add(seat.key); else next.delete(seat.key); return next; })}
+                  aria-label={`Apply to ${seat.label}`}
+                />
+                <div className="min-w-0">
+                  <div className="font-medium">{seat.label}{seat.reviewer ? " (reviewer: your choice)" : ""}</div>
+                  <div className="text-muted-foreground">{seat.changed ? `${show(seat.current)} → ${show(seat.proposed)}` : `No change: ${show(seat.current)}`}</div>
+                  <div className="text-muted-foreground">{seat.why.join(". ")}.</div>
+                </div>
+              </li>
+            ))}
+          </ul>
+          {preview.warnings.map((warning) => (
+            <div key={warning.id} className="rounded border border-amber-500/50 p-2 text-xs">
+              <div className="font-medium">{warning.title}</div>
+              <div className="text-muted-foreground">{warning.detail}</div>
+            </div>
+          ))}
+          <div className="flex gap-1">
+            <Button size="sm" disabled={pending !== null || ticked.size === 0} onClick={() => void apply()}>
+              {pending === "apply" ? "Applying…" : `Apply to ${ticked.size} seat${ticked.size === 1 ? "" : "s"}`}
+            </Button>
+            <Button size="sm" variant="ghost" disabled={pending !== null} onClick={() => setPreview(null)}>Cancel</Button>
+          </div>
+        </>
+      )}
       {error === null ? null : <Alert>{error}</Alert>}
     </div>
   );

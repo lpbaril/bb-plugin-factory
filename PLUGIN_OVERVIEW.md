@@ -11,9 +11,9 @@
 
 ## How it works
 
-A factory ties one bb project to one bb Tasks project, so tasks also appear on the Tasks page. Builders, explorers and designers get their own worktree, and QA and reviewers work in the builder's worktree for the same task. In the Agents section of the plugin settings, pick each role's provider, model and reasoning level. Reviewer 1 defaults to a second provider, and the factory warns if the Builder and all required reviewers share one.
+A factory ties one bb project to one bb Tasks project, so tasks also appear on the Tasks page. Builders, explorers and designers get their own worktree, and QA and reviewers work in the builder's worktree for the same task. In the Agents section of the plugin settings, pick each role's provider, model and reasoning level, or start from a preset. Reviewer 1 defaults to a second provider; you're warned if the Builder and all required reviewers share one.
 
-Agents use the `bb factory` command: `create`, `start`, `doctor`, `init-specs`, `reconcile`, `assign`, `track`, `plan-ready`, `design-resolve`, `verdict`, `block`, `status`, `agents`, `archive`, `restore`, `merge`, `qa`, `runs`, `health`, `lessons`, `rafter check` and `shadow compare`. Delete a factory only from the Factory page.
+Agents use the `bb factory` command: `create`, `start`, `doctor`, `init-specs`, `reconcile`, `assign`, `track`, `plan-ready`, `design-resolve`, `verdict`, `block`, `status`, `agents`, `archive`, `restore`, `merge`, `qa`, `runs`, `health`, `lessons`, `rafter check` and `shadow compare`. Only the Factory page deletes a factory.
 
 ## Requirements
 
