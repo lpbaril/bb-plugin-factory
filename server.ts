@@ -399,6 +399,18 @@ export function sectionText(body: string, heading: string, max = 600): string | 
   return text.length > max ? `${text.slice(0, max - 1)}…` : text;
 }
 
+/** A short fingerprint of a plan's text, ignoring whitespace. Not for security: it tells a changed plan from the same one posted again. */
+export function planDigest(body: string): string {
+  const text = body.replace(/\s+/g, " ").trim();
+  let a = 0x811c9dc5, b = 0x01000193;
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index);
+    a = Math.imul(a ^ code, 0x01000193) >>> 0;
+    b = Math.imul(b ^ code, 0x5bd1e995) >>> 0;
+  }
+  return `${text.length.toString(36)}-${a.toString(36)}-${b.toString(36)}`;
+}
+
 /** Paths whose PRs get Reviewer 2, and whose plans get design review at full depth. */
 const SENSITIVE_PATH = /(auth|login|session|token|secret|crypt|password|permission|rbac|rls|payment|billing|stripe|migration|alembic|\.sql$|terraform|docker|k8s|helm|\.github\/workflows|infra)/i;
 
@@ -425,8 +437,13 @@ export function parseDesignFindings(body: string, lens: DesignLens): { findings:
   }
   const heading = /^###\s+\d+\.\s+(\*\*)?(Blocker|Major|Nit)(\*\*)?\s*:\s*(.+?)\s*$/gim;
   const matches = [...body.matchAll(heading)];
+  // A finding in any other heading format would otherwise be lost, and the plan read as clean.
+  const stray = body.split("\n").find((line) => /^###\s/.test(line) && !new RegExp(heading.source, "i").test(line));
+  if (stray !== undefined) return { error: `The heading "${stray.trim().slice(0, 120)}" isn't in the finding format "### 1. Major: <title>".` };
   if (matches.length === 0) {
-    return /no findings/i.test(body) ? { findings: [] } : { error: "List each finding as \"### 1. Major: <title>\", or write \"No findings.\"." };
+    // "No findings." on its own line, not the words somewhere in a sentence.
+    const clean = body.split("\n").some((line) => /^\s*(\*\*)?no findings\.?(\*\*)?\s*$/i.test(line));
+    return clean ? { findings: [] } : { error: "List each finding as \"### 1. Major: <title>\", or write \"No findings.\" on its own line." };
   }
   const findings = matches.map((match, index) => {
     const start = match.index! + match[0].length;
@@ -468,7 +485,7 @@ export function parsePersonQuestions(body: string): Pick<PersonQuestion, "id" | 
   const rest = body.slice(start + "## Open questions".length);
   const end = rest.search(/\n## /);
   const section = end < 0 ? rest : rest.slice(0, end);
-  const questions: Pick<PersonQuestion, "id" | "text" | "assumed">[] = [];
+  const found: { id: string | null; text: string; assumed: string | null }[] = [];
   for (const line of section.split("\n")) {
     const match = /^\s*(?:[-*]|\d+[.)])?\s*(?:\*\*)?for the person(?:\*\*)?\s*:\s*(?:\*\*)?\s*(.+?)\s*$/i.exec(line);
     if (match === null) continue;
@@ -478,17 +495,31 @@ export function parsePersonQuestions(body: string): Pick<PersonQuestion, "id" | 
     const assumedAt = text.search(/\bAssumed:/i);
     const assumed = assumedAt < 0 ? null : text.slice(assumedAt + "Assumed:".length).trim() || null;
     if (assumedAt >= 0) text = text.slice(0, assumedAt).trim();
-    const questionId = id === null ? `Q${questions.length + 1}` : id[1]!.toUpperCase();
-    if (text === "" || questions.some((entry) => entry.id === questionId)) continue;
-    questions.push({ id: questionId, text: text.slice(0, 600), assumed: assumed?.slice(0, 400) ?? null });
+    if (text !== "") found.push({ id: id === null ? null : id[1]!.toUpperCase(), text: text.slice(0, 600), assumed: assumed?.slice(0, 400) ?? null });
   }
+  // A question keeps the id it gives, if no earlier one gave it too; the rest get the lowest id nobody
+  // gave or took. No question is dropped.
+  const owner = new Map<string, number>();
+  found.forEach((entry, index) => { if (entry.id !== null && !owner.has(entry.id)) owner.set(entry.id, index); });
+  const taken = new Set(owner.keys());
+  const questions: Pick<PersonQuestion, "id" | "text" | "assumed">[] = found.map((entry, index) => {
+    let questionId = entry.id !== null && owner.get(entry.id) === index ? entry.id : null;
+    if (questionId === null) {
+      let n = 1;
+      while (taken.has(`Q${n}`)) n += 1;
+      questionId = `Q${n}`;
+      taken.add(questionId);
+    }
+    return { id: questionId, text: entry.text, assumed: entry.assumed };
+  });
   return questions;
 }
 
 /** A Builder also waits for the person's answer to each question in the current READY plan, and for a new plan when an answer changes it. */
-export function personQuestionsGate(factory: Pick<Factory, "plans">, taskKey: string): void {
+export function personQuestionsGate(factory: Pick<Factory, "plans" | "designReviewEnabled">, taskKey: string): void {
   const plan = factory.plans.find((entry) => entry.taskKey === taskKey);
-  if (plan === undefined || plan.commentId === null || plan.personQuestions.length === 0) return;
+  // Turning design review off lets plans marked ready while it was on go ahead.
+  if (!factory.designReviewEnabled || plan === undefined || plan.commentId === null || plan.personQuestions.length === 0) return;
   const open = plan.personQuestions.filter((question) => question.answer === null);
   if (open.length > 0) {
     throw new PluginCliError(`${taskKey}'s plan has ${open.length === 1 ? "a question" : `${open.length} questions`} only the person can answer: ${open.map((question) => question.id).join(", ")}.`, {
@@ -503,9 +534,9 @@ export function personQuestionsGate(factory: Pick<Factory, "plans">, taskKey: st
 }
 
 /** With design review on, a Builder waits until the current READY plan has passed or been accepted. */
-export function designGate(factory: Pick<Factory, "plans" | "designRounds">, taskKey: string): void {
+export function designGate(factory: Pick<Factory, "plans" | "designRounds" | "designReviewEnabled">, taskKey: string): void {
   const plan = factory.plans.find((entry) => entry.taskKey === taskKey);
-  if (plan === undefined || !plan.designRequired || plan.commentId === null || plan.reviewedCommentId === plan.commentId) return;
+  if (!factory.designReviewEnabled || plan === undefined || !plan.designRequired || plan.commentId === null || plan.reviewedCommentId === plan.commentId) return;
   const round = factory.designRounds.filter((entry) => entry.taskKey === taskKey && entry.planCommentId === plan.commentId).at(-1);
   const state = round === undefined ? null : designRoundState(round);
   // Passed, and the factory is still recording it.
@@ -847,6 +878,8 @@ const designRoundSchema = z.object({
   taskKey: z.string(),
   round: z.number(),
   planCommentId: z.string(),
+  /** A fingerprint of the plan's text, so the same plan can't be reviewed again to shake off findings. */
+  planDigest: z.string().nullable().default(null),
   depth: z.enum(["core", "full"]),
   startedAt: z.string(),
   lenses: z.array(z.object({
@@ -855,7 +888,8 @@ const designRoundSchema = z.object({
     findingsCommentId: z.string().nullable().default(null),
     recordedAt: z.string().nullable().default(null),
     quietNotifiedAt: z.string().nullable().default(null),
-    /** Its own worktree and branch, if bb made one for it, are deleted once it has finished. */
+    /** Its own worktree and branch, if bb made one for it, are deleted once it has finished: the worktree first, then the branch. */
+    worktreeDeletedAt: z.string().nullable().default(null),
     cleanedAt: z.string().nullable().default(null),
   })),
   findings: z.array(designFindingSchema).default([]),
@@ -2203,7 +2237,9 @@ export default async function plugin(bb: BbPluginApi) {
       }
       const plan = factory.plans.find((entry) => entry.taskKey === task.key);
       const hasBuilder = factory.agents.some((agent) => agent.taskKey === task.key && agent.role === "build");
-      if (task.status !== "done" && plan?.commentId != null && !hasBuilder) {
+      // Only a plan a Builder could start on: design review and the person's answers come first.
+      const gateOpen = (() => { try { designGate(factory, task.key); personQuestionsGate(factory, task.key); return true; } catch { return false; } })();
+      if (task.status !== "done" && plan?.commentId != null && !hasBuilder && gateOpen) {
         readyPlansAwaitingBuilder.push({
           taskKey: task.key,
           title: task.title,
@@ -2229,7 +2265,7 @@ export default async function plugin(bb: BbPluginApi) {
         // or a plan the READY list above already reports; neither is a worker gone quiet.
         // An Explorer isn't one either: the exploration watch covers its time box, and after its report the
         // task waits for the person's decision.
-        const hasWorker = taskAgents.some((agent) => agent.role !== "plan" && agent.role !== "explore");
+        const hasWorker = taskAgents.some((agent) => agent.role !== "plan" && agent.role !== "explore" && agent.role !== "designreview");
         if (hasWorker && !anyActive && (pr === null || pr.state !== "open")) {
           const lastRoles = [...new Set(taskAgents.map((agent) => ROLES[agent.role].label))];
           inProgressWithoutLiveWorker.push({ taskKey: task.key, title: task.title, lastRoles });
@@ -2638,16 +2674,38 @@ export default async function plugin(bb: BbPluginApi) {
       if (document === undefined || !document.body.startsWith("Factory plan: READY") || !headings.every((heading) => document.body.includes(heading))) {
         throw new PluginCliError(`Post a complete READY planning comment from this Planner first (scope, acceptance criteria, implementation plan, dependencies, open questions${factory.designReviewEnabled ? " and success checks" : ""}).`, { code: "plan_incomplete" });
       }
-      // Each READY plan asks its own questions: answers to an earlier one were for that plan.
-      const questions = factory.designReviewEnabled ? parsePersonQuestions(document.body) : [];
+      if (factory.designReviewEnabled) {
+        // A round's findings can't be shaken off by reviewing the same plan again.
+        if (plan.commentId === document.id) {
+          throw new PluginCliError("This comment is already the READY plan. Post the changed plan as a new task comment, then mark that one ready.", { code: "plan_already_ready" });
+        }
+        const open = latestDesignRound(factory, task.key);
+        if (open !== null && open.outcome === null) {
+          const unresolved = open.findings.filter((finding) => finding.severity !== "nit" && finding.resolution === null);
+          if (unresolved.length > 0) {
+            throw new PluginCliError(`Resolve each Blocker and Major of design review round ${open.round} first: ${unresolved.map((finding) => finding.id).join(", ")}.`, { code: "design_findings_unresolved", hint: `Use \`bb factory design-resolve ${task.key} --finding <id> --as fix|contest|escalate|decline --note "<why>"\`.` });
+          }
+        }
+        const previous = factory.designRounds.filter((round) => round.taskKey === task.key).at(-1);
+        if (previous !== undefined && previous.planDigest === planDigest(document.body) && previous.findings.some((finding) => finding.severity !== "nit")) {
+          throw new PluginCliError(`This plan's text is the same as the one design review round ${previous.round} found problems in. Change it to address the findings first.`, { code: "plan_unchanged" });
+        }
+      }
+      // Each READY plan asks its own questions. An answer that kept the earlier plan's assumption carries
+      // over to the same question, worded the same; anything else is asked again.
+      const earlier = plan.personQuestions;
+      const questions = (factory.designReviewEnabled ? parsePersonQuestions(document.body) : []).map((question) => {
+        const same = earlier.find((entry) => entry.id === question.id && entry.text === question.text && entry.assumed === question.assumed && entry.answer?.choice === "keep");
+        return { ...question, answer: same?.answer ?? null, notifiedAt: same?.notifiedAt ?? null };
+      });
       await mutateFactory(factory.prefix, (current) => {
         const entry = current.plans.find((candidate) => candidate.taskKey === task.key)!;
         entry.commentId = document.id;
         if (current.designReviewEnabled) entry.designRequired = true;
-        entry.personQuestions = questions.map((question) => ({ ...question, answer: null, notifiedAt: null }));
+        entry.personQuestions = questions;
         delete current.closeAdvice[task.key];
       });
-      if (questions.length > 0) await announcePersonQuestions(factory.prefix, task.key);
+      if (questions.some((question) => question.answer === null)) await announcePersonQuestions(factory.prefix, task.key);
       if (factory.designReviewEnabled) await startDesignRound(factory.prefix, task.key, document.id, document.body);
     });
   }
@@ -2678,6 +2736,7 @@ export default async function plugin(bb: BbPluginApi) {
     await mutateFactory(prefix, (current) => {
       for (const entry of current.designRounds) if (entry.taskKey === taskKey && entry.outcome === null) entry.outcome = "superseded";
     });
+    await stopUnfinishedReviewers(previous.filter((entry) => entry.outcome === null));
     if (number > MAX_DESIGN_ROUNDS) {
       await tellLead(factory, `[factory] ${taskKey}'s plan has had ${MAX_DESIGN_ROUNDS} design review rounds, so no more start on their own. Bring it to the person: they can accept the plan as it is (\`bb factory design-accept ${taskKey} --reason "<why>"\`), or ask the Planner to rethink it.`);
       return;
@@ -2685,7 +2744,15 @@ export default async function plugin(bb: BbPluginApi) {
     const sensitive = planSensitivePaths(body);
     const depth = factory.designDepth[taskKey] === "full" || sensitive.length > 0 ? "full" : "core";
     const lenses = depth === "full" ? [...DESIGN_LENSES] : [...CORE_DESIGN_LENSES];
-    const execution = await executionFor("designreview");
+    // A seat on a provider this machine doesn't have would leave every plan waiting. Fall back to the
+    // Planner's, and say so: it loses the second provider, not the review.
+    let execution = await executionFor("designreview");
+    let fellBack = false;
+    const providers = await listProviders();
+    if (providers !== null && !providers.some((provider) => provider.id === execution.providerId && provider.available)) {
+      execution = await executionFor("plan");
+      fellBack = true;
+    }
     const started: { lens: DesignLens; threadId: string }[] = [];
     try {
       for (const lens of lenses) {
@@ -2711,12 +2778,12 @@ export default async function plugin(bb: BbPluginApi) {
     await mutateFactory(prefix, (current) => {
       for (const entry of started) current.agents.push({ threadId: entry.threadId, role: "designreview", taskKey, providerId: execution.providerId, createdAt: now, pr: null });
       current.designRounds.push({
-        taskKey, round: number, planCommentId, depth, startedAt: now,
-        lenses: started.map((entry) => ({ lens: entry.lens, threadId: entry.threadId, findingsCommentId: null, recordedAt: null, quietNotifiedAt: null, cleanedAt: null })),
+        taskKey, round: number, planCommentId, planDigest: planDigest(body), depth, startedAt: now,
+        lenses: started.map((entry) => ({ lens: entry.lens, threadId: entry.threadId, findingsCommentId: null, recordedAt: null, quietNotifiedAt: null, worktreeDeletedAt: null, cleanedAt: null })),
         findings: [], outcome: null, sentToPlannerAt: null, escalationsNotifiedAt: null, outcomeNotifiedAt: null,
       });
     });
-    await comment(task.id, `**Design review, round ${number}** of plan comment \`${planCommentId}\`: ${depth === "full" ? `full depth${sensitive.length > 0 ? ` (it names ${sensitive.slice(0, 3).map((path) => `\`${path}\``).join(", ")})` : ""}` : "core lenses"}. ${started.map((entry) => `${DESIGN_LENS_LABELS[entry.lens]} \`${entry.threadId}\``).join(", ")}.`);
+    await comment(task.id, `**Design review, round ${number}** of plan comment \`${planCommentId}\`: ${depth === "full" ? `full depth${sensitive.length > 0 ? ` (it names ${sensitive.slice(0, 3).map((path) => `\`${path}\``).join(", ")})` : ""}` : "core lenses"}. ${started.map((entry) => `${DESIGN_LENS_LABELS[entry.lens]} \`${entry.threadId}\``).join(", ")}.${fellBack ? ` The design reviewer seat's provider isn't available here, so they run on the Planner's (${execution.providerId}).` : ""}`);
     bb.realtime.publish(BOARD_CHANGED, { prefix });
   }
 
@@ -2748,8 +2815,29 @@ export default async function plugin(bb: BbPluginApi) {
     });
   }
 
+  /** A round that ended has no use for reviewers still reading it. */
+  async function stopUnfinishedReviewers(rounds: DesignRound[]): Promise<void> {
+    for (const round of rounds) {
+      for (const entry of round.lenses) {
+        if (entry.findingsCommentId === null) await bb.sdk.threads.stop({ threadId: entry.threadId }).catch(() => undefined);
+      }
+    }
+  }
+
   /** Moves a round on after anything changes: tells whoever acts next, once, and opens the gate when it passes. */
+  /** Rounds being moved on right now: the commands and the watch can both get there. The watch tries again next pass. */
+  const advancing = new Set<string>();
   async function advanceDesignRound(prefix: string, taskKey: string, number: number): Promise<void> {
+    const key = `${prefix}:${taskKey}:${number}`;
+    if (advancing.has(key)) return;
+    advancing.add(key);
+    try {
+      await advanceDesignRoundOnce(prefix, taskKey, number);
+    } finally {
+      advancing.delete(key);
+    }
+  }
+  async function advanceDesignRoundOnce(prefix: string, taskKey: string, number: number): Promise<void> {
     const factory = await findFactory(prefix);
     const round = factory.designRounds.find((entry) => entry.taskKey === taskKey && entry.round === number);
     if (round === undefined || round.outcome === "superseded" || round.outcome === "accepted") return;
@@ -2757,12 +2845,18 @@ export default async function plugin(bb: BbPluginApi) {
     const state = designRoundState(round);
     const nits = round.findings.filter((finding) => finding.severity === "nit");
     if (state === "clean" || state === "settled") {
+      let claimed = false;
       if (round.outcome === null) {
+        // Set once: only the call that set it posts the comment.
         await updateDesignRound(prefix, taskKey, number, (target, current) => {
+          if (target.outcome !== null) return;
+          claimed = true;
           target.outcome = state === "clean" ? "clean" : "resolved";
           const entry = current.plans.find((candidate) => candidate.taskKey === taskKey);
           if (entry !== undefined && entry.commentId === round.planCommentId) entry.reviewedCommentId = round.planCommentId;
         });
+      }
+      if (claimed) {
         const task = await getTaskByKey(taskKey);
         await comment(task.id, `**Design review passed** in round ${number}${state === "clean" ? ": no Blockers or Majors" : ": every Blocker and Major is settled"}.${nits.length > 0 ? ` ${nits.length} Nit${nits.length === 1 ? "" : "s"} for the Planner to consider.` : ""}`);
         bb.realtime.publish(BOARD_CHANGED, { prefix });
@@ -2800,8 +2894,8 @@ export default async function plugin(bb: BbPluginApi) {
       if (threadId === null || plan?.threadId !== threadId) throw new PluginCliError("Only this task's current Planner can resolve design findings.", { code: "not_the_planner" });
       const round = latestDesignRound(factory, task.key);
       const finding = round?.findings.find((entry) => entry.id === findingId);
-      if (round === null || finding === undefined || round.outcome === "superseded" || round.outcome === "accepted") {
-        throw new PluginCliError(`${findingId} isn't a finding of ${task.key}'s current design review round.`, { code: "design_finding_unknown", hint: `Run \`bb factory status ${factory.prefix}\` to see the current findings.` });
+      if (round === null || finding === undefined || round.outcome !== null) {
+        throw new PluginCliError(round !== null && finding !== undefined ? `Design review round ${round.round} of ${task.key} has ended (${round.outcome}), so its findings can't change. Post a new READY plan to start another round.` : `${findingId} isn't a finding of ${task.key}'s current design review round.`, { code: "design_finding_unknown", hint: `Run \`bb factory status ${factory.prefix}\` to see the current findings.` });
       }
       if (as === "decline" && finding.severity !== "nit") throw new PluginCliError("Only Nits can be declined. Fix, contest or escalate a Blocker or Major.", { code: "design_decline_nit_only" });
       if (as === "contest" && finding.lens === "comprehension") throw new PluginCliError("A Comprehension finding can't be contested: if a fresh reader got it wrong, the plan isn't clear enough. Fix it, or escalate it.", { code: "design_contest_comprehension" });
@@ -2835,6 +2929,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (round === null || finding === undefined || finding.resolution?.as !== "escalate") {
         throw new PluginCliError(`${findingId} isn't an escalated finding of ${task.key}'s current round.`, { code: "design_finding_not_escalated" });
       }
+      if (round.outcome !== null) throw new PluginCliError(`Design review round ${round.round} of ${task.key} has ended (${round.outcome}), so the answer can't change.`, { code: "design_round_ended" });
       await updateDesignRound(factory.prefix, task.key, round.round, (target) => {
         target.findings.find((candidate) => candidate.id === findingId)!.decision = { choice, by: threadId === null ? "person" : "lead", at: new Date().toISOString() };
       });
@@ -2862,6 +2957,7 @@ export default async function plugin(bb: BbPluginApi) {
         entry.reviewedCommentId = entry.commentId;
         for (const round of current.designRounds) if (round.taskKey === task.key && round.outcome === null) round.outcome = "accepted";
       });
+      await stopUnfinishedReviewers(factory.designRounds.filter((round) => round.taskKey === task.key && round.outcome === null));
       await comment(task.id, `**Plan accepted without further design review** (comment \`${plan.commentId}\`), by ${threadId === null ? "the person" : "the Lead, for the person"}: ${reason.trim()}`);
       bb.realtime.publish(BOARD_CHANGED, { prefix: factory.prefix });
     });
@@ -2928,30 +3024,44 @@ export default async function plugin(bb: BbPluginApi) {
    * whose branch is named as this reviewer's is touched; a reviewer in the project checkout needs nothing.
    */
   async function cleanUpDesignReviewer(factory: Factory, round: DesignRound, entry: DesignRound["lenses"][number]): Promise<void> {
-    const thread = await bb.sdk.threads.get({ threadId: entry.threadId }).catch(() => null);
-    if (thread === null || (thread.deletedAt === null && thread.status !== "idle" && thread.status !== "error")) return;
+    const update = (change: (lens: DesignRound["lenses"][number]) => void) => updateDesignRound(factory.prefix, round.taskKey, round.round, (target) => {
+      const lens = target.lenses.find((candidate) => candidate.threadId === entry.threadId);
+      if (lens !== undefined) change(lens);
+    });
     const listed = await agentWorktree(factory, entry.threadId);
     if (listed === undefined) return;
-    const done = () => updateDesignRound(factory.prefix, round.taskKey, round.round, (target) => {
-      const lens = target.lenses.find((candidate) => candidate.threadId === entry.threadId);
-      if (lens !== undefined) lens.cleanedAt = new Date().toISOString();
-    });
-    if (listed === null || !listed.isWorktree || listed.branch === null || !isDisposableBranch(listed.branch, entry.threadId)) return done();
-    try {
-      if (thread.deletedAt === null && thread.environmentId !== null) {
-        if (thread.archivedAt === null) await bb.sdk.threads.archive({ threadId: entry.threadId });
-        await bb.sdk.environments.delete({ environmentId: thread.environmentId });
+    // bb no longer lists it, or it ran in the project checkout: nothing of its own to delete.
+    if (listed === null || !listed.isWorktree || listed.branch === null || !isDisposableBranch(listed.branch, entry.threadId)) {
+      await update((lens) => { lens.cleanedAt = new Date().toISOString(); });
+      return;
+    }
+    // Each step is recorded as it's done, so a retry doesn't redo what already worked.
+    if (entry.worktreeDeletedAt === null) {
+      const thread = await bb.sdk.threads.get({ threadId: entry.threadId }).catch(() => null);
+      if (thread === null || (thread.deletedAt === null && thread.status !== "idle" && thread.status !== "error")) return;
+      try {
+        if (thread.deletedAt === null && thread.environmentId !== null) {
+          if (thread.archivedAt === null) await bb.sdk.threads.archive({ threadId: entry.threadId });
+          await bb.sdk.environments.delete({ environmentId: thread.environmentId });
+        }
+      } catch (error) {
+        if (!worktreeDeleteWarned.has(entry.threadId)) bb.log.warn(`could not delete the worktree of design reviewer ${entry.threadId}: ${String(error)}`);
+        worktreeDeleteWarned.add(entry.threadId);
+        return;
       }
+      await update((lens) => { lens.worktreeDeletedAt = new Date().toISOString(); });
+    }
+    try {
       const { hostId, projectPath } = await projectHost(factory);
       if (projectPath === null) return;
       const result = await host.call("delete_explorer_branch", { projectPath, branch: listed.branch, threadId: entry.threadId }, { hostId, timeoutMs: 60_000 });
       if (!result.deleted && !result.missing) throw new Error(result.error ?? "the branch wasn't deleted");
     } catch (error) {
-      if (!worktreeDeleteWarned.has(entry.threadId)) bb.log.warn(`could not clean up design reviewer ${entry.threadId}: ${String(error)}`);
-      worktreeDeleteWarned.add(entry.threadId);
+      if (!worktreeDeleteWarned.has(`branch:${entry.threadId}`)) bb.log.warn(`could not delete the branch of design reviewer ${entry.threadId}: ${String(error)}`);
+      worktreeDeleteWarned.add(`branch:${entry.threadId}`);
       return;
     }
-    await done();
+    await update((lens) => { lens.cleanedAt = new Date().toISOString(); });
   }
   /** Whether bb gave the thread a worktree, and its branch; null if bb doesn't list it, undefined if the lookup failed. */
   async function agentWorktree(factory: Factory, threadId: string): Promise<{ isWorktree: boolean; branch: string | null } | null | undefined> {

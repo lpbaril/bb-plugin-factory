@@ -354,7 +354,7 @@ export function workerReminder(args: { role: WorkerRoleId; factoryName: string; 
   const track = [args.tracks ? TRACK_REMINDERS[args.role] : undefined, args.designReview ? DESIGN_REMINDERS[args.role] : undefined].filter((part) => part !== undefined).join(" ") || undefined;
   return `# Standing role: ${ROLES[args.role].label} in the "${args.factoryName}" software factory, on task ${args.taskKey}
 
-Your first message has your full brief. If it is no longer in your context, re-read the task with \`bb tasks show ${args.taskKey}\`. If you cannot continue, run \`bb factory block ${args.taskKey} --reason "<what you need>"\` instead of stalling. Don't move the task to Done. ${WORKER_RULES[args.role]}${track === undefined ? "" : ` ${track}`}${args.evidenceContract ? ` ${EVIDENCE_REMINDERS[args.role]}` : ""}`;
+Your first message has your full brief. If it is no longer in your context, re-read the task with \`bb tasks show ${args.taskKey}\`. ${args.role === "designreview" ? "If you can't finish, say why in your final message; never block the task, which others are working on." : `If you cannot continue, run \`bb factory block ${args.taskKey} --reason "<what you need>"\` instead of stalling.`} Don't move the task to Done. ${WORKER_RULES[args.role]}${track === undefined ? "" : ` ${track}`}${args.evidenceContract ? ` ${EVIDENCE_REMINDERS[args.role]}` : ""}`;
 }
 
 const WORKER_CONTRACTS: Record<WorkerRoleId, string> = {
@@ -526,7 +526,8 @@ const PLAN_DESIGN_REVIEW = `## Design review of your plan
   - **contest**: the finding is wrong, and evidence the reviewer could have read shows it: a file and symbol, or a decision already written in the plan. Say which in the note. A Comprehension finding can't be contested: if a fresh reader got it wrong, the plan isn't clear enough.
   - **escalate**: the finding is wrong, but only knowledge outside the plan and the code settles it, or fixing it would undo an earlier fix. The person decides, through the Lead. Don't add context to the plan just to satisfy a reviewer without project knowledge.
   - **decline**: Nits only; recorded, not fixed.
-- After any fix, post a new complete READY plan with the fixes as a task comment and run \`bb factory plan-ready <KEY> --comment <id>\` again. That starts the next round. Findings you contested or declined stay settled across rounds.`;
+- Resolve every Blocker and Major before you post a new plan. After any fix, post a new complete READY plan with the fixes as a new task comment and run \`bb factory plan-ready <KEY> --comment <id>\` again. That starts the next round; the factory refuses the same plan unchanged.
+- Each round's reviewers start fresh, so one may raise a finding you contested before. Contest it again, citing the same evidence. Answers the person gave to keep an assumption carry over when the question stays word for word the same.`;
 
 /** The Planner's other endings, for factories with tracks on. */
 const PLAN_OUTCOMES = `## When there's no plan to write
@@ -646,7 +647,7 @@ You review a plan before anyone builds it, for the "${args.factoryName}" softwar
 - **Read only the plan and the code it names.** Get the plan with \`bb factory plan ${args.task.key}\`: it prints task comment \`${args.planCommentId}\`, the version under review. Read the code in this project checkout. Don't read the task's other comments, other reviewers' findings or the Planner's thread.
 - **Read-only.** Don't edit files, change git state or run anything that writes.
 - **No invented findings.** A plan with nothing wrong gets "No findings." Every finding cites the plan's text or a file:line.
-- **Don't message other agents,** the Lead included. The factory reports your findings to whoever acts next.
+- **Don't message other agents,** the Lead included. The factory reports your findings to whoever acts next. Never block or move the task: others are working on it. If you can't finish, say why in your final message.
 
 ## Your lens
 
