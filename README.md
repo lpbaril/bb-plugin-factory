@@ -95,7 +95,8 @@ a task with no track yet direct.
   comment recorded with `bb factory explore-report`: hypothesis, what was tried, what
   was learned, a recommendation (build, plan, explore more or close) and what wasn't
   checked. The factory reminds it near the end of the time box, and tells the Lead if
-  it runs past. Once it has reported and finished, the factory archives its thread
+  it runs past. An Explorer that finishes or is stopped without a report is given up
+  on after twice its time box, and the comparison lists it as stopped without one. Once it has reported and finished, the factory archives its thread
   and deletes its worktree and local branch. The host worker deletes only a branch
   named as an Explorer's, never one still checked out, and a branch an Explorer
   pushed anyway stays on GitHub. A Builder
@@ -109,7 +110,11 @@ Lead gets them side by side, and the task on the Factory page shows them in colu
 
 A Planner can also end without a plan: NEEDS SPIKE moves the task to explore, and
 RECOMMEND CLOSE, like an Explorer's close recommendation, marks the task "Close
-advised". Only you close a task on an agent's advice.
+advised" until a track is chosen, a new Planner or Explorer starts, or a plan is
+READY. Only you close a task on an agent's advice.
+
+Turning tracks on in an existing factory keeps a Planner's gate: a task that already
+has a Planner counts as plan, so no Builder starts until its plan is READY.
 
 Tracks are on for new factories. Existing factories keep working as before until you
 turn them on, from outside an agent thread: `bb factory tracks APP on`.
