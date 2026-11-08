@@ -51,14 +51,17 @@ Settings → Plugins → Factory, or `bb plugin config factory`:
     provider when there is one.
   - **What a preset keeps:** the model and reasoning level you picked, when the seat
     stays on the same provider and the preset doesn't target its level. A seat
-    that moves starts from that provider's defaults. It proposes only
+    that moves starts from that provider's defaults. Maximum depth never lowers a
+    level, such as ultra, and Lower cost never raises one, such as none. A level is left alone
+    when the model's levels can't be read. It proposes only
     providers available on this machine, preferring ones the roster already
     uses, and never touches the shadow or the trial comparison.
   - **Reviewer seats** (Reviewer 1, Reviewer 2 and Security) are shown but
     unticked: tick them yourself to apply them.
   - **From the command line:** `bb factory agents preset balanced|lower-cost|max-depth`
     previews, and `--apply` applies the ticked seats, or only those named with
-    `--seats review1,plan`. Applying is refused from an agent thread.
+    `--seats review1,plan`. Applying is refused from an agent thread, and when
+    the roster or the providers changed since the preview.
 - **Agent permissions**: `auto` (default) asks you before commands outside the
   sandbox. `full` removes all approvals.
 - **Review factory pull requests automatically**, and the changed-line threshold
