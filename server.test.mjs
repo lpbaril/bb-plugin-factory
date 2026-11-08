@@ -10,7 +10,7 @@ registerHooks({ resolve(specifier, context, next) {
   }
   return next(specifier, context);
 } });
-const { default: plugin, parsePersonQuestions, personQuestionsGate, parseDesignFindings, planSensitivePaths, designRoundState, designGate, trackGate, parseApproaches, exploreAssignment, readRecommendation, sectionText, supervisorAction, turnsFromEvents, creditUsage, mergeBlockers, sortChecks, latestRuns, mergeOverlapNote, migrateQaResults, qaCarryNote, leadMayMerge, rosterWarnings, computeHealth, parseDay, prsOpenedBetween, qaHold, qaNextStep, parseCoverage, changeRounds, fixLoopAdvice } = await import('./server.ts');
+const { default: plugin, computePreset, parsePersonQuestions, personQuestionsGate, parseDesignFindings, planSensitivePaths, designRoundState, designGate, trackGate, parseApproaches, exploreAssignment, readRecommendation, sectionText, supervisorAction, turnsFromEvents, creditUsage, mergeBlockers, sortChecks, latestRuns, mergeOverlapNote, migrateQaResults, qaCarryNote, leadMayMerge, rosterWarnings, computeHealth, parseDay, prsOpenedBetween, qaHold, qaNextStep, parseCoverage, changeRounds, fixLoopAdvice } = await import('./server.ts');
 const { leadCharter, leadPrompt, reReviewMessage, workerPrompt, workerReminder, designReviewPrompt } = await import('./roles.ts');
 const { createFactoryStorage } = await import('./factory-storage.ts');
 
@@ -5114,4 +5114,143 @@ test('"plan passed" is posted and sent once, even when the watch and the last re
   await Promise.all([last, watching]);
   assert.equal(fx2.sent.length, 1);
   assert.equal(fx.posted.filter(body => /^\*\*Design review passed\*\*/.test(body)).length, 1);
+});
+
+// ----- Phase 3b: roster presets -----
+
+const efforts = (...levels) => levels;
+const presetCatalog = (over = {}) => ({
+  providers: [{ id: 'claude-code', available: true }, { id: 'codex', available: true }, { id: 'acp-cursor', available: false }, ...(over.extra ?? [])],
+  models: {
+    'claude-code': [
+      { id: 'claude-opus-5-5', isDefault: true, defaultReasoningEffort: 'high', efforts: efforts('low', 'medium', 'high', 'xhigh', 'max', 'ultra') },
+      { id: 'claude-sonnet-5-5', isDefault: false, defaultReasoningEffort: 'high', efforts: efforts('low', 'medium', 'high') },
+    ],
+    codex: [{ id: 'gpt-6.1-sol', isDefault: true, defaultReasoningEffort: 'medium', efforts: efforts('none', 'low', 'medium', 'high', 'xhigh') }],
+    ...(over.models ?? {}),
+  },
+});
+const exec = (providerId, model = null, reasoningLevel = null) => ({ providerId, model, reasoningLevel });
+// This machine's roster when Phase 3b was built.
+const liveRoster = () => ({
+  lead: exec('claude-code', 'claude-sonnet-5-5', 'high'), plan: exec('claude-code', 'claude-opus-5-5', 'high'), explore: exec('claude-code'),
+  build: exec('codex', 'gpt-6.1-sol', 'xhigh'), qa: exec('claude-code', 'claude-sonnet-5-5', 'high'), design: exec('claude-code', null, 'high'),
+  review1: exec('claude-code', 'claude-opus-5-5', 'high'), review2: exec('codex', 'gpt-6.1-sol', 'xhigh'), security: exec('claude-code', null, 'high'),
+  designreview: exec('codex'), shadow: exec('codex', null, 'high'), comparison: exec('claude-code'),
+});
+const seat = (seats, key) => seats.find(entry => entry.key === key);
+
+test('Balanced keeps the models and reasoning levels you set, leaves reviewer seats unticked and trial seats alone', () => {
+  const seats = computePreset('balanced', liveRoster(), presetCatalog());
+  assert.deepEqual(seats.map(entry => entry.key), ['lead', 'plan', 'explore', 'build', 'qa', 'design', 'review1', 'review2', 'security', 'designreview']);
+  assert.deepEqual(seat(seats, 'build').proposed, exec('codex', 'gpt-6.1-sol', 'xhigh'), 'not dropped to the model\'s default');
+  assert.match(seat(seats, 'build').why.join(' '), /Keeps the model you picked \(gpt-6\.1-sol\)[\s\S]*Keeps the reasoning level you set \(xhigh\)/);
+  assert.equal(seat(seats, 'build').changed, false);
+  assert.equal(seats.filter(entry => entry.changed).length, 0, 'this roster already balances');
+  assert.match(seat(seats, 'review1').why.join(' '), /A reviewer seat: applied only if you tick it/);
+  // A reviewer seat that does change is shown unticked.
+  const moved = computePreset('balanced', { ...liveRoster(), review1: exec('codex', 'gpt-6.1-sol', 'high') }, presetCatalog());
+  assert.equal(seat(moved, 'review1').changed, true);
+  assert.equal(seat(moved, 'review1').ticked, false, 'reviewer seats stay the person\'s choice');
+  assert.equal(seat(seats, 'explore').changed, false);
+  assert.equal(seat(seats, 'explore').ticked, false);
+});
+
+test('Balanced keeps reviews independent and moves seats off a provider that isn\'t available', () => {
+  const roster = { ...liveRoster(), review1: exec('codex', 'gpt-6.1-sol'), designreview: exec('claude-code'), qa: exec('acp-cursor', 'gemini', 'high') };
+  const catalog = presetCatalog();
+  catalog.providers.unshift({ id: 'pi', available: true }); // listed first, but nobody in the roster uses it
+  const seats = computePreset('balanced', roster, catalog);
+  assert.deepEqual(seat(seats, 'review1').proposed, exec('claude-code', null, null));
+  assert.match(seat(seats, 'review1').why[0], /Moved to claude-code: Reviewer 1 checks the Builder's work/);
+  assert.deepEqual(seat(seats, 'designreview').proposed, exec('codex', null, null));
+  assert.match(seat(seats, 'designreview').why[0], /provider other than the Planner's/);
+  assert.deepEqual(seat(seats, 'qa').proposed, exec('claude-code', null, null), 'to a provider the roster already uses, from its defaults');
+  assert.match(seat(seats, 'qa').why[0], /acp-cursor isn't available here/);
+});
+
+test('with one provider, reviews can\'t be independent and the preset says so rather than leaving the seat unable to run', () => {
+  const catalog = { providers: [{ id: 'claude-code', available: true }], models: presetCatalog().models };
+  const roster = { ...liveRoster(), build: exec('claude-code'), review1: exec('claude-code'), review2: exec('claude-code'), designreview: exec('codex') };
+  const seats = computePreset('max-depth', roster, catalog);
+  assert.equal(seat(seats, 'review1').proposed.providerId, 'claude-code');
+  assert.match(seat(seats, 'review1').why[0], /No other provider is available here, so it can't be independent/);
+  assert.equal(seat(seats, 'review2').proposed.providerId, 'claude-code');
+  assert.match(seat(seats, 'review2').why[0], /No other provider is available here, so it can't be independent/);
+  assert.doesNotMatch(seat(seats, 'review2').why.join(' '), /off the Builder's/);
+  assert.equal(seat(seats, 'designreview').proposed.providerId, 'claude-code', 'codex isn\'t available');
+});
+
+test('Lower cost lowers reasoning only on seats that read more than they write', () => {
+  const seats = computePreset('lower-cost', liveRoster(), presetCatalog());
+  assert.equal(seat(seats, 'qa').proposed.reasoningLevel, 'low');
+  assert.equal(seat(seats, 'designreview').proposed.reasoningLevel, 'low', 'none is skipped');
+  assert.equal(seat(seats, 'explore').proposed.reasoningLevel, 'low', 'its default model also offers ultra, a special mode that is never picked');
+  assert.match(seat(seats, 'qa').why.join(' '), /Lowest reasoning level its model offers \(low\): this seat reads more than it writes/);
+  assert.equal(seat(seats, 'build').proposed.reasoningLevel, 'xhigh', 'a seat the preset doesn\'t target keeps your level');
+  assert.equal(seat(seats, 'plan').proposed.reasoningLevel, 'high');
+});
+
+test('Maximum depth raises reasoning where judgment matters, and adds a third provider for Reviewer 2 only when there is one', () => {
+  let seats = computePreset('max-depth', liveRoster(), presetCatalog());
+  assert.equal(seat(seats, 'plan').proposed.reasoningLevel, 'max', 'ultra is a special mode, never picked');
+  assert.equal(seat(seats, 'designreview').proposed.reasoningLevel, 'xhigh');
+  assert.equal(seat(seats, 'build').proposed.reasoningLevel, 'xhigh');
+  assert.equal(seat(seats, 'review2').proposed.providerId, 'claude-code', 'off the Builder\'s provider, at least');
+  assert.match(seat(seats, 'review2').why[0], /^Moved to claude-code: no third provider is available, so it at least runs on one other than the Builder's$/);
+  assert.doesNotMatch(seat(seats, 'review2').why.join(' '), /adds a third provider/);
+  seats = computePreset('max-depth', liveRoster(), presetCatalog({ extra: [{ id: 'pi', available: true }], models: { pi: [{ id: 'pi-1', isDefault: true, defaultReasoningEffort: 'high', efforts: ['high'] }] } }));
+  assert.deepEqual(seat(seats, 'review2').proposed, exec('pi', null, 'high'));
+  assert.match(seat(seats, 'review2').why[0], /at maximum depth, Reviewer 2 adds a third provider/);
+});
+
+const presetProviders = () => ({
+  list: async () => presetCatalog().providers,
+  models: async ({ providerId }) => ({ models: (presetCatalog().models[providerId] ?? []).map(model => ({ id: model.id, model: model.id, displayName: model.id, description: '', isDefault: model.isDefault, defaultReasoningEffort: model.defaultReasoningEffort, supportedReasoningEfforts: model.efforts.map(reasoningEffort => ({ reasoningEffort, description: '' })) })) }),
+});
+async function presetFixture(t) {
+  const result = await fixture(t, false, {}, { providers: presetProviders() });
+  await result.bb.storage.kv.set('agents', { roles: liveRoster(), shadowCustomModel: null });
+  const roles = async () => (await result.bb.storage.kv.get('agents')).roles;
+  return { ...result, roles };
+}
+
+test('bb factory agents preset previews each seat with why, and only the person applies it', async t => {
+  const { harness, roles } = await presetFixture(t);
+  const preview = await harness.behavior.runCli(['agents', 'preset', 'lower-cost']);
+  assert.equal(preview.exitCode, 0, preview.stderr);
+  assert.match(preview.stdout, /\[x\] QA: claude-code · claude-sonnet-5-5 · high → claude-code · claude-sonnet-5-5 · low/);
+  assert.match(preview.stdout, /\n    Reviewer 1: no change \(claude-code · claude-opus-5-5 · high\)\n/);
+  assert.match((await harness.behavior.runCli(['agents', 'preset', 'max-depth'])).stdout, /\[ \] Reviewer 1: claude-code · claude-opus-5-5 · high → claude-code · claude-opus-5-5 · max/);
+  assert.match(preview.stdout, /Lowest reasoning level its model offers \(low\)/);
+  assert.match((await harness.behavior.runCli(['agents', 'preset', 'cheap'])).stderr, /The preset is balanced, lower-cost, max-depth/);
+  const agent = await harness.behavior.runCli(['agents', 'preset', 'lower-cost', '--apply'], { threadId: 'thr_lead' });
+  assert.match(agent.stderr, /Only the person can change which model an agent runs on/);
+  assert.equal((await roles()).qa.reasoningLevel, 'high');
+  const applied = await harness.behavior.runCli(['agents', 'preset', 'lower-cost', '--apply']);
+  assert.equal(applied.stdout, 'Applied the Lower cost preset to Lead, Explorer, QA, Design reviewer.', 'the ticked seats, no reviewer seat');
+  const after = await roles();
+  assert.equal(after.qa.reasoningLevel, 'low');
+  assert.deepEqual(after.review1, liveRoster().review1, 'a reviewer seat isn\'t applied unless named');
+  assert.deepEqual(after.build, liveRoster().build);
+  assert.match((await harness.behavior.runCli(['agents', 'preset', 'balanced', '--apply', '--seats', 'review9'])).stderr, /Not a preset seat: review9/);
+  assert.equal((await harness.behavior.runCli(['agents', 'preset', 'balanced', '--apply'])).stdout, 'Nothing changed: those seats already match the preset.');
+  await harness.behavior.runCli(['agents', 'preset', 'max-depth', '--apply', '--seats', 'review1']);
+  assert.deepEqual((await roles()).review1, exec('claude-code', 'claude-opus-5-5', 'max'), 'named, it applies');
+  assert.equal((await roles()).plan.reasoningLevel, 'high', 'only the named seat');
+  assert.deepEqual((await roles()).shadow, liveRoster().shadow, 'the trial seats are never touched');
+});
+
+test('the settings page previews and applies only the seats it sends, and nothing else can apply', async t => {
+  const { harness, roles } = await presetFixture(t);
+  const preview = await harness.behavior.callRpc('agents_preset_preview', { preset: 'max-depth' });
+  assert.equal(preview.label, 'Maximum depth');
+  assert.equal(preview.seats.find(entry => entry.key === 'review1').ticked, false);
+  await assert.rejects(harness.behavior.callRpc('agents_preset_apply', { preset: 'max-depth', keys: ['plan'] }, { experimental_caller: { kind: 'plugin', pluginId: 'other' } }), /Only the plugin settings page/);
+  const view = await harness.behavior.callRpc('agents_preset_apply', { preset: 'max-depth', keys: ['plan', 'security'] });
+  assert.ok(Array.isArray(view.agents));
+  const after = await roles();
+  assert.equal(after.plan.reasoningLevel, 'max');
+  assert.equal(after.security.reasoningLevel, 'max', 'a reviewer seat the person ticked');
+  assert.equal(after.designreview.reasoningLevel, null, 'not sent, not changed');
 });

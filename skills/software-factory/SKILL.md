@@ -220,6 +220,11 @@ runs on (every role plus the reviewer-trial comparison); the person changes them
 in the Agents section of the plugin settings, or with `bb factory agents set`. It and
 `bb factory doctor` warn when the Builder, Reviewer 1 and Security share a provider, or
 a seat's provider isn't available.
+`bb factory agents preset balanced|lower-cost|max-depth` previews a roster
+preset: for each seat, the provider and reasoning level it proposes and why.
+Only the person applies one (`--apply`, refused from an agent thread). Reviewer
+seats are applied only when the person names them. To suggest a preset, show the person the
+preview and let them apply it.
 An unset level follows the model's default. A level the model's catalog doesn't
 list is still sent as the person set it — provider capabilities lag behind what
 a provider accepts — with a warning in the plugin log.

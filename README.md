@@ -25,8 +25,9 @@ a project and a task prefix, and start the Lead.
 
 Settings → Plugins → Factory, or `bb plugin config factory`:
 
-- **Agents**: one line per agent (Lead, Planner, Builder, QA, Designer, Reviewer 1,
-  Reviewer 2, Security, Shadow security, and the reviewer-trial comparison),
+- **Agents**: one line per agent (Lead, Planner, Explorer, Builder, QA, Designer,
+  Reviewer 1, Reviewer 2, Security, Design reviewer, Shadow security, and the
+  reviewer-trial comparison),
   each with bb's provider, model and reasoning picker. Until you pick, an agent
   uses the provider's catalog defaults, exactly as shown (never the level a
   project used last); **Use defaults** goes back to them. The shadow
@@ -37,6 +38,27 @@ Settings → Plugins → Factory, or `bb plugin config factory`:
   --provider … --model … --reasoning …` changes one (`--custom-model` for the
   shadow). Upgrading from 0.1.2 copies the old per-role provider settings and
   the shadow model into Agents once.
+- **Presets**: above the agents, **Balanced**, **Lower cost** and **Maximum
+  depth** each propose a provider and reasoning level for every seat, with why,
+  for you to tick and apply. Nothing changes until you choose **Apply**.
+  - **Balanced** keeps each seat as you set it, except that it moves Reviewer 1
+    to a provider other than the Builder's, design reviewers to one other than
+    the Planner's, and any seat off a provider that isn't available.
+  - **Lower cost** is Balanced with the lowest reasoning level on the seats that read
+    more than they write: Lead, QA, Explorer and Design reviewer.
+  - **Maximum depth** is Balanced with the highest reasoning level on the Planner,
+    the design reviewers and the PR reviewers, and Reviewer 2 on a third
+    provider when there is one.
+  - **What a preset keeps:** the model and reasoning level you picked, when the seat
+    stays on the same provider and the preset doesn't target its level. A seat
+    that moves starts from that provider's defaults. It proposes only
+    providers available on this machine, preferring ones the roster already
+    uses, and never touches the shadow or the trial comparison.
+  - **Reviewer seats** (Reviewer 1, Reviewer 2 and Security) are shown but
+    unticked: tick them yourself to apply them.
+  - **From the command line:** `bb factory agents preset balanced|lower-cost|max-depth`
+    previews, and `--apply` applies the ticked seats, or only those named with
+    `--seats review1,plan`. Applying is refused from an agent thread.
 - **Agent permissions**: `auto` (default) asks you before commands outside the
   sandbox. `full` removes all approvals.
 - **Review factory pull requests automatically**, and the changed-line threshold
