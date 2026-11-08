@@ -119,6 +119,48 @@ has a Planner counts as plan, so no Builder starts until its plan is READY.
 Tracks are on for new factories. Existing factories keep working as before until you
 turn them on, from outside an agent thread: `bb factory tracks APP on`.
 
+## Design review
+
+When a Planner marks a plan READY, fresh design reviewers read it before any Builder
+starts. They haven't seen the Planner's reasoning: each reads only the plan and the code
+it names, read-only in the project checkout, one thread per lens. This is adapted from
+Google's [Elephant & Goldfish Model](https://github.com/google/elephant-goldfish-model)
+(Apache-2.0).
+
+- **Core lenses:** Zoom Out (simplicity, YAGNI, reuse of existing code), Comprehension
+  (a naive reader: undefined terms and assumed context) and Codebase Details (what the
+  plan says about the code, checked against the code).
+- **Full depth** adds Design Critic (failure modes, scale, trade-offs) and
+  Implementation Readiness (files, steps and tests). It runs when the plan names
+  sensitive paths, the same ones that bring in Reviewer 2 on a PR, or when the Lead or
+  you set `bb factory design-depth APP-12 full` before the plan is READY.
+- Each reviewer records its findings, each a Blocker, Major or Nit, with
+  `bb factory design-findings`. The Planner resolves each one with
+  `bb factory design-resolve`: **fix**, **contest** with evidence the reviewer could
+  have read, **escalate** when only you know the answer, or **decline** for Nits. A
+  Comprehension finding can't be contested.
+- A Builder can't start until no Blocker or Major is unsettled. After a fix, the
+  Planner posts a new READY plan, which starts the next round. A round with no
+  unsettled Blocker or Major ends the review.
+- Only escalations reach you, through the Lead or as Keep and Fix buttons on the task
+  on the Factory page. So do the plan's own questions for you: the Planner lists each
+  one under "## Open questions" as `- For the person: Q1. <question> Assumed: <what the
+  plan builds on>`. The Lead gets them as soon as the plan is READY, and no Builder
+  starts until you've answered each, through the Lead (`bb factory plan-answer APP-12
+  keep|change --question Q1`) or on the task. A different answer sends the plan back to
+  the Planner for a new READY plan. After 5 rounds, the Lead brings the plan to you: you can accept it
+  as it is (`bb factory design-accept APP-12 --reason "..."`) or send it back.
+- READY plans also need a "## Success checks" heading. Every review, with findings or
+  without, ends with "## Checked" (the plan sections and files read) and "## Not
+  checked", so a clean review shows what it looked at.
+- Once a reviewer has finished, the factory archives its thread and deletes the
+  worktree and branch bb made for it, the same way as an Explorer's.
+
+Design review is on for new factories. Existing factories turn it on from outside an
+agent thread: `bb factory design-review APP on`. It applies to plans marked ready from
+then on. The design reviewer seat in Agents defaults to Codex, a provider other than
+the Planner's.
+
 The Lead escalates technical disputes and substantive replanning to the Planner,
 and product decisions to you. It cannot waive review gates. New PR reviewers
 send parent notifications only when stuck; Factory reports the complete review

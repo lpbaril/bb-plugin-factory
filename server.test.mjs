@@ -10,8 +10,8 @@ registerHooks({ resolve(specifier, context, next) {
   }
   return next(specifier, context);
 } });
-const { default: plugin, trackGate, parseApproaches, exploreAssignment, readRecommendation, sectionText, supervisorAction, turnsFromEvents, creditUsage, mergeBlockers, sortChecks, latestRuns, mergeOverlapNote, migrateQaResults, qaCarryNote, leadMayMerge, rosterWarnings, computeHealth, parseDay, prsOpenedBetween, qaHold, qaNextStep, parseCoverage, changeRounds, fixLoopAdvice } = await import('./server.ts');
-const { leadCharter, leadPrompt, reReviewMessage, workerPrompt, workerReminder } = await import('./roles.ts');
+const { default: plugin, parsePersonQuestions, personQuestionsGate, parseDesignFindings, planSensitivePaths, designRoundState, designGate, trackGate, parseApproaches, exploreAssignment, readRecommendation, sectionText, supervisorAction, turnsFromEvents, creditUsage, mergeBlockers, sortChecks, latestRuns, mergeOverlapNote, migrateQaResults, qaCarryNote, leadMayMerge, rosterWarnings, computeHealth, parseDay, prsOpenedBetween, qaHold, qaNextStep, parseCoverage, changeRounds, fixLoopAdvice } = await import('./server.ts');
+const { leadCharter, leadPrompt, reReviewMessage, workerPrompt, workerReminder, designReviewPrompt } = await import('./roles.ts');
 const { createFactoryStorage } = await import('./factory-storage.ts');
 
 const failure = (category, httpStatusCode = null, attemptNumber = 1) =>
@@ -4554,4 +4554,402 @@ test('the watch leaves a settled Explorer without its own worktree alone', async
   const { harness } = await tracksFixture(t, { explorations: [reportedEntry({ ownWorktree: false })] }, { threads: { list: async () => { lookups += 1; return []; }, get: async ({ threadId }) => { lookups += 1; return makeThreadResponse({ id: threadId, status: 'idle' }); } } });
   await exploreWatch(harness);
   assert.equal(lookups, 0);
+});
+
+// ----- Phase 3: fresh design review -----
+
+const finding = (n, severity, title) => `### ${n}. ${severity}: ${title}\nWhere: Implementation plan\nProblem: it breaks.\nEvidence: tip.py:12\nSuggested fix: do this.`;
+const checked = '\n\n## Checked\nThe whole plan; tip.py, test_tip.py.\n\n## Not checked\nnothing';
+const review = (lens, ...findings) => `Factory design review: ${lens}, round 1\n\n${lens === 'Comprehension' ? '## What this proposes\nA tax option.\n## How the existing system works, per this plan\nIt adds tips.\n\n' : ''}${findings.length === 0 ? 'No findings.' : findings.join('\n\n')}${checked}`;
+
+test('parseDesignFindings reads numbered findings, "No findings", and refuses what it can\'t read', () => {
+  const parsed = parseDesignFindings(review('Zoom Out', finding(1, 'Major', 'Reinvents the parser'), finding(2, '**Nit**', 'Wording')), 'zoom-out');
+  assert.deepEqual(parsed.findings.map(entry => [entry.severity, entry.title]), [['major', 'Reinvents the parser'], ['nit', 'Wording']]);
+  assert.match(parsed.findings[0].detail, /^Where: Implementation plan[\s\S]*Suggested fix: do this\.$/);
+  assert.doesNotMatch(parsed.findings[1].detail, /## Checked/, 'the last finding stops before the closing sections');
+  assert.deepEqual(parseDesignFindings(review('Zoom Out'), 'zoom-out'), { findings: [] });
+  assert.match(parseDesignFindings('My review\n### 1. Major: x', 'zoom-out').error, /must start with "Factory design review:"/);
+  assert.match(parseDesignFindings(`Factory design review: Zoom Out\nLooks fine to me.${checked}`, 'zoom-out').error, /"### 1\. Major: <title>"/);
+  assert.match(parseDesignFindings(`Factory design review: Comprehension\nNo findings.${checked}`, 'comprehension').error, /What this proposes/);
+  // As SAND-17's reviewers wrote: nothing shows what a bare "No findings." looked at.
+  assert.match(parseDesignFindings('Factory design review: Zoom Out, round 1\n\nNo findings.', 'zoom-out').error, /ends with "## Checked" \(the plan sections and the files you read\) and "## Not checked"/);
+  assert.match(parseDesignFindings('Factory design review: Zoom Out, round 1\n\nNo findings.\n\n## Checked\nThe plan.', 'zoom-out').error, /## Not checked/);
+  assert.deepEqual(parseDesignFindings(review('Comprehension'), 'comprehension'), { findings: [] });
+});
+
+test('planSensitivePaths finds the sensitive files a plan names', () => {
+  assert.deepEqual(planSensitivePaths('Change `app/auth/session.py`, `README.md` and `src/tip.py`.'), ['app/auth/session.py']);
+  assert.deepEqual(planSensitivePaths('Edit .github/workflows/ci.yml and add migrations/0012_tax.sql.'), ['.github/workflows/ci.yml', 'migrations/0012_tax.sql'], 'without the full stop');
+  assert.deepEqual(planSensitivePaths('Add a --tax option to tip.py'), []);
+});
+
+const designFinding = (over = {}) => ({ id: '1.zoom-out.1', lens: 'zoom-out', severity: 'major', title: 't', detail: '', resolution: null, decision: null, ...over });
+const designLenses = (recorded = true) => ['zoom-out', 'comprehension', 'codebase-details'].map(lens => ({ lens, threadId: `thr_${lens}`, findingsCommentId: recorded ? `c_${lens}` : null, recordedAt: null, quietNotifiedAt: null }));
+
+test('designRoundState: only Blockers and Majors hold a plan, until resolved and answered', () => {
+  const at = '';
+  assert.equal(designRoundState({ lenses: designLenses(false), findings: [] }), 'reviewing');
+  assert.equal(designRoundState({ lenses: designLenses(), findings: [designFinding({ severity: 'nit' })] }), 'clean');
+  assert.equal(designRoundState({ lenses: designLenses(), findings: [designFinding()] }), 'resolving');
+  assert.equal(designRoundState({ lenses: designLenses(), findings: [designFinding({ resolution: { as: 'contest', note: 'x', at } })] }), 'settled');
+  assert.equal(designRoundState({ lenses: designLenses(), findings: [designFinding({ resolution: { as: 'escalate', note: 'x', at } })] }), 'escalated');
+  assert.equal(designRoundState({ lenses: designLenses(), findings: [designFinding({ resolution: { as: 'escalate', note: 'x', at }, decision: { choice: 'keep', by: 'lead', at } })] }), 'settled');
+  assert.equal(designRoundState({ lenses: designLenses(), findings: [designFinding({ resolution: { as: 'escalate', note: 'x', at }, decision: { choice: 'fix', by: 'person', at } })] }), 'needs-new-plan');
+  assert.equal(designRoundState({ lenses: designLenses(), findings: [designFinding({ resolution: { as: 'fix', note: '', at } }), designFinding({ id: '2', resolution: { as: 'escalate', note: 'x', at } })] }), 'escalated', 'the person answers before the plan is redone');
+});
+
+test('designGate holds a Builder until the current READY plan has passed', () => {
+  const plan = over => ({ taskKey: 'T-1', threadId: 'thr_p', commentId: 'c2', designRequired: true, reviewedCommentId: null, ...over });
+  const round = over => ({ taskKey: 'T-1', round: 1, planCommentId: 'c2', depth: 'core', startedAt: '', lenses: designLenses(false), findings: [], outcome: null, ...over });
+  designGate({ plans: [plan({ designRequired: false })], designRounds: [] }, 'T-1');
+  designGate({ plans: [plan({ reviewedCommentId: 'c2' })], designRounds: [] }, 'T-1');
+  assert.throws(() => designGate({ plans: [plan()], designRounds: [round()] }, 'T-1'), error => error.code === 'design_review_pending' && /still reading it \(round 1\)/.test(error.message));
+  assert.throws(() => designGate({ plans: [plan({ reviewedCommentId: 'c1' })], designRounds: [round()] }, 'T-1'), /hasn't passed design review/, 'a pass on an older plan doesn\'t count');
+  assert.throws(() => designGate({ plans: [plan()], designRounds: [round({ lenses: designLenses(), findings: [designFinding({ resolution: { as: 'escalate', note: 'x', at: '' } })] })] }, 'T-1'), error => /design-decide/.test(error.hint));
+  designGate({ plans: [plan()], designRounds: [round({ lenses: designLenses(), findings: [] })] }, 'T-1');
+});
+
+const plannerAgent = { threadId: 'thr_planner', role: 'plan', taskKey: 'TEST-1', providerId: 'claude-code', createdAt: '', pr: null };
+const readyPlan = (extra = '') => `Factory plan: READY\n## Problem and scope\nAdd --tax to tip.py.\n## Acceptance criteria\nx\n## Implementation plan\nChange tip.py.${extra}\n## Dependencies\nNone\n## Open questions\nNone blocking\n## Success checks\npython3 tip.py 10 --tax 5`;
+async function designFixture(t, initial = {}, overrides = {}) {
+  const posted = [];
+  const sent = [];
+  let spawned = 0;
+  const stopped = [];
+  const result = await fixture(t, false, { designReviewEnabled: true, tracksEnabled: true, agents: [leadAgent, plannerAgent], plans: [{ taskKey: 'TEST-1', threadId: 'thr_planner', commentId: null }], ...initial }, {
+    threads: {
+      list: async () => [],
+      get: async ({ threadId }) => makeThreadResponse({ id: threadId, status: 'active' }),
+      spawn: async args => { spawned += 1; result.spawns.push(args); if (overrides.spawnFailsAt === spawned) throw new Error('provider down'); return makeThreadResponse({ id: `thr_d${spawned}` }); },
+      send: async args => { sent.push(args); return {}; },
+      stop: async ({ threadId }) => { stopped.push(threadId); return {}; },
+      ...overrides.threads,
+    },
+    tasksRpc: async ({ method, input }) => { if (method === 'createComment') posted.push(input.body); return undefined; },
+    environments: overrides.environments,
+    hostRpc: overrides.hostRpc,
+    projectPath: overrides.projectPath,
+  });
+  const read = async () => createFactoryStorage(result.bb.storage, value => value).read('TEST');
+  const say = (threadId, text) => sent.filter(message => message.threadId === threadId).map(message => message.input[0].text).filter(body => text === undefined || text.test(body));
+  const markReady = async (id = 'plan_1', body = readyPlan()) => {
+    result.comments.push({ id, kind: 'agent', authorName: 'Planner', threadId: 'thr_planner', body, createdAt: '' });
+    return result.harness.behavior.runCli(['plan-ready', 'TEST-1', '--comment', id], { threadId: 'thr_planner' });
+  };
+  const record = async (threadId, lens, ...findings) => {
+    const id = `review_${threadId}_${result.comments.length}`;
+    result.comments.push({ id, kind: 'agent', authorName: 'Reviewer', threadId, body: review(lens, ...findings), createdAt: '' });
+    return result.harness.behavior.runCli(['design-findings', 'TEST-1', '--comment', id], { threadId });
+  };
+  return { ...result, posted, sent, stopped, read, say, markReady, record };
+}
+
+test('a READY plan gets one fresh reviewer per core lens, and no Builder until it passes', async t => {
+  const { harness, spawns, read, markReady, posted } = await designFixture(t);
+  const missing = await markReady('plan_0', readyPlan().replace(/\n## Success checks[\s\S]*$/, ''));
+  assert.notEqual(missing.exitCode, 0);
+  assert.match(missing.stderr, /and success checks/);
+  assert.equal((await markReady()).exitCode, 0);
+  assert.equal(spawns.length, 3);
+  for (const [index, lens] of ['Zoom Out', 'Comprehension', 'Codebase Details'].entries()) {
+    assert.deepEqual(spawns[index].environment, { type: 'project-default' });
+    assert.match(spawns[index].prompt, new RegExp(`# You are the ${lens} design reviewer`));
+    assert.match(spawns[index].prompt, /task comment `plan_1`, the version under review/);
+    assert.match(spawns[index].prompt, /Don't read the task's other comments, other reviewers' findings or the Planner's thread/);
+    assert.equal(spawns[index].providerId, 'codex', 'a provider other than the Planner\'s');
+  }
+  assert.match(spawns[1].prompt, /## What this proposes/);
+  const factory = await read();
+  assert.deepEqual(factory.designRounds.map(round => [round.round, round.depth, round.lenses.length]), [[1, 'core', 3]]);
+  assert.ok(factory.plans[0].designRequired);
+  assert.ok(posted.some(body => /^\*\*Design review, round 1\*\* of plan comment `plan_1`: core lenses/.test(body)));
+  const refused = await harness.behavior.runCli(['assign', 'TEST-1', '--role', 'build']);
+  assert.notEqual(refused.exitCode, 0);
+  assert.match(refused.stderr, /hasn't passed design review: design reviewers are still reading it \(round 1\)/);
+});
+
+test('full depth: a plan naming sensitive paths, or a task set to full, gets all five lenses', async t => {
+  const sensitive = await designFixture(t);
+  await sensitive.markReady('plan_1', readyPlan('\nAdd migrations/0012_tax.sql.'));
+  assert.equal(sensitive.spawns.length, 5);
+  assert.ok(sensitive.posted.some(body => /full depth \(it names `migrations\/0012_tax\.sql`\)/.test(body)));
+  const asked = await designFixture(t);
+  assert.match((await asked.harness.behavior.runCli(['design-depth', 'TEST-1', 'full'], { threadId: 'thr_planner' })).stderr, /Only the factory's Lead or the person/);
+  assert.equal((await asked.harness.behavior.runCli(['design-depth', 'TEST-1', 'full'], { threadId: 'thr_lead' })).exitCode, 0);
+  await asked.markReady();
+  assert.deepEqual(asked.spawns.map(spawn => /# You are the (.+?) design reviewer/.exec(spawn.prompt)[1]), ['Zoom Out', 'Comprehension', 'Codebase Details', 'Design Critic', 'Implementation Readiness']);
+});
+
+test('a clean round passes the plan, tells the Lead, sends Nits to the Planner, and lets a Builder start', async t => {
+  const { harness, markReady, record, read, say } = await designFixture(t);
+  await markReady();
+  assert.match((await record('thr_lead', 'Zoom Out')).stderr, /Only a design reviewer of this task's current round/);
+  const bad = await harness.behavior.runCli(['design-findings', 'TEST-1', '--comment', 'plan_1'], { threadId: 'thr_d1' });
+  assert.match(bad.stderr, /Post your report as a task comment from this thread first/);
+  assert.equal((await record('thr_d1', 'Zoom Out', finding(1, 'Nit', 'Shorter name'))).exitCode, 0);
+  assert.match((await record('thr_d1', 'Zoom Out')).stderr, /already recorded/);
+  assert.equal(say('thr_lead', /passed design review/).length, 0, 'not until every lens has reported');
+  await record('thr_d2', 'Comprehension');
+  await record('thr_d3', 'Codebase Details');
+  assert.equal(say('thr_lead', /passed design review in round 1\. A Builder can start\./).length, 1);
+  assert.match(say('thr_planner', /These Nits are optional/)[0], /1\.zoom-out\.1 · Nit \(Zoom Out\): Shorter name/);
+  const factory = await read();
+  assert.equal(factory.designRounds[0].outcome, 'clean');
+  assert.equal(factory.plans[0].reviewedCommentId, 'plan_1');
+  assert.equal((await harness.behavior.runCli(['assign', 'TEST-1', '--role', 'build'])).exitCode, 0);
+});
+
+test('the Planner resolves Blockers and Majors, within the rules, and a settled round passes', async t => {
+  const { harness, markReady, record, read, say } = await designFixture(t);
+  await markReady();
+  await record('thr_d1', 'Zoom Out', finding(1, 'Major', 'Reinvents the parser'));
+  await record('thr_d2', 'Comprehension', finding(1, 'Blocker', 'Undefined "bill"'));
+  await record('thr_d3', 'Codebase Details', finding(1, 'Nit', 'Typo'));
+  const told = say('thr_planner', /Design review round 1 of TEST-1 found 2 Blocker or Major findings and 1 Nit/);
+  assert.equal(told.length, 1);
+  assert.match(told[0], /1\.zoom-out\.1 · Major \(Zoom Out\): Reinvents the parser\n1\.comprehension\.1 · Blocker \(Comprehension\): Undefined "bill"/);
+  const resolve = (id, as, note = 'tip.py:12 already parses this', threadId = 'thr_planner') => harness.behavior.runCli(['design-resolve', 'TEST-1', '--finding', id, '--as', as, '--note', note], { threadId });
+  assert.match((await resolve('1.zoom-out.1', 'contest', 'x', 'thr_lead')).stderr, /Only this task's current Planner/);
+  assert.match((await resolve('1.zoom-out.1', 'decline')).stderr, /Only Nits can be declined/);
+  assert.match((await resolve('1.comprehension.1', 'contest')).stderr, /A Comprehension finding can't be contested/);
+  assert.match((await resolve('1.zoom-out.1', 'contest', 'no')).stderr, /needs its evidence in --note/);
+  assert.match((await resolve('9.zoom-out.1', 'fix')).stderr, /isn't a finding of TEST-1's current design review round/);
+  assert.equal((await resolve('1.zoom-out.1', 'contest')).exitCode, 0);
+  assert.equal(say('thr_lead', /passed design review/).length, 0, 'the Blocker is still open');
+  assert.equal((await resolve('1.comprehension.1', 'escalate', 'Only the person knows what a bill is here')).exitCode, 0);
+  const escalated = say('thr_lead', /escalated a design finding on TEST-1 to the person/);
+  assert.equal(escalated.length, 1);
+  assert.match(escalated[0], /1\.comprehension\.1 · Blocker \(Comprehension\): Undefined "bill"\n  Planner: Only the person knows what a bill is here/);
+  assert.match((await harness.behavior.runCli(['design-decide', 'TEST-1', 'keep', '--finding', '1.comprehension.1'], { threadId: 'thr_planner' })).stderr, /Only the factory's Lead or the person/);
+  assert.match((await harness.behavior.runCli(['design-decide', 'TEST-1', 'keep', '--finding', '1.zoom-out.1'], { threadId: 'thr_lead' })).stderr, /isn't an escalated finding/);
+  assert.equal((await harness.behavior.runCli(['design-decide', 'TEST-1', 'keep', '--finding', '1.comprehension.1'], { threadId: 'thr_lead' })).exitCode, 0);
+  assert.equal(say('thr_lead', /passed design review in round 1/).length, 1);
+  const factory = await read();
+  assert.equal(factory.designRounds[0].outcome, 'resolved');
+  assert.equal(factory.designRounds[0].findings.find(entry => entry.id === '1.comprehension.1').decision.by, 'lead');
+});
+
+test('a fix needs a new READY plan, which starts round 2 and supersedes round 1', async t => {
+  const { harness, markReady, record, read, say, spawns } = await designFixture(t);
+  await markReady();
+  await record('thr_d1', 'Zoom Out', finding(1, 'Major', 'Reinvents the parser'));
+  await record('thr_d2', 'Comprehension');
+  await record('thr_d3', 'Codebase Details');
+  await harness.behavior.runCli(['design-resolve', 'TEST-1', '--finding', '1.zoom-out.1', '--as', 'fix', '--note', 'Use the existing parser'], { threadId: 'thr_planner' });
+  assert.match((await harness.behavior.runCli(['assign', 'TEST-1', '--role', 'build'])).stderr, /the Planner owes a new READY plan/);
+  assert.equal((await markReady('plan_2', readyPlan('\nReuse parse_args.'))).exitCode, 0);
+  assert.equal(spawns.length, 6);
+  assert.match(spawns[3].prompt, /round 2/);
+  let factory = await read();
+  assert.deepEqual(factory.designRounds.map(round => [round.round, round.planCommentId, round.outcome]), [[1, 'plan_1', 'superseded'], [2, 'plan_2', null]]);
+  for (const [threadId, lens] of [['thr_d4', 'Zoom Out'], ['thr_d5', 'Comprehension'], ['thr_d6', 'Codebase Details']]) await record(threadId, lens);
+  factory = await read();
+  assert.equal(factory.plans[0].reviewedCommentId, 'plan_2');
+  assert.equal(say('thr_lead', /passed design review in round 2/).length, 1);
+});
+
+test('the person\'s "fix" goes to the Planner, and the Factory page can answer for them', async t => {
+  const { harness, markReady, record, say, read } = await designFixture(t);
+  await markReady();
+  await record('thr_d1', 'Zoom Out', finding(1, 'Major', 'Reinvents the parser'));
+  await record('thr_d2', 'Comprehension');
+  await record('thr_d3', 'Codebase Details');
+  await harness.behavior.runCli(['design-resolve', 'TEST-1', '--finding', '1.zoom-out.1', '--as', 'escalate', '--note', 'The person chose this parser on purpose'], { threadId: 'thr_planner' });
+  await assert.rejects(harness.behavior.callRpc('task_design_decide', { taskKey: 'TEST-1', findingId: '1.zoom-out.1', choice: 'fix' }, { experimental_caller: { kind: 'plugin', pluginId: 'other' } }), /Only the Factory page/);
+  assert.deepEqual(await harness.behavior.callRpc('task_design_decide', { taskKey: 'TEST-1', findingId: '1.zoom-out.1', choice: 'fix' }), { ok: true });
+  assert.match(say('thr_planner', /The person wants design finding 1\.zoom-out\.1 on TEST-1 fixed/)[0], /post a new complete READY plan/);
+  const factory = await read();
+  assert.equal(factory.designRounds[0].findings[0].decision.by, 'person');
+  assert.equal(designRoundState(factory.designRounds[0]), 'needs-new-plan');
+});
+
+test('after five rounds, no sixth starts: the Lead brings it to the person, who can accept the plan', async t => {
+  const rounds = [1, 2, 3, 4, 5].map(round => ({ taskKey: 'TEST-1', round, planCommentId: `old_${round}`, depth: 'core', startedAt: '', lenses: designLenses(), findings: [], outcome: 'superseded' }));
+  const { harness, markReady, spawns, say, read } = await designFixture(t, { designRounds: rounds });
+  assert.equal((await markReady('plan_6')).exitCode, 0);
+  assert.equal(spawns.length, 0);
+  assert.match(say('thr_lead', /has had 5 design review rounds/)[0], /bb factory design-accept TEST-1 --reason/);
+  assert.match((await harness.behavior.runCli(['design-accept', 'TEST-1', '--reason', 'Good enough'], { threadId: 'thr_planner' })).stderr, /Only the factory's Lead or the person/);
+  assert.match((await harness.behavior.runCli(['design-accept', 'TEST-1', '--reason', 'ok'], { threadId: 'thr_lead' })).stderr, /Give the person's reason/);
+  assert.equal((await harness.behavior.runCli(['design-accept', 'TEST-1', '--reason', 'The person read it and is happy'], { threadId: 'thr_lead' })).exitCode, 0);
+  assert.equal((await read()).plans[0].reviewedCommentId, 'plan_6');
+  assert.equal((await harness.behavior.runCli(['assign', 'TEST-1', '--role', 'build'])).exitCode, 0);
+});
+
+test('a reviewer that finishes without findings is reported to the Lead once', async t => {
+  const status = { thr_d1: 'idle', thr_d2: 'active', thr_d3: 'active' };
+  const { harness, markReady, say } = await designFixture(t, {}, { threads: { get: async ({ threadId }) => makeThreadResponse({ id: threadId, status: status[threadId] ?? 'active' }) } });
+  await markReady();
+  for (let pass = 0; pass < 2; pass++) await exploreWatch(harness);
+  const quiet = say('thr_lead', /design reviewer of TEST-1 \(thr_d1\) finished without recording findings/);
+  assert.equal(quiet.length, 1);
+  assert.match(quiet[0], /The Zoom Out design reviewer/);
+});
+
+test('if a reviewer can\'t start, the others are stopped and the Lead is told', async t => {
+  const { markReady, stopped, say, read } = await designFixture(t, {}, { spawnFailsAt: 2 });
+  assert.equal((await markReady()).exitCode, 0, 'the plan is still marked ready');
+  assert.deepEqual(stopped, ['thr_d1']);
+  assert.match(say('thr_lead', /Design review of TEST-1's plan couldn't start/)[0], /A Builder waits until the plan passes/);
+  const factory = await read();
+  assert.equal(factory.designRounds.length, 0);
+  assert.ok(factory.plans[0].designRequired && factory.plans[0].reviewedCommentId === null);
+});
+
+test('design review off: no reviewers, no success checks required, and only the person turns it on', async t => {
+  const { harness, comments, spawns, bb } = await fixture(t, false, { agents: [leadAgent, plannerAgent], plans: [{ taskKey: 'TEST-1', threadId: 'thr_planner', commentId: null }] }, { threads: { list: async () => [] } });
+  comments.push({ id: 'plan_1', kind: 'agent', authorName: 'Planner', threadId: 'thr_planner', body: readyPlan().replace(/\n## Success checks[\s\S]*$/, ''), createdAt: '' });
+  assert.equal((await harness.behavior.runCli(['plan-ready', 'TEST-1', '--comment', 'plan_1'], { threadId: 'thr_planner' })).exitCode, 0);
+  assert.equal(spawns.length, 0);
+  assert.equal((await createFactoryStorage(bb.storage, value => value).read('TEST')).plans[0].designRequired, false);
+  assert.equal((await harness.behavior.runCli(['design-review', 'TEST'])).stdout, 'TEST: design review off');
+  assert.match((await harness.behavior.runCli(['design-review', 'TEST', 'on'], { threadId: 'thr_lead' })).stderr, /Only the person can change this/);
+  assert.equal((await harness.behavior.runCli(['design-review', 'TEST', 'on'])).exitCode, 0);
+  assert.equal((await harness.behavior.runCli(['design-review', 'TEST'])).stdout, 'TEST: design review on');
+});
+
+test('design review reaches the prompts and standing rules, within bb\'s limit', () => {
+  const charter = leadCharter({ factoryName: 'BusinessOS', prefix: 'BOS', mergePolicy: 'person', evidenceContract: true, tracks: true, designReview: true });
+  assert.ok(charter.length < 4096, `${charter.length}`);
+  assert.match(charter, /`bb factory design-decide` or `bb factory plan-answer`/);
+  assert.match(leadPrompt({ factoryName: 'F', prefix: 'F', goal: null, designReview: true }), /## Design review[\s\S]*design-accept/);
+  const task = { key: 'T-1', title: 't', description: '' };
+  const planner = workerPrompt({ role: 'plan', factoryName: 'F', prefix: 'F', task, instructions: null, builderThreadId: null, designReview: true });
+  assert.match(planner, /## Success checks[\s\S]*A Comprehension finding can't be contested/);
+  assert.doesNotMatch(workerPrompt({ role: 'plan', factoryName: 'F', prefix: 'F', task, instructions: null, builderThreadId: null }), /design-resolve/);
+  for (const role of ['plan', 'designreview']) assert.ok(workerReminder({ role, factoryName: 'BusinessOS', taskKey: 'BOS-123', evidenceContract: true, tracks: true, designReview: true }).length < 4096);
+  const prompt = designReviewPrompt({ factoryName: 'F', prefix: 'F', task, lens: 'codebase-details', round: 2, planCommentId: 'c7' });
+  assert.match(prompt, /Contradicts the code[\s\S]*Proposed files aren't findings/);
+  assert.match(prompt, /"Factory design review: Codebase Details, round 2"/);
+  assert.match(prompt, /## Checked\n<the plan sections you read, and each file you read, by path>[\s\S]*## Not checked/);
+  assert.match(prompt, /Don't message other agents,\*\* the Lead included/);
+  assert.match(workerReminder({ role: 'designreview', factoryName: 'F', taskKey: 'T-1' }), /don't message other agents[\s\S]*## Checked/);
+  assert.doesNotMatch(prompt, /What this proposes/);
+});
+
+test('a reviewer can\'t record findings once its round has ended', async t => {
+  const { harness, markReady, record, read } = await designFixture(t);
+  await markReady();
+  assert.equal((await harness.behavior.runCli(['design-accept', 'TEST-1', '--reason', 'The person read it and is happy'], { threadId: 'thr_lead' })).exitCode, 0);
+  const late = await record('thr_d1', 'Zoom Out', finding(1, 'Blocker', 'Too late'));
+  assert.notEqual(late.exitCode, 0);
+  assert.match(late.stderr, /Only a design reviewer of this task's current round/);
+  assert.deepEqual((await read()).designRounds[0].findings, []);
+});
+
+test('a finished design reviewer loses the worktree and branch bb made for it, and nothing else', async t => {
+  const lens = (lensId, threadId, over = {}) => ({ lens: lensId, threadId, findingsCommentId: `c_${threadId}`, recordedAt: '', quietNotifiedAt: null, cleanedAt: null, ...over });
+  const round = { taskKey: 'TEST-1', round: 1, planCommentId: 'plan_1', depth: 'core', startedAt: '', findings: [], outcome: 'clean', outcomeNotifiedAt: '2026-11-08T00:00:00Z', lenses: [
+    lens('zoom-out', 'thr_rz'),
+    lens('comprehension', 'thr_rc', { findingsCommentId: null }),
+    lens('codebase-details', 'thr_rd'),
+  ] };
+  const running = { taskKey: 'TEST-2', round: 1, planCommentId: 'plan_2', depth: 'core', startedAt: '', findings: [], outcome: null, lenses: [lens('zoom-out', 'thr_busy')] }; // recorded, still writing its final message
+  // As on SAND: each reviewer got its own worktree. thr_rd ran in the project checkout instead.
+  const worktrees = {
+    thr_rz: { environmentIsWorktree: true, environmentBranchName: 'bb/test-1-design-review-zoom-out-round-1-x-thr_rz' },
+    thr_rc: { environmentIsWorktree: true, environmentBranchName: 'bb/test-1-design-review-comprehension-round-1-x-thr_rc' },
+    thr_rd: { environmentIsWorktree: false, environmentBranchName: 'master' },
+    thr_busy: { environmentIsWorktree: true, environmentBranchName: 'bb/test-2-design-review-zoom-out-round-1-x-thr_busy' },
+  };
+  const archived = new Set();
+  const deleted = [];
+  const branches = [];
+  const { harness: h2, bb: bb2 } = await designFixture(t, { designRounds: [round, running] }, {
+    threads: {
+      list: async ({ threadIds = [] }) => threadIds.filter(id => worktrees[id]).map(id => ({ id, ...worktrees[id] })),
+      get: async ({ threadId }) => makeThreadResponse({ id: threadId, status: threadId === 'thr_busy' ? 'active' : 'idle', environmentId: `env_${threadId}`, archivedAt: archived.has(threadId) ? 1 : null }),
+      archive: async ({ threadId }) => { archived.add(threadId); return {}; },
+    },
+    environments: { delete: async ({ environmentId }) => { deleted.push(environmentId); return { ok: true }; } },
+    hostRpc: async ({ method, input }) => { if (method === 'delete_explorer_branch') { branches.push(input); return { deleted: true, missing: false, error: null }; } return { code: 0, stdout: '[]', stderr: '' }; },
+    projectPath: '/repo/sand',
+  });
+  for (let pass = 0; pass < 2; pass++) await exploreWatch(h2);
+  assert.deepEqual([...archived].sort(), ['thr_rc', 'thr_rz'], 'both its worktree reviewers: one recorded, one whose round ended');
+  assert.deepEqual(deleted.sort(), ['env_thr_rc', 'env_thr_rz']);
+  assert.deepEqual(branches.map(entry => entry.branch).sort(), ['bb/test-1-design-review-comprehension-round-1-x-thr_rc', 'bb/test-1-design-review-zoom-out-round-1-x-thr_rz']);
+  const lenses = (await createFactoryStorage(bb2.storage, value => value).read('TEST')).designRounds[0].lenses;
+  assert.ok(lenses.every(entry => entry.cleanedAt !== null), 'the one in the project checkout needs nothing and is marked done');
+  assert.ok(!archived.has('thr_busy') && !deleted.includes('env_thr_busy'), 'a reviewer still running keeps its worktree, even after recording');
+});
+
+// ----- Questions for the person in a READY plan -----
+
+const withQuestions = (lines) => readyPlan().replace('## Open questions\nNone blocking', `## Open questions\n${lines}`);
+
+test('parsePersonQuestions reads "For the person" lines from Open questions only', () => {
+  const body = withQuestions('- For the person: Q1. Round to what amount? Assumed: up to the next whole unit.\n- **For the person:** Should it round up or to the nearest?\n- For the Builder: pick a name.');
+  assert.deepEqual(parsePersonQuestions(body), [
+    { id: 'Q1', text: 'Round to what amount?', assumed: 'up to the next whole unit.' },
+    { id: 'Q2', text: 'Should it round up or to the nearest?', assumed: null },
+  ]);
+  assert.deepEqual(parsePersonQuestions(readyPlan()), [], 'None blocking');
+  assert.deepEqual(parsePersonQuestions(`${readyPlan()}\n\nFor the person: a line outside Open questions`), []);
+});
+
+test('personQuestionsGate holds a Builder until each question is answered, and after a changed answer', () => {
+  const plan = questions => ({ plans: [{ taskKey: 'T-1', threadId: 'thr_p', commentId: 'c1', designRequired: true, reviewedCommentId: 'c1', personQuestions: questions }] });
+  const q = over => ({ id: 'Q1', text: 'Round to what?', assumed: 'up', answer: null, notifiedAt: null, ...over });
+  assert.throws(() => personQuestionsGate(plan([q()]), 'T-1'), error => error.code === 'person_questions_open' && /plan-answer T-1 keep --question <id>/.test(error.hint));
+  personQuestionsGate(plan([q({ answer: { choice: 'keep', text: null, by: 'lead', at: '' } })]), 'T-1');
+  assert.throws(() => personQuestionsGate(plan([q({ answer: { choice: 'change', text: 'to 5', by: 'person', at: '' } })]), 'T-1'), error => error.code === 'person_answer_changes_plan');
+  personQuestionsGate(plan([]), 'T-1');
+});
+
+test('a READY plan\'s questions reach the Lead at once, and a Builder waits for the answers', async t => {
+  const { harness, markReady, record, say, read, posted } = await designFixture(t);
+  await markReady('plan_1', withQuestions('- For the person: Q1. Round to what amount? Assumed: up to the next whole unit.'));
+  const told = say('thr_lead', /only the person can answer/);
+  assert.equal(told.length, 1, 'while design review runs, not after');
+  assert.match(told[0], /Q1: Round to what amount\?\n  The plan assumes: up to the next whole unit\.[\s\S]*bb factory plan-answer TEST-1 keep --question <id>/);
+  for (const [threadId, lens] of [['thr_d1', 'Zoom Out'], ['thr_d2', 'Comprehension'], ['thr_d3', 'Codebase Details']]) await record(threadId, lens);
+  const refused = await harness.behavior.runCli(['assign', 'TEST-1', '--role', 'build']);
+  assert.match(refused.stderr, /has a question only the person can answer: Q1/, 'design review passed, but the question is open');
+  assert.match((await harness.behavior.runCli(['plan-answer', 'TEST-1', 'keep', '--question', 'Q1'], { threadId: 'thr_planner' })).stderr, /Only the factory's Lead or the person/);
+  assert.match((await harness.behavior.runCli(['plan-answer', 'TEST-1', 'keep', '--question', 'Q9'], { threadId: 'thr_lead' })).stderr, /Q9 isn't a question for the person/);
+  assert.equal((await harness.behavior.runCli(['plan-answer', 'TEST-1', 'keep', '--question', 'q1'], { threadId: 'thr_lead' })).exitCode, 0);
+  assert.ok(posted.includes("**Q1, answered by the person:** the plan's assumption holds (up to the next whole unit.)."));
+  assert.equal((await read()).plans[0].personQuestions[0].answer.by, 'lead');
+  assert.equal((await harness.behavior.runCli(['assign', 'TEST-1', '--role', 'build'])).exitCode, 0);
+});
+
+test('a different answer goes to the Planner, and the next READY plan starts with fresh questions', async t => {
+  const { harness, markReady, record, say, read } = await designFixture(t);
+  await markReady('plan_1', withQuestions('- For the person: Q1. Round to what amount? Assumed: the next whole unit.'));
+  for (const [threadId, lens] of [['thr_d1', 'Zoom Out'], ['thr_d2', 'Comprehension'], ['thr_d3', 'Codebase Details']]) await record(threadId, lens);
+  assert.match((await harness.behavior.runCli(['plan-answer', 'TEST-1', 'change', '--question', 'Q1'])).stderr, /Give the person's answer with --answer/);
+  await assert.rejects(harness.behavior.callRpc('task_plan_answer', { taskKey: 'TEST-1', questionId: 'Q1', choice: 'change', answer: 'to 5' }, { experimental_caller: { kind: 'plugin', pluginId: 'other' } }), /Only the Factory page/);
+  assert.deepEqual(await harness.behavior.callRpc('task_plan_answer', { taskKey: 'TEST-1', questionId: 'Q1', choice: 'change', answer: 'Round up to the next 5' }), { ok: true });
+  assert.match(say('thr_planner', /answered Q1 on TEST-1 differently/)[0], /Round up to the next 5[\s\S]*post a new complete READY plan/);
+  assert.equal((await read()).plans[0].personQuestions[0].answer.by, 'person');
+  assert.match((await harness.behavior.runCli(['assign', 'TEST-1', '--role', 'build'])).stderr, /answered Q1 differently from TEST-1's plan/);
+  await markReady('plan_2');
+  assert.deepEqual((await read()).plans[0].personQuestions, [], 'the new plan took the answer in and asks nothing');
+});
+
+test('questions that didn\'t reach the Lead are sent again by the watch', async t => {
+  let down = true;
+  const sent = [];
+  const { harness, markReady } = await designFixture(t, {}, { threads: { send: async args => { if (down) throw new Error('down'); sent.push(args); return {}; } } });
+  await markReady('plan_1', withQuestions('- For the person: Q1. Round to what amount?'));
+  down = false;
+  await exploreWatch(harness);
+  await exploreWatch(harness);
+  assert.equal(sent.filter(message => message.threadId === 'thr_lead' && /only the person can answer/.test(message.input[0].text)).length, 1);
+});
+
+test('with design review off, a plan\'s questions aren\'t gated', async t => {
+  const { harness, comments, bb } = await fixture(t, false, { agents: [leadAgent, plannerAgent], plans: [{ taskKey: 'TEST-1', threadId: 'thr_planner', commentId: null }] }, { threads: { list: async () => [] } });
+  comments.push({ id: 'plan_1', kind: 'agent', authorName: 'Planner', threadId: 'thr_planner', body: withQuestions('- For the person: Q1. Round to what?'), createdAt: '' });
+  await harness.behavior.runCli(['plan-ready', 'TEST-1', '--comment', 'plan_1'], { threadId: 'thr_planner' });
+  assert.deepEqual((await createFactoryStorage(bb.storage, value => value).read('TEST')).plans[0].personQuestions, []);
+});
+
+test('the Planner and the Lead are told how questions for the person work', () => {
+  const task = { key: 'T-1', title: 't', description: '' };
+  assert.match(workerPrompt({ role: 'plan', factoryName: 'F', prefix: 'F', task, instructions: null, builderThreadId: null, designReview: true }), /- For the person: Q1\. <the question> Assumed: <what the plan builds on until they answer>/);
+  assert.match(workerReminder({ role: 'plan', factoryName: 'F', taskKey: 'T-1', designReview: true }), /For the person: Q1/);
+  assert.match(leadPrompt({ factoryName: 'F', prefix: 'F', goal: null, designReview: true }), /bb factory plan-answer <KEY> keep --question <id>/);
+  assert.match(leadCharter({ factoryName: 'F', prefix: 'F', designReview: true }), /bb factory plan-answer/);
 });

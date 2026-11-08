@@ -7,6 +7,12 @@ This product includes role prompts and team culture adapted from OpenRig
 (https://github.com/mvschwarz/openrig), licensed under the Apache License,
 Version 2.0. The adaptation replaces OpenRig's coordination commands with bb's.
 
+The design review lenses (designReviewPrompt in roles.ts) and the way findings
+are resolved and rounds end are adapted from the Elephant & Goldfish Model
+(https://github.com/google/elephant-goldfish-model), Copyright Google LLC,
+licensed under the Apache License, Version 2.0. The adaptation keeps EGM's
+review mode only and replaces its orchestration with the factory's commands.
+
 The UI components in components/, hooks/ and lib/ come from the bb plugin
 registry (https://github.com/get-bb/bb), built on shadcn/ui
 (https://ui.shadcn.com), both under the MIT License.

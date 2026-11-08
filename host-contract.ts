@@ -14,15 +14,15 @@ export const GH_ALLOWED = [
 ] as const;
 
 /**
- * The only branches the host worker will delete: an Explorer's, named by bb as
- * bb/<prefix>-<number>-explorer-<title>-<thread>. The role comes right after the
- * task number, so a Builder's branch never matches, even with "explorer" in its
- * title. The branch must also end with the Explorer's own thread id, and git
- * itself refuses a branch that is still checked out.
+ * The only branches the host worker will delete: an Explorer's or a design reviewer's,
+ * named by bb as bb/<prefix>-<number>-<role>-<title>-<thread>. Neither ships code. The
+ * role comes right after the task number, so a Builder's branch never matches, even with
+ * "explorer" in its title. The branch must also end with that agent's own thread id, and
+ * git itself refuses a branch that is still checked out.
  */
-export const EXPLORER_BRANCH = /^bb\/[a-z][a-z0-9]*-[0-9]+-explorer-[a-z0-9-]*thr_[a-z0-9]+$/;
-export function isExplorerBranch(branch: string, threadId: string): boolean {
-  return EXPLORER_BRANCH.test(branch) && /^thr_[a-z0-9]+$/.test(threadId) && branch.endsWith(`-${threadId}`);
+export const DISPOSABLE_BRANCH = /^bb\/[a-z][a-z0-9]*-[0-9]+-(?:explorer|design-review)-[a-z0-9-]*thr_[a-z0-9]+$/;
+export function isDisposableBranch(branch: string, threadId: string): boolean {
+  return DISPOSABLE_BRANCH.test(branch) && /^thr_[a-z0-9]+$/.test(threadId) && branch.endsWith(`-${threadId}`);
 }
 
 export const repoInspectionSchema = z.object({
@@ -62,7 +62,7 @@ export const hostContract = defineRpcContract({
     input: z.object({
       projectPath: z.string().min(1).max(4096),
       branch: z.string().min(1).max(250),
-      /** The Explorer's thread, which bb puts at the end of its branch name. */
+      /** The agent's thread, which bb puts at the end of its branch name. */
       threadId: z.string().min(1).max(100),
     }),
     /** missing: there was no such branch, which needs nothing more. */

@@ -35,7 +35,7 @@ import type {
   rpcContract,
 } from "./server";
 import type { RepoInspection } from "./host-contract";
-import { ROLES, TRACKS, WORKER_ROLE_IDS, type AssignableRoleId, type ProjectMode, type Track } from "./roles";
+import { DESIGN_LENS_LABELS, ROLES, TRACKS, WORKER_ROLE_IDS, type AssignableRoleId, type ProjectMode, type Track } from "./roles";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import {
@@ -139,9 +139,154 @@ const TRACK_NOTE: Record<Track, string> = {
   explore: "An Explorer tries it first, with a time box and no PR. You decide what comes next.",
 };
 
+// ---------- Design review ----------
+
+const DESIGN_STATE_LABEL: Record<NonNullable<BoardTask["design"]>["state"], string> = {
+  reviewing: "Design review",
+  clean: "Design passed",
+  settled: "Design passed",
+  resolving: "Design findings",
+  escalated: "Design: your call",
+  "needs-new-plan": "Design: plan being fixed",
+  accepted: "Plan accepted",
+  superseded: "Design review",
+};
+
+function DesignChip({ task }: { task: BoardTask }) {
+  if (task.design === null) return null;
+  const label = task.design.passed ? "Design passed" : DESIGN_STATE_LABEL[task.design.state];
+  const warn = !task.design.passed && task.design.state === "escalated";
+  return (
+    <span className={cn("rounded border px-1.5 py-0.5", warn ? "border-amber-500/50 text-amber-600 dark:text-amber-400" : "border-border")} title={`Round ${task.design.round}, ${task.design.depth} depth`}>
+      {label}
+    </span>
+  );
+}
+
+/** The READY plan's questions only the person can answer: keep the plan's assumption, or answer differently. */
+function PersonQuestionsPanel({ task }: { task: BoardTask }) {
+  const rpc = useRpc<typeof rpcContract>();
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const [pending, setPending] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  if (task.personQuestions.length === 0) return null;
+  const answer = async (questionId: string, choice: "keep" | "change") => {
+    setPending(`${questionId}:${choice}`);
+    setError(null);
+    try {
+      await rpc.call("task_plan_answer", { taskKey: task.key, questionId, choice, answer: choice === "change" ? (drafts[questionId] ?? "").trim() || null : null });
+    } catch (cause) {
+      setError(errorText(cause));
+    } finally {
+      setPending(null);
+    }
+  };
+  return (
+    <div className="space-y-1">
+      <div className="text-xs font-medium text-muted-foreground">Questions for you in the plan</div>
+      <ul className="space-y-1.5 text-xs">
+        {task.personQuestions.map((question) => (
+          <li key={question.id} className="space-y-1 rounded-md border border-border p-2">
+            <div><span className="font-medium">{question.id}.</span> {question.text}</div>
+            {question.assumed === null ? null : <div className="text-muted-foreground">The plan assumes: {question.assumed}</div>}
+            {question.answer !== null ? (
+              <div>{question.answer.choice === "keep" ? "You kept the plan's assumption." : `You answered: ${question.answer.text}`}</div>
+            ) : (
+              <div className="flex flex-wrap items-center gap-1">
+                <Button size="sm" variant="outline" disabled={pending !== null} onClick={() => void answer(question.id, "keep")}>
+                  {pending === `${question.id}:keep` ? "Saving…" : "Keep the assumption"}
+                </Button>
+                <Input
+                  className="h-8 min-w-40 flex-1 text-xs"
+                  value={drafts[question.id] ?? ""}
+                  onChange={(event) => setDrafts((current) => ({ ...current, [question.id]: event.target.value }))}
+                  placeholder="Or your answer"
+                  aria-label={`Your answer to ${question.id}`}
+                />
+                <Button size="sm" variant="outline" disabled={pending !== null || (drafts[question.id] ?? "").trim() === ""} onClick={() => void answer(question.id, "change")}>
+                  {pending === `${question.id}:change` ? "Sending…" : "Answer differently"}
+                </Button>
+              </div>
+            )}
+          </li>
+        ))}
+      </ul>
+      {error === null ? null : <Alert>{error}</Alert>}
+    </div>
+  );
+}
+
+/** The latest round's lenses and findings, with Keep or Fix for each finding escalated to the person. */
+function DesignReviewPanel({ task }: { task: BoardTask }) {
+  const rpc = useRpc<typeof rpcContract>();
+  const navigate = useBbNavigate();
+  const [pending, setPending] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const design = task.design;
+  if (design === null) return null;
+  const decide = async (findingId: string, choice: "keep" | "fix") => {
+    setPending(`${findingId}:${choice}`);
+    setError(null);
+    try {
+      await rpc.call("task_design_decide", { taskKey: task.key, findingId, choice });
+    } catch (cause) {
+      setError(errorText(cause));
+    } finally {
+      setPending(null);
+    }
+  };
+  const severityTone = (severity: string) => (severity === "blocker" ? "text-destructive" : severity === "major" ? "text-amber-600 dark:text-amber-400" : "text-muted-foreground");
+  return (
+    <div className="space-y-1">
+      <div className="text-xs font-medium text-muted-foreground">
+        Design review · round {design.round} · {design.depth === "full" ? "full depth" : "core lenses"} · {design.passed ? "passed" : DESIGN_STATE_LABEL[design.state].replace(/^Design:? ?/, "").toLowerCase() || "in progress"}
+      </div>
+      <div className="flex flex-wrap gap-1 text-[10px]">
+        {design.lenses.map((entry) => (
+          <button key={entry.threadId} type="button" className="rounded border border-border px-1.5 py-0.5 hover:bg-state-hover" onClick={() => navigate.toThread(entry.threadId, { split: true })}>
+            {DESIGN_LENS_LABELS[entry.lens]} {entry.recorded ? "✓" : "…"}
+          </button>
+        ))}
+      </div>
+      {design.findings.length === 0 ? (
+        <p className="text-xs text-muted-foreground">{design.lenses.every((entry) => entry.recorded) ? "No findings." : "Reviewers are reading the plan."}</p>
+      ) : (
+        <ul className="space-y-1.5 text-xs">
+          {design.findings.map((finding) => (
+            <li key={finding.id} className="rounded-md border border-border p-2">
+              <div className="flex items-baseline gap-2">
+                <span className={cn("font-medium capitalize", severityTone(finding.severity))}>{finding.severity}</span>
+                <span className="font-medium">{finding.title}</span>
+                <span className="ml-auto shrink-0 text-muted-foreground">{DESIGN_LENS_LABELS[finding.lens]}</span>
+              </div>
+              {finding.resolution === null ? (
+                <div className="text-muted-foreground">{finding.severity === "nit" ? "Optional" : "Waiting for the Planner"}</div>
+              ) : (
+                <div>
+                  <span className="font-medium capitalize">{finding.resolution.as}</span>
+                  {finding.resolution.note === "" ? null : <span className="text-muted-foreground"> · {finding.resolution.note}</span>}
+                  {finding.decision === null ? null : <span> · you chose to {finding.decision.choice === "keep" ? "keep the plan" : "fix it"}</span>}
+                </div>
+              )}
+              {finding.resolution?.as === "escalate" && finding.decision === null ? (
+                <div className="mt-1.5 flex gap-1">
+                  <Button size="sm" variant="outline" disabled={pending !== null} onClick={() => void decide(finding.id, "keep")}>{pending === `${finding.id}:keep` ? "Saving…" : "Keep the plan"}</Button>
+                  <Button size="sm" variant="outline" disabled={pending !== null} onClick={() => void decide(finding.id, "fix")}>{pending === `${finding.id}:fix` ? "Saving…" : "Fix it"}</Button>
+                </div>
+              ) : null}
+            </li>
+          ))}
+        </ul>
+      )}
+      {error === null ? null : <Alert>{error}</Alert>}
+    </div>
+  );
+}
+
 /** The track, how far exploring has got, and advice to close, as chips on a card. */
 function TrackChips({ task }: { task: BoardTask }) {
-  if (task.track === null && task.closeAdvice === null) return null;
+  const unanswered = task.personQuestions.filter((question) => question.answer === null).length;
+  if (task.track === null && task.closeAdvice === null && task.design === null && unanswered === 0) return null;
   const reported = task.exploration?.filter((entry) => entry.recommendation !== null).length ?? 0;
   const total = task.exploration?.length ?? 0;
   return (
@@ -153,6 +298,10 @@ function TrackChips({ task }: { task: BoardTask }) {
         <span className="rounded border border-border px-1.5 py-0.5 text-muted-foreground">
           {reported === total ? (total === 1 ? "Reported" : `${total} reported, compare`) : `${reported} of ${total} reported`}
         </span>
+      )}
+      <DesignChip task={task} />
+      {unanswered === 0 ? null : (
+        <span className="rounded border border-amber-500/50 px-1.5 py-0.5 text-amber-600 dark:text-amber-400">{unanswered === 1 ? "A question for you" : `${unanswered} questions for you`}</span>
       )}
       {task.closeAdvice === null ? null : (
         <span className="rounded border border-amber-500/50 px-1.5 py-0.5 text-amber-600 dark:text-amber-400">Close advised</span>
@@ -1810,6 +1959,8 @@ function TaskDialog({
 
             {tracksEnabled ? <TrackPicker task={task} /> : null}
             <ExplorationCompare task={task} />
+            <PersonQuestionsPanel task={task} />
+            <DesignReviewPanel task={task} />
 
             {task.pr === null ? null : (
               <div className="space-y-1">
