@@ -319,7 +319,10 @@ export function branchRulesHold(mergeStateStatus: string | null | undefined): st
  * the person to decide, which the Lead records by changing the track.
  */
 export function trackGate(factory: Pick<Factory, "tracks" | "plans">, taskKey: string, role: WorkerRoleId): Track | null {
-  const current = factory.tracks[taskKey] ?? null;
+  // A task planned before tracks were turned on has no track yet, but its Planner still decides.
+  const planned = factory.plans.some((entry) => entry.taskKey === taskKey);
+  const recorded = factory.tracks[taskKey] ?? null;
+  const current = recorded ?? (planned ? "plan" : null);
   if (role === "plan") return "plan";
   if (role === "explore") return "explore";
   if (role !== "build") return null;
@@ -341,7 +344,7 @@ export function trackGate(factory: Pick<Factory, "tracks" | "plans">, taskKey: s
       });
     }
   }
-  return null;
+  return recorded === null ? current : null;
 }
 
 /** The approaches for several Explorers, one numbered line each ("1. ...", "2) ..."), or null if any is missing. */
@@ -368,9 +371,12 @@ export function readRecommendation(body: string): (typeof EXPLORE_RECOMMENDATION
   const section = body.split("## Recommendation")[1];
   // Agents often bold or quote it: **Recommendation: plan**, `Recommendation: build`.
   const line = section?.split("\n").map((entry) => entry.replace(/[`*_]/g, "").trim()).find((entry) => entry !== "");
-  const match = /^Recommendation:\s*(.+?)\.?\s*$/i.exec(line ?? "");
-  const value = match?.[1]?.toLowerCase().trim();
-  return (EXPLORE_RECOMMENDATIONS as readonly string[]).includes(value ?? "") ? value as (typeof EXPLORE_RECOMMENDATIONS)[number] : null;
+  const match = /^Recommendation:\s*(.+?)\s*$/i.exec(line ?? "");
+  const value = match?.[1]?.toLowerCase() ?? "";
+  // The reason may follow on the same line: "build, the prototype passed", "plan - two open questions".
+  // Longest first, so "explore more" isn't read as anything shorter.
+  const allowed = [...EXPLORE_RECOMMENDATIONS].sort((a, b) => b.length - a.length);
+  return allowed.find((recommendation) => value === recommendation || (value.startsWith(recommendation) && /^[^a-z0-9]/.test(value.slice(recommendation.length)))) ?? null;
 }
 /** A heading's text, up to the next heading, shortened for the comparison. */
 export function sectionText(body: string, heading: string, max = 600): string | null {
@@ -703,6 +709,8 @@ const explorationSchema = z.object({
   /** Its local branch, read before the worktree goes; deleting the worktree leaves the branch. */
   branch: z.string().nullable().default(null),
   branchDeletedAt: z.string().nullable().default(null),
+  /** Finished or stopped without a report, well past its time box. */
+  abandonedAt: z.string().nullable().default(null),
 });
 export type Exploration = z.infer<typeof explorationSchema>;
 
@@ -1981,7 +1989,9 @@ export default async function plugin(bb: BbPluginApi) {
         }
         // Nobody assigned means the person owns it. A Planner alone means coordination,
         // or a plan the READY list above already reports; neither is a worker gone quiet.
-        const hasWorker = taskAgents.some((agent) => agent.role !== "plan");
+        // An Explorer isn't one either: the exploration watch covers its time box, and after its report the
+        // task waits for the person's decision.
+        const hasWorker = taskAgents.some((agent) => agent.role !== "plan" && agent.role !== "explore");
         if (hasWorker && !anyActive && (pr === null || pr.state !== "open")) {
           const lastRoles = [...new Set(taskAgents.map((agent) => ROLES[agent.role].label))];
           inProgressWithoutLiveWorker.push({ taskKey: task.key, title: task.title, lastRoles });
@@ -2350,8 +2360,27 @@ export default async function plugin(bb: BbPluginApi) {
       }
       const round = `${task.key}:${Date.now()}`;
       const threads: string[] = [];
-      for (const [index, approach] of approaches.entries()) {
-        threads.push(await assignUnlocked({ taskKey: task.key, role: "explore", instructions: args.instructions, candidate: { round, index: index + 1, of: args.candidates, approach } }));
+      try {
+        for (const [index, approach] of approaches.entries()) {
+          threads.push(await assignUnlocked({ taskKey: task.key, role: "explore", instructions: args.instructions, candidate: { round, index: index + 1, of: args.candidates, approach } }));
+        }
+      } catch (error) {
+        // A round is compared as a whole, so a partial one is undone: the candidates already started are
+        // stopped and settled without an announcement, which lets the watch clean up their worktrees and
+        // the Lead start the round again.
+        for (const threadId of threads) {
+          await bb.sdk.threads.stop({ threadId }).catch((stopError: unknown) => bb.log.warn(`could not stop Explorer ${threadId}: ${String(stopError)}`));
+        }
+        const now = new Date().toISOString();
+        await mutateFactory(factory.prefix, (current) => {
+          for (const entry of current.explorations) {
+            if (entry.round !== round) continue;
+            entry.abandonedAt = now;
+            entry.roundNotifiedAt = now;
+          }
+        });
+        if (threads.length > 0) await comment(task.id, `Exploration not started: candidate ${threads.length + 1} of ${args.candidates} couldn't start, so ${threads.length === 1 ? "the one already started was" : `the ${threads.length} already started were`} stopped (${threads.join(", ")}).`).catch(() => undefined);
+        throw error;
       }
       return threads;
     });
@@ -2373,6 +2402,7 @@ export default async function plugin(bb: BbPluginApi) {
       }
       await mutateFactory(factory.prefix, (current) => {
         current.plans.find((entry) => entry.taskKey === task.key)!.commentId = document.id;
+        delete current.closeAdvice[task.key];
       });
     });
   }
@@ -2394,7 +2424,8 @@ export default async function plugin(bb: BbPluginApi) {
       throw new PluginCliError("Only the factory's Lead or the person can change a task's track.", { code: "track_not_allowed" });
     }
     if (factory.tracks[task.key] === track) return track;
-    await mutateFactory(factory.prefix, (current) => { current.tracks[task.key] = track; });
+    // Choosing a track is the person's decision on any advice to close.
+    await mutateFactory(factory.prefix, (current) => { current.tracks[task.key] = track; delete current.closeAdvice[task.key]; });
     await comment(task.id, `Track: **${track}**, set by ${threadId === null ? "the person" : "the Lead"}.`);
     bb.realtime.publish(BOARD_CHANGED, { prefix: factory.prefix });
     return track;
@@ -2439,64 +2470,86 @@ export default async function plugin(bb: BbPluginApi) {
     });
   }
 
-  /** Once every candidate of a round has reported, the Lead gets the recommendation or the comparison, once. */
+  /** Rounds being announced right now: the report command and the watch can both get there. */
+  const announcing = new Set<string>();
+  /** An Explorer that finished or was stopped without a report, once it's well past its time box. */
+  const ABANDON_AFTER_TIMEBOXES = 2;
+  function explorationSettled(entry: Exploration): boolean {
+    return entry.reportCommentId !== null || entry.abandonedAt !== null;
+  }
+  /** Once every candidate of a round has reported, or stopped without one, the Lead gets the recommendation or the comparison, once. */
   async function announceRound(prefix: string, round: string): Promise<void> {
-    const factory = await findFactory(prefix);
-    const entries = factory.explorations.filter((entry) => entry.round === round).sort((a, b) => a.candidate - b.candidate);
-    if (entries.length === 0 || entries.some((entry) => entry.reportCommentId === null || entry.roundNotifiedAt !== null)) return;
-    const key = entries[0]!.taskKey;
-    const next = `Show the person ${entries.length === 1 ? "the report" : "this comparison, which is also on the Factory page,"} and ask how to continue: set the track with \`bb factory track ${key} direct\` or \`plan\`, explore again, or, if they choose to, close the task. Only the person closes a task.`;
-    const text = entries.length === 1
-      ? `[factory] ${key}'s exploration has reported: it recommends ${entries[0]!.recommendation} (task comment ${entries[0]!.reportCommentId}). ${next}`
-      : `[factory] All ${entries.length} candidates exploring ${key} have reported:\n${entries.map((entry) => `${entry.candidate}. ${entry.approach ?? "approach not named"}: recommends ${entry.recommendation} (task comment ${entry.reportCommentId})`).join("\n")}\n\n${next}`;
-    if (!(await tellLead(factory, text))) return;
-    const now = new Date().toISOString();
-    await mutateFactory(prefix, (current) => {
-      for (const entry of current.explorations) if (entry.round === round) entry.roundNotifiedAt = now;
-    });
+    if (announcing.has(round)) return;
+    announcing.add(round);
+    try {
+      const factory = await findFactory(prefix);
+      const entries = factory.explorations.filter((entry) => entry.round === round).sort((a, b) => a.candidate - b.candidate);
+      if (entries.length === 0 || !entries.every(explorationSettled) || entries.some((entry) => entry.roundNotifiedAt !== null)) return;
+      const key = entries[0]!.taskKey;
+      const outcome = (entry: Exploration) => entry.reportCommentId === null ? "stopped without a report" : `recommends ${entry.recommendation} (task comment ${entry.reportCommentId})`;
+      const next = `Show the person ${entries.length === 1 ? "the report" : "this comparison, which is also on the Factory page,"} and ask how to continue: set the track with \`bb factory track ${key} direct\` or \`plan\`, explore again, or, if they choose to, close the task. Only the person closes a task.`;
+      const text = entries.length === 1
+        ? `[factory] ${key}'s exploration has ${entries[0]!.reportCommentId === null ? "stopped without a report" : `reported: it recommends ${entries[0]!.recommendation} (task comment ${entries[0]!.reportCommentId})`}. ${next}`
+        : `[factory] All ${entries.length} candidates exploring ${key} have finished:\n${entries.map((entry) => `${entry.candidate}. ${entry.approach ?? "approach not named"}: ${outcome(entry)}`).join("\n")}\n\n${next}`;
+      if (!(await tellLead(factory, text))) return;
+      const now = new Date().toISOString();
+      await mutateFactory(prefix, (current) => {
+        for (const entry of current.explorations) if (entry.round === round) entry.roundNotifiedAt = now;
+      });
+    } finally {
+      announcing.delete(round);
+    }
+  }
+
+  /** Whether the watch still has something to do for this Explorer. */
+  function explorationPending(entry: Exploration): boolean {
+    if (!explorationSettled(entry) || entry.roundNotifiedAt === null) return true;
+    return entry.ownWorktree && (entry.worktreeDeletedAt === null || entry.branchDeletedAt === null);
   }
 
   /**
-   * Each pass: remind an Explorer near the end of its time box, tell the Lead once when it runs past, retry
-   * a comparison that didn't reach the Lead, and delete the worktree of an Explorer that has reported and
-   * finished, archiving its thread first, then its local branch. Only a worktree the factory made for that Explorer is ever deleted.
+   * Each pass: remind an Explorer near the end of its time box, tell the Lead once when it runs past, and
+   * give up on one that finished or was stopped without a report once it's well past it. Then retry a
+   * comparison that didn't reach the Lead, and once an Explorer is settled and finished, archive its
+   * thread, delete its worktree, then its local branch. Only a worktree the factory made for that Explorer
+   * is ever deleted, and nothing is recorded as deleted unless it was.
    */
   /** Logged once per Explorer: the watch retries every minute. */
   const worktreeDeleteWarned = new Set<string>();
   async function maintainExplorations(prefix: string, now = Date.now()): Promise<void> {
     const factory = await findFactory(prefix);
     for (const entry of factory.explorations) {
+      if (!explorationPending(entry)) continue;
       const elapsed = now - Date.parse(entry.startedAt);
       const box = entry.timeboxMinutes * 60_000;
-      if (entry.reportCommentId === null) {
+      if (!explorationSettled(entry)) {
         if (entry.remindedAt === null && elapsed >= box * 0.8) {
           const left = Math.max(1, Math.round((box - elapsed) / 60_000));
           if (!(await threadDone(entry.threadId))) {
             await tellThread(entry.threadId, `[factory] About ${left} minute${left === 1 ? "" : "s"} left in your ${entry.timeboxMinutes}-minute time box. Wrap up and record your report with what you have: \`bb factory explore-report ${entry.taskKey} --comment <comment-id>\`.`);
           }
-          await mutateFactory(prefix, (current) => {
-            const target = current.explorations.find((candidate) => candidate.threadId === entry.threadId && candidate.round === entry.round);
-            if (target !== undefined) target.remindedAt = new Date(now).toISOString();
-          });
+          await updateExploration(prefix, entry, (target) => { target.remindedAt = new Date(now).toISOString(); });
         }
         if (entry.overrunNotifiedAt === null && elapsed >= box) {
           const told = await tellLead(factory, `[factory] ${entry.taskKey}'s Explorer (${entry.threadId}) passed its ${entry.timeboxMinutes}-minute time box without a report. Ask it to record its report now with what it has, or stop it with \`bb thread stop ${entry.threadId}\`.`);
-          if (told) {
-            await mutateFactory(prefix, (current) => {
-              const target = current.explorations.find((candidate) => candidate.threadId === entry.threadId && candidate.round === entry.round);
-              if (target !== undefined) target.overrunNotifiedAt = new Date(now).toISOString();
-            });
-          }
+          if (told) await updateExploration(prefix, entry, (target) => { target.overrunNotifiedAt = new Date(now).toISOString(); });
         }
-        continue;
+        if (elapsed < box * ABANDON_AFTER_TIMEBOXES || !(await explorerFinished(entry.threadId))) continue;
+        await updateExploration(prefix, entry, (target) => { target.abandonedAt = new Date(now).toISOString(); });
+        entry.abandonedAt = new Date(now).toISOString();
       }
       if (entry.roundNotifiedAt === null) await announceRound(prefix, entry.round);
-      if (entry.ownWorktree && entry.worktreeDeletedAt === null && (await threadDone(entry.threadId))) {
+      if (entry.ownWorktree && entry.worktreeDeletedAt === null) {
+        // A failed lookup isn't "done": nothing is deleted or recorded until bb says the thread has finished.
         const thread = await bb.sdk.threads.get({ threadId: entry.threadId }).catch(() => null);
+        if (thread === null || (thread.deletedAt === null && thread.status !== "idle" && thread.status !== "error")) continue;
         const branch = entry.branch ?? (await explorerBranch(factory, entry.threadId));
-        if (branch !== null && entry.branch === null) await updateExploration(prefix, entry, (target) => { target.branch = branch; });
+        if (typeof branch === "string" && entry.branch === null) {
+          await updateExploration(prefix, entry, (target) => { target.branch = branch; });
+          entry.branch = branch;
+        }
         try {
-          if (thread !== null && thread.environmentId !== null) {
+          if (thread.deletedAt === null && thread.environmentId !== null) {
             // bb won't delete a worktree while a thread on it isn't archived. The report is on the task.
             if (thread.archivedAt === null) await bb.sdk.threads.archive({ threadId: entry.threadId });
             await bb.sdk.environments.delete({ environmentId: thread.environmentId });
@@ -2514,33 +2567,50 @@ export default async function plugin(bb: BbPluginApi) {
       }
     }
   }
+  /** Finished for good: idle, failed or deleted. A failed lookup says no. */
+  async function explorerFinished(threadId: string): Promise<boolean> {
+    const thread = await bb.sdk.threads.get({ threadId }).catch(() => null);
+    return thread !== null && (thread.deletedAt !== null || thread.status === "idle" || thread.status === "error");
+  }
   function updateExploration(prefix: string, entry: Pick<Exploration, "threadId" | "round">, change: (target: Exploration) => void): Promise<void> {
     return mutateFactory(prefix, (current) => {
       const target = current.explorations.find((candidate) => candidate.threadId === entry.threadId && candidate.round === entry.round);
       if (target !== undefined) change(target);
     });
   }
-  /** The branch bb gave the Explorer's worktree. It's still listed once the thread is archived. */
-  async function explorerBranch(factory: Factory, threadId: string): Promise<string | null> {
+  /**
+   * The branch bb gave the Explorer's worktree, which it still lists once the thread is archived. Null when
+   * bb lists the thread with no branch, and undefined when the lookup failed, which settles nothing.
+   */
+  async function explorerBranch(factory: Factory, threadId: string): Promise<string | null | undefined> {
+    let listedAtAll = false;
     for (const archived of [false, true]) {
-      const listed = await bb.sdk.threads.list({ projectId: factory.bbProjectId, threadIds: [threadId], includeHidden: true, archived }).catch(() => []);
-      const branch = listed.find((thread) => thread.id === threadId)?.environmentBranchName ?? null;
-      if (branch !== null) return branch;
+      let listed;
+      try {
+        listed = await bb.sdk.threads.list({ projectId: factory.bbProjectId, threadIds: [threadId], includeHidden: true, archived });
+      } catch {
+        return undefined;
+      }
+      const thread = listed.find((candidate) => candidate.id === threadId);
+      if (thread === undefined) continue;
+      listedAtAll = true;
+      if (thread.environmentBranchName !== null) return thread.environmentBranchName;
     }
-    return null;
+    return listedAtAll ? null : undefined;
   }
   /**
-   * The host worker deletes the branch only if it's named as an Explorer's, and git refuses one still
+   * The host worker deletes the branch only if it's named as this Explorer's, and git refuses one still
    * checked out. A branch that isn't there needs nothing more; one the Explorer pushed stays on GitHub.
    */
   async function deleteExplorerBranch(factory: Factory, entry: Exploration, now: number): Promise<void> {
     const branch = entry.branch ?? (await explorerBranch(factory, entry.threadId));
+    if (branch === undefined) return;
     const done = () => updateExploration(factory.prefix, entry, (target) => { target.branch = branch; target.branchDeletedAt = new Date(now).toISOString(); });
     if (branch === null) return done();
     const { hostId, projectPath } = await projectHost(factory);
     if (projectPath === null) return;
     try {
-      const result = await host.call("delete_explorer_branch", { projectPath, branch }, { hostId, timeoutMs: 60_000 });
+      const result = await host.call("delete_explorer_branch", { projectPath, branch, threadId: entry.threadId }, { hostId, timeoutMs: 60_000 });
       if (result.deleted || result.missing) return done();
       if (!worktreeDeleteWarned.has(`branch:${entry.threadId}`)) bb.log.warn(`could not delete Explorer branch ${branch}: ${result.error}`);
     } catch (error) {
@@ -2682,12 +2752,14 @@ export default async function plugin(bb: BbPluginApi) {
     await mutateFactory(factory.prefix, (current) => {
       // Assigning a role is a choice of track for a task that has none, and plan and explore move it there.
       if (current.tracksEnabled && track !== null) current.tracks[task.key] = track;
+      // New planning or exploring replaces the advice the last one gave.
+      if (args.role === "plan" || args.role === "explore") delete current.closeAdvice[task.key];
       if (args.role === "explore" && args.candidate !== undefined) {
         current.explorations.push({
           taskKey: task.key, threadId: thread.id, round: args.candidate.round, candidate: args.candidate.index, of: args.candidate.of,
           approach: args.candidate.approach, startedAt: new Date().toISOString(), timeboxMinutes: EXPLORE_TIMEBOX_MINUTES, ownWorktree,
           reportCommentId: null, recommendation: null, summary: null, learned: null, reportedAt: null, remindedAt: null,
-          overrunNotifiedAt: null, roundNotifiedAt: null, worktreeDeletedAt: null, branch: null, branchDeletedAt: null,
+          overrunNotifiedAt: null, roundNotifiedAt: null, worktreeDeletedAt: null, branch: null, branchDeletedAt: null, abandonedAt: null,
         });
       }
       if (args.role === "plan") {
@@ -4439,7 +4511,7 @@ ${findings}`;
     async start(signal) {
       while (!signal.aborted) {
         for (const factory of await listFactories().catch(() => [])) {
-          const pending = factory.explorations.some((entry) => entry.worktreeDeletedAt === null || (entry.ownWorktree && entry.branchDeletedAt === null));
+          const pending = factory.explorations.some(explorationPending);
           if (factory.archivedAt !== null || !pending) continue;
           await maintainExplorations(factory.prefix).catch((error: unknown) => bb.log.warn(`exploration watch failed for ${factory.prefix}: ${String(error)}`));
         }

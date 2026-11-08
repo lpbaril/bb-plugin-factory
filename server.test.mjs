@@ -4262,7 +4262,7 @@ test('an Explorer records a complete report, and the Lead gets the comparison on
   assert.equal((await harness.behavior.runCli(['explore-report', 'TEST-1', '--comment', 'c2'], { threadId: 'thr_e2' })).exitCode, 0);
   const told = messages.filter(message => /candidates exploring/.test(message.input[0].text));
   assert.equal(told.length, 1);
-  assert.match(told[0].input[0].text, /All 2 candidates exploring TEST-1 have reported:\n1\. Use a queue: recommends build \(task comment c1\)\n2\. Poll the table: recommends close \(task comment c2\)/);
+  assert.match(told[0].input[0].text, /All 2 candidates exploring TEST-1 have finished:\n1\. Use a queue: recommends build \(task comment c1\)\n2\. Poll the table: recommends close \(task comment c2\)/);
   assert.match(told[0].input[0].text, /Only the person closes a task/);
   const factory = await createFactoryStorage(bb.storage, value => value).read('TEST');
   assert.deepEqual(factory.closeAdvice['TEST-1'].commentId, 'c2');
@@ -4316,7 +4316,7 @@ test('the time box: a reminder near the end, the Lead told once past it, and the
   assert.ok(!to('thr_lead').some(text => /TEST-1/.test(text)), 'not past it yet');
   assert.deepEqual(deleted, ['env_thr_done'], 'only a worktree made for that Explorer, once it has reported and finished');
   assert.deepEqual([...archived], ['thr_done'], 'its thread is archived first, and only its');
-  assert.deepEqual(branchCalls, [{ projectPath: '/repo/sand', branch: 'bb/test-3-explorer-csv-thr_done' }], 'then its local branch, once');
+  assert.deepEqual(branchCalls, [{ projectPath: '/repo/sand', branch: 'bb/test-3-explorer-csv-thr_done', threadId: 'thr_done' }], 'then its local branch, once');
   const factory = await createFactoryStorage(bb.storage, value => value).read('TEST');
   const done = factory.explorations.find(entry => entry.threadId === 'thr_done');
   assert.equal(done.branch, 'bb/test-3-explorer-csv-thr_done');
@@ -4388,4 +4388,170 @@ test('tracks reach the prompts and standing rules, within bb\'s limit', () => {
   assert.match(workerReminder({ role: 'plan', factoryName: 'F', taskKey: 'T-1', tracks: true }), /NEEDS SPIKE/);
   assert.match(workerReminder({ role: 'explore', factoryName: 'F', taskKey: 'T-1', evidenceContract: true }), /never push or open a pull request[\s\S]*## Not checked/);
   for (const role of ['plan', 'explore', 'design']) assert.ok(workerReminder({ role, factoryName: 'BusinessOS', taskKey: 'BOS-123', evidenceContract: true, tracks: true }).length < 4096);
+});
+
+// ----- Review of PR #12 -----
+
+test('an Explorer waiting on the person isn\'t reported as stalled', async t => {
+  const agents = [
+    { threadId: 'thr_x', role: 'explore', taskKey: 'TEST-1', providerId: 'codex', createdAt: '', pr: null },
+    { threadId: 'thr_build', role: 'build', taskKey: 'TEST-2', providerId: 'codex', createdAt: '', pr: null },
+  ];
+  const { harness } = await nightlyFixture(t, () => [boardTask('TEST-1', 'in_progress'), boardTask('TEST-2', 'in_progress')], { agents });
+  assert.deepEqual((await healthOf(harness)).inProgressWithoutLiveWorker.map(task => task.taskKey), ['TEST-2']);
+});
+
+test('trackGate: a task planned before tracks were on still waits for its plan', () => {
+  const pending = trackState({ plans: [{ taskKey: 'T-1', threadId: 'thr_p', commentId: null }] });
+  assert.throws(() => trackGate(pending, 'T-1', 'build'), error => error.code === 'plan_not_ready' && /plan-ready/.test(error.hint));
+  const ready = trackState({ plans: [{ taskKey: 'T-1', threadId: 'thr_p', commentId: 'c1' }] });
+  assert.equal(trackGate(ready, 'T-1', 'build'), 'plan', 'and its track is recorded as plan');
+  assert.equal(trackGate(trackState({ tracks: { 'T-1': 'direct' }, plans: pending.plans }), 'T-1', 'build'), null, 'unless someone chose direct');
+});
+
+test('readRecommendation takes a reason on the same line, but not a different word', () => {
+  for (const [line, expected] of [['Recommendation: build, the prototype passed all tests', 'build'], ['Recommendation: plan - two open questions', 'plan'], ['Recommendation: explore more (one case left)', 'explore more'], ['Recommendation: close; already done', 'close'], ['Recommendation: planning first', null], ['Recommendation: closed', null], ['Recommendation: buildings', null]]) {
+    assert.equal(readRecommendation(`## Recommendation\n${line}`), expected, line);
+  }
+});
+
+const exploreWatch = async harness => {
+  const service = harness.behavior.runService('explore-watch');
+  await new Promise(resolve => setTimeout(resolve, 80));
+  service.controller.abort();
+  await service.done;
+};
+const minutesAgo = minutes => new Date(Date.now() - minutes * 60_000).toISOString();
+const reportedEntry = (over = {}) => ({ taskKey: 'TEST-3', threadId: 'thr_done', round: 'r3', candidate: 1, of: 1, approach: null, startedAt: minutesAgo(30), timeboxMinutes: 45, ownWorktree: true, reportCommentId: 'c9', recommendation: 'plan', reportedAt: minutesAgo(5), roundNotifiedAt: minutesAgo(5), ...over });
+
+test('a thread lookup that fails deletes nothing and records nothing, then the next pass does', async t => {
+  let lookupWorks = false;
+  const deleted = [];
+  const archived = new Set();
+  const { harness, bb } = await tracksFixture(t, { explorations: [reportedEntry()] }, {
+    threads: {
+      list: async ({ threadIds = [] }) => { if (!lookupWorks) throw new Error('down'); return threadIds.map(id => ({ id, environmentBranchName: 'bb/test-3-explorer-csv-thr_done' })); },
+      get: async ({ threadId }) => { if (!lookupWorks) throw new Error('down'); return makeThreadResponse({ id: threadId, status: 'idle', environmentId: 'env_done', archivedAt: archived.has(threadId) ? 1 : null }); },
+      archive: async ({ threadId }) => { archived.add(threadId); return {}; },
+    },
+    environments: { delete: async ({ environmentId }) => { deleted.push(environmentId); return { ok: true }; } },
+    hostRpc: async () => ({ deleted: true, missing: false, error: null }),
+    projectPath: '/repo/sand',
+  });
+  const read = async () => (await createFactoryStorage(bb.storage, value => value).read('TEST')).explorations[0];
+  await exploreWatch(harness);
+  assert.deepEqual(deleted, []);
+  assert.equal((await read()).worktreeDeletedAt, null, 'not recorded as deleted');
+  lookupWorks = true;
+  await exploreWatch(harness);
+  assert.deepEqual(deleted, ['env_done']);
+  const entry = await read();
+  assert.ok(entry.worktreeDeletedAt !== null && entry.branchDeletedAt !== null);
+});
+
+test('a branch lookup that fails doesn\'t record the branch as deleted', async t => {
+  const { harness, bb } = await tracksFixture(t, { explorations: [reportedEntry({ worktreeDeletedAt: minutesAgo(1) })] }, {
+    threads: { list: async () => { throw new Error('down'); }, get: async ({ threadId }) => makeThreadResponse({ id: threadId, status: 'idle' }) },
+    environments: { delete: async () => ({ ok: true }) },
+  });
+  await exploreWatch(harness);
+  assert.equal((await createFactoryStorage(bb.storage, value => value).read('TEST')).explorations[0].branchDeletedAt, null);
+});
+
+test('an Explorer stopped without a report is given up on after twice its time box, reported, and cleaned up', async t => {
+  const deleted = [];
+  const archived = new Set();
+  const stopped = { taskKey: 'TEST-1', threadId: 'thr_quiet', round: 'r1', candidate: 1, of: 2, approach: 'Use a queue', startedAt: minutesAgo(95), timeboxMinutes: 45, ownWorktree: true, remindedAt: minutesAgo(60), overrunNotifiedAt: minutesAgo(50) };
+  const other = { ...stopped, threadId: 'thr_other', candidate: 2, approach: 'Poll the table', reportCommentId: 'c2', recommendation: 'build', reportedAt: minutesAgo(40) };
+  const { harness, bb, messages } = await tracksFixture(t, { explorations: [stopped, other] }, {
+    threads: {
+      list: async ({ threadIds = [] }) => threadIds.map(id => ({ id, environmentBranchName: `bb/test-1-explorer-csv-${id}` })),
+      get: async ({ threadId }) => makeThreadResponse({ id: threadId, status: 'idle', environmentId: `env_${threadId}`, archivedAt: archived.has(threadId) ? 1 : null }),
+      send: async args => { messages.push(args); return {}; },
+      archive: async ({ threadId }) => { archived.add(threadId); return {}; },
+    },
+    environments: { delete: async ({ environmentId }) => { deleted.push(environmentId); return { ok: true }; } },
+    hostRpc: async () => ({ deleted: true, missing: false, error: null }),
+    projectPath: '/repo/sand',
+  });
+  await exploreWatch(harness);
+  const told = messages.filter(message => /candidates exploring TEST-1/.test(message.input[0].text));
+  assert.equal(told.length, 1);
+  assert.match(told[0].input[0].text, /1\. Use a queue: stopped without a report\n2\. Poll the table: recommends build \(task comment c2\)/);
+  assert.deepEqual(deleted.sort(), ['env_thr_other', 'env_thr_quiet']);
+  const entry = (await createFactoryStorage(bb.storage, value => value).read('TEST')).explorations.find(candidate => candidate.threadId === 'thr_quiet');
+  assert.ok(entry.abandonedAt !== null && entry.worktreeDeletedAt !== null);
+});
+
+test('an Explorer still running past twice its time box isn\'t given up on', async t => {
+  const running = { taskKey: 'TEST-1', threadId: 'thr_busy', round: 'r1', candidate: 1, of: 1, approach: null, startedAt: minutesAgo(100), timeboxMinutes: 45, ownWorktree: true, remindedAt: minutesAgo(60), overrunNotifiedAt: minutesAgo(50) };
+  const { harness, bb } = await tracksFixture(t, { explorations: [running] }, { threads: { list: async () => [], get: async ({ threadId }) => makeThreadResponse({ id: threadId, status: 'active' }) }, environments: { delete: async () => { throw new Error('should not delete'); } } });
+  await exploreWatch(harness);
+  assert.equal((await createFactoryStorage(bb.storage, value => value).read('TEST')).explorations[0].abandonedAt, null);
+});
+
+test('a round that fails to start partway is undone, and can be started again', async t => {
+  let spawned = 0;
+  const stopped = [];
+  const spawns = [];
+  const { harness, bb } = await tracksFixture(t, {}, {
+    threads: {
+      list: async () => [],
+      get: async ({ threadId }) => makeThreadResponse({ id: threadId, status: stopped.includes(threadId) ? 'idle' : 'active' }),
+      // Candidate 2's worktree spawn and its fallback to the project checkout both fail.
+      spawn: async args => { spawned += 1; spawns.push(args); if (spawned === 2 || spawned === 3) throw new Error('provider down'); return makeThreadResponse({ id: `thr_c${spawned}` }); },
+      stop: async ({ threadId }) => { stopped.push(threadId); return {}; },
+    },
+  });
+  const failed = await harness.behavior.runCli(['assign', 'TEST-1', '--role', 'explore', '--candidates', '2', '--instructions', '1. Use a queue\n2. Poll the table']);
+  assert.notEqual(failed.exitCode, 0);
+  assert.deepEqual(stopped, ['thr_c1'], 'the candidate already started is stopped');
+  let factory = await createFactoryStorage(bb.storage, value => value).read('TEST');
+  assert.deepEqual(factory.explorations.map(entry => [entry.threadId, entry.abandonedAt !== null, entry.roundNotifiedAt !== null]), [['thr_c1', true, true]], 'settled, without telling the Lead');
+  const again = await harness.behavior.runCli(['assign', 'TEST-1', '--role', 'explore', '--candidates', '2', '--instructions', '1. Use a queue\n2. Poll the table']);
+  assert.equal(again.exitCode, 0, again.stderr);
+  factory = await createFactoryStorage(bb.storage, value => value).read('TEST');
+  assert.equal(new Set(factory.explorations.map(entry => entry.round)).size, 2);
+});
+
+test('advice to close is cleared by a track choice, a new Planner or Explorer, and a READY plan', async t => {
+  const advice = { role: 'explore', threadId: 'thr_x', commentId: 'c9', at: '' };
+  const read = async bb => (await createFactoryStorage(bb.storage, value => value).read('TEST')).closeAdvice['TEST-1'];
+  const byTrack = await tracksFixture(t, { closeAdvice: { 'TEST-1': advice }, tracks: { 'TEST-1': 'explore' } });
+  await byTrack.harness.behavior.runCli(['track', 'TEST-1', 'direct']);
+  assert.equal(await read(byTrack.bb), undefined);
+  const byPlanner = await tracksFixture(t, { closeAdvice: { 'TEST-1': advice } });
+  assert.equal((await byPlanner.harness.behavior.runCli(['assign', 'TEST-1', '--role', 'plan'])).exitCode, 0);
+  assert.equal(await read(byPlanner.bb), undefined);
+  const planner = { threadId: 'thr_planner', role: 'plan', taskKey: 'TEST-1', providerId: 'codex', createdAt: '', pr: null };
+  const byReady = await tracksFixture(t, { agents: [leadAgent, planner], plans: [{ taskKey: 'TEST-1', threadId: 'thr_planner', commentId: null }], closeAdvice: { 'TEST-1': { ...advice, role: 'plan' } } });
+  byReady.comments.push({ id: 'plan_1', kind: 'agent', authorName: 'Planner', threadId: 'thr_planner', body: 'Factory plan: READY\n## Problem and scope\n## Acceptance criteria\n## Implementation plan\n## Dependencies\n## Open questions\nNone blocking', createdAt: '' });
+  assert.equal((await byReady.harness.behavior.runCli(['plan-ready', 'TEST-1', '--comment', 'plan_1'], { threadId: 'thr_planner' })).exitCode, 0);
+  assert.equal(await read(byReady.bb), undefined);
+});
+
+test('the Lead hears about a round once, even when the watch runs while the report is being sent', async t => {
+  const sent = [];
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const candidates = twoCandidates().map((entry, index) => (index === 0 ? { ...entry, reportCommentId: 'c1', recommendation: 'build', reportedAt: minutesAgo(1) } : entry));
+  const { harness, comments } = await tracksFixture(t, { explorations: candidates, tracks: { 'TEST-1': 'explore' } }, {
+    threads: { list: async () => [], get: async ({ threadId }) => makeThreadResponse({ id: threadId, status: 'active' }), send: async args => { if (/candidates exploring/.test(args.input[0].text)) { sent.push(args); await gate; } return {}; } },
+    environments: { delete: async () => ({ ok: true }) },
+  });
+  comments.push({ id: 'c2', kind: 'agent', authorName: 'x', threadId: 'thr_e2', body: report(), createdAt: '' });
+  const reporting = harness.behavior.runCli(['explore-report', 'TEST-1', '--comment', 'c2'], { threadId: 'thr_e2' });
+  await new Promise(resolve => setTimeout(resolve, 50));
+  const watching = exploreWatch(harness);
+  await new Promise(resolve => setTimeout(resolve, 50));
+  release();
+  await Promise.all([reporting, watching]);
+  assert.equal(sent.length, 1);
+});
+
+test('the watch leaves a settled Explorer without its own worktree alone', async t => {
+  let lookups = 0;
+  const { harness } = await tracksFixture(t, { explorations: [reportedEntry({ ownWorktree: false })] }, { threads: { list: async () => { lookups += 1; return []; }, get: async ({ threadId }) => { lookups += 1; return makeThreadResponse({ id: threadId, status: 'idle' }); } } });
+  await exploreWatch(harness);
+  assert.equal(lookups, 0);
 });
