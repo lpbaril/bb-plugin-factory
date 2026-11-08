@@ -5123,10 +5123,10 @@ const presetCatalog = (over = {}) => ({
   providers: [{ id: 'claude-code', available: true }, { id: 'codex', available: true }, { id: 'acp-cursor', available: false }, ...(over.extra ?? [])],
   models: {
     'claude-code': [
-      { id: 'claude-opus-5-5', isDefault: true, defaultReasoningEffort: 'high', efforts: efforts('low', 'medium', 'high', 'xhigh', 'max', 'ultra') },
-      { id: 'claude-sonnet-5-5', isDefault: false, defaultReasoningEffort: 'high', efforts: efforts('low', 'medium', 'high') },
+      { id: 'claude-opus-5-5', model: 'opus', isDefault: true, defaultReasoningEffort: 'high', efforts: efforts('low', 'medium', 'high', 'xhigh', 'max', 'ultra') },
+      { id: 'claude-sonnet-5-5', model: 'sonnet', isDefault: false, defaultReasoningEffort: 'high', efforts: efforts('low', 'medium', 'high') },
     ],
-    codex: [{ id: 'gpt-6.1-sol', isDefault: true, defaultReasoningEffort: 'medium', efforts: efforts('none', 'low', 'medium', 'high', 'xhigh') }],
+    codex: [{ id: 'gpt-6.1-sol', model: 'gpt-6.1-sol', isDefault: true, defaultReasoningEffort: 'medium', efforts: efforts('none', 'low', 'medium', 'high', 'xhigh') }],
     ...(over.models ?? {}),
   },
 });
@@ -5199,20 +5199,21 @@ test('Maximum depth raises reasoning where judgment matters, and adds a third pr
   assert.equal(seat(seats, 'review2').proposed.providerId, 'claude-code', 'off the Builder\'s provider, at least');
   assert.match(seat(seats, 'review2').why[0], /^Moved to claude-code: no third provider is available, so it at least runs on one other than the Builder's$/);
   assert.doesNotMatch(seat(seats, 'review2').why.join(' '), /adds a third provider/);
-  seats = computePreset('max-depth', liveRoster(), presetCatalog({ extra: [{ id: 'pi', available: true }], models: { pi: [{ id: 'pi-1', isDefault: true, defaultReasoningEffort: 'high', efforts: ['high'] }] } }));
+  seats = computePreset('max-depth', liveRoster(), presetCatalog({ extra: [{ id: 'pi', available: true }], models: { pi: [{ id: 'pi-1', model: 'pi-1', isDefault: true, defaultReasoningEffort: 'high', efforts: ['high'] }] } }));
   assert.deepEqual(seat(seats, 'review2').proposed, exec('pi', null, 'high'));
   assert.match(seat(seats, 'review2').why[0], /at maximum depth, Reviewer 2 adds a third provider/);
 });
 
-const presetProviders = () => ({
-  list: async () => presetCatalog().providers,
-  models: async ({ providerId }) => ({ models: (presetCatalog().models[providerId] ?? []).map(model => ({ id: model.id, model: model.id, displayName: model.id, description: '', isDefault: model.isDefault, defaultReasoningEffort: model.defaultReasoningEffort, supportedReasoningEfforts: model.efforts.map(reasoningEffort => ({ reasoningEffort, description: '' })) })) }),
+const presetProviders = (calls = { list: 0, models: 0, failList: false, failModels: [], onModels: null }) => ({
+  list: async () => { calls.list += 1; if (calls.failList) throw new Error('provider service restarting'); return presetCatalog().providers; },
+  models: async ({ providerId }) => { calls.models += 1; await calls.onModels?.(); if (calls.failModels.includes(providerId)) throw new Error('models timed out'); return { models: (presetCatalog().models[providerId] ?? []).map(model => ({ id: model.id, model: model.model, displayName: model.id, description: '', isDefault: model.isDefault, defaultReasoningEffort: model.defaultReasoningEffort, supportedReasoningEfforts: model.efforts.map(reasoningEffort => ({ reasoningEffort, description: '' })) })) }; },
 });
-async function presetFixture(t) {
-  const result = await fixture(t, false, {}, { providers: presetProviders() });
-  await result.bb.storage.kv.set('agents', { roles: liveRoster(), shadowCustomModel: null });
+async function presetFixture(t, roster = liveRoster()) {
+  const calls = { list: 0, models: 0, failList: false, failModels: [], onModels: null };
+  const result = await fixture(t, false, {}, { providers: presetProviders(calls) });
+  await result.bb.storage.kv.set('agents', { roles: roster, shadowCustomModel: null });
   const roles = async () => (await result.bb.storage.kv.get('agents')).roles;
-  return { ...result, roles };
+  return { ...result, roles, calls };
 }
 
 test('bb factory agents preset previews each seat with why, and only the person applies it', async t => {
@@ -5246,11 +5247,137 @@ test('the settings page previews and applies only the seats it sends, and nothin
   const preview = await harness.behavior.callRpc('agents_preset_preview', { preset: 'max-depth' });
   assert.equal(preview.label, 'Maximum depth');
   assert.equal(preview.seats.find(entry => entry.key === 'review1').ticked, false);
-  await assert.rejects(harness.behavior.callRpc('agents_preset_apply', { preset: 'max-depth', keys: ['plan'] }, { experimental_caller: { kind: 'plugin', pluginId: 'other' } }), /Only the plugin settings page/);
-  const view = await harness.behavior.callRpc('agents_preset_apply', { preset: 'max-depth', keys: ['plan', 'security'] });
+  const sent = keys => keys.map(key => ({ key, proposed: preview.seats.find(entry => entry.key === key).proposed }));
+  await assert.rejects(harness.behavior.callRpc('agents_preset_apply', { preset: 'max-depth', seats: sent(['plan']) }, { experimental_caller: { kind: 'plugin', pluginId: 'other' } }), /Only the plugin settings page/);
+  const view = await harness.behavior.callRpc('agents_preset_apply', { preset: 'max-depth', seats: sent(['plan', 'security']) });
   assert.ok(Array.isArray(view.agents));
   const after = await roles();
   assert.equal(after.plan.reasoningLevel, 'max');
   assert.equal(after.security.reasoningLevel, 'max', 'a reviewer seat the person ticked');
   assert.equal(after.designreview.reasoningLevel, null, 'not sent, not changed');
+});
+
+// ----- PR #16 review fixes -----
+
+test('a seat saved under the catalog\'s other model id is recognised, so a preset lowers its level rather than wiping it', () => {
+  const seats = computePreset('lower-cost', { ...liveRoster(), lead: exec('claude-code', 'sonnet', 'high') }, presetCatalog());
+  assert.deepEqual(seat(seats, 'lead').proposed, exec('claude-code', 'sonnet', 'low'));
+  assert.match(seat(seats, 'lead').why.join(' '), /Lowest reasoning level its model offers \(low\)/);
+});
+
+test('a preset never moves a level the wrong way, and keeps a level it can\'t place', () => {
+  const roster = { ...liveRoster(), plan: exec('claude-code', 'claude-opus-5-5', 'ultra'), qa: exec('claude-code', 'claude-sonnet-5-5', 'none'), lead: exec('claude-code', 'claude-sonnet-5-5', 'turbo') };
+  const deep = computePreset('max-depth', roster, presetCatalog());
+  assert.equal(seat(deep, 'plan').proposed.reasoningLevel, 'ultra', 'Maximum depth doesn\'t lower ultra to max');
+  assert.equal(seat(deep, 'plan').changed, false);
+  assert.match(seat(deep, 'plan').why.join(' '), /Keeps the reasoning level you set \(ultra\): the preset would lower it/);
+  const cheap = computePreset('lower-cost', roster, presetCatalog());
+  assert.equal(seat(cheap, 'qa').proposed.reasoningLevel, 'none', 'Lower cost doesn\'t raise none to low');
+  assert.match(seat(cheap, 'qa').why.join(' '), /the preset would raise it/);
+  assert.equal(seat(cheap, 'lead').proposed.reasoningLevel, 'turbo', 'a level outside the known order is kept');
+  assert.match(seat(cheap, 'lead').why.join(' '), /Keeps the reasoning level you set \(turbo\): the preset can't place it/);
+  const odd = computePreset('max-depth', { ...liveRoster(), plan: exec('claude-code', 'claude-opus-5-5', 'turbo') }, presetCatalog());
+  assert.equal(seat(odd, 'plan').proposed.reasoningLevel, 'turbo', 'nor raised to max');
+});
+
+test('when a model\'s levels can\'t be read, a preset leaves its seat\'s level alone', () => {
+  const catalog = presetCatalog();
+  delete catalog.models['claude-code'];
+  const seats = computePreset('max-depth', liveRoster(), catalog);
+  assert.deepEqual(seat(seats, 'plan').proposed, liveRoster().plan);
+  assert.equal(seat(seats, 'plan').changed, false);
+  assert.match(seat(seats, 'plan').why.join(' '), /Couldn't read claude-code's models, so its reasoning level stays as it is/);
+  const custom = computePreset('lower-cost', { ...liveRoster(), qa: exec('claude-code', 'claude-preview-x', 'high') }, presetCatalog());
+  assert.equal(seat(custom, 'qa').proposed.reasoningLevel, 'high');
+  assert.match(seat(custom, 'qa').why.join(' '), /Its model isn't in claude-code's list/);
+});
+
+test('a provider list that can\'t be read stops the preset instead of reading as no providers', async t => {
+  const { harness, calls } = await presetFixture(t);
+  calls.failList = true;
+  const result = await harness.behavior.runCli(['agents', 'preset', 'max-depth']);
+  assert.notEqual(result.exitCode, 0);
+  assert.match(result.stderr, /Couldn't read the providers on this machine, so no preset can be proposed/);
+  assert.doesNotMatch(result.stdout, /can't be independent/);
+  await assert.rejects(harness.behavior.callRpc('agents_preset_preview', { preset: 'max-depth' }), /Couldn't read the providers/);
+});
+
+test('one provider\'s models failing leaves its seats\' levels alone on apply', async t => {
+  const { harness, roles, calls } = await presetFixture(t);
+  calls.failModels = ['claude-code'];
+  const applied = await harness.behavior.runCli(['agents', 'preset', 'lower-cost', '--apply']);
+  assert.equal(applied.exitCode, 0, applied.stderr);
+  const after = await roles();
+  assert.equal(after.lead.reasoningLevel, 'high', 'not wiped');
+  assert.equal(after.qa.reasoningLevel, 'high');
+  assert.equal(after.designreview.reasoningLevel, 'low', 'codex was read');
+});
+
+test('across every roster on three providers, Reviewer 2 at maximum depth stays off the Builder\'s and Reviewer 1\'s providers, saved or proposed', () => {
+  const ids = ['claude-code', 'codex', 'pi'];
+  const catalog = presetCatalog({ extra: [{ id: 'pi', available: true }], models: { pi: [{ id: 'pi-1', model: 'pi-1', isDefault: true, defaultReasoningEffort: 'high', efforts: ['high'] }] } });
+  for (const build of ids) for (const review1 of ids) for (const review2 of ids) {
+    const seats = computePreset('max-depth', { ...liveRoster(), build: exec(build), review1: exec(review1), review2: exec(review2) }, catalog);
+    const proposed = seat(seats, 'review2').proposed.providerId;
+    const taken = new Set([build, review1, seat(seats, 'review1').proposed.providerId]);
+    // The saved Reviewer 1 can only be the Builder's provider when it moves, so three are enough.
+    assert.ok(!taken.has(proposed) || taken.size === 3, `${build}/${review1}/${review2} → ${proposed}`);
+    assert.notEqual(proposed, build, `${build}/${review1}/${review2}`);
+  }
+});
+
+test('applying refuses a proposal that changed since the preview', async t => {
+  const { harness, roles } = await presetFixture(t);
+  const preview = await harness.behavior.callRpc('agents_preset_preview', { preset: 'lower-cost' });
+  const lead = preview.seats.find(entry => entry.key === 'lead');
+  // Not what the preset proposes now.
+  await assert.rejects(harness.behavior.callRpc('agents_preset_apply', { preset: 'lower-cost', seats: [{ key: 'lead', proposed: { ...lead.proposed, reasoningLevel: 'medium' } }] }), /changed since this preview, so nothing was applied/);
+  // The roster changed after the preview: the Lead moved to codex.
+  await harness.behavior.runCli(['agents', 'set', 'lead', '--provider', 'codex']);
+  await assert.rejects(harness.behavior.callRpc('agents_preset_apply', { preset: 'lower-cost', seats: [{ key: 'lead', proposed: lead.proposed }, { key: 'qa', proposed: preview.seats.find(entry => entry.key === 'qa').proposed }] }), /changed since this preview/);
+  const after = await roles();
+  assert.equal(after.lead.providerId, 'codex');
+  assert.equal(after.qa.reasoningLevel, 'high', 'nothing applied, not even the seat that still matched');
+});
+
+test('the preview carries what the page needs to recheck warnings as seats are ticked', async t => {
+  const roster = { ...liveRoster(), build: exec('claude-code'), review1: exec('claude-code'), security: exec('claude-code'), review2: exec('claude-code') };
+  const { harness } = await presetFixture(t, roster);
+  const preview = await harness.behavior.callRpc('agents_preset_preview', { preset: 'balanced' });
+  assert.equal(preview.seats.find(entry => entry.key === 'review1').ticked, false);
+  assert.deepEqual(preview.warnings.map(warning => warning.id), ['roster-shared-provider'], 'with the default ticks');
+  assert.deepEqual(preview.roster.build, roster.build);
+  assert.equal(preview.shadowOn, false, 'the fixture runs with the shadow off');
+  const ticked = { ...preview.roster, review1: preview.seats.find(entry => entry.key === 'review1').proposed };
+  assert.deepEqual(rosterWarnings(ticked, preview.providers, { shadowOn: preview.shadowOn }), [], 'ticking Reviewer 1 clears it');
+});
+
+test('one preset apply reads the providers once and each provider\'s models once', async t => {
+  const { harness, calls } = await presetFixture(t);
+  calls.list = 0; calls.models = 0;
+  const applied = await harness.behavior.runCli(['agents', 'preset', 'lower-cost', '--apply']);
+  assert.equal(applied.exitCode, 0, applied.stderr);
+  assert.equal(calls.list, 1);
+  assert.equal(calls.models, 2, 'claude-code and codex; acp-cursor isn\'t available');
+});
+
+test('--seats needs --apply and at least one seat', async t => {
+  const { harness, roles } = await presetFixture(t);
+  assert.match((await harness.behavior.runCli(['agents', 'preset', 'max-depth', '--seats', 'review1'])).stderr, /--seats only works with --apply/);
+  assert.match((await harness.behavior.runCli(['agents', 'preset', 'max-depth', '--apply', '--seats', ' , '])).stderr, /--seats needs at least one seat/);
+  assert.deepEqual(await roles(), liveRoster());
+});
+
+test('applying refuses when the roster changes while the preset is being worked out', async t => {
+  const { harness, roles, bb, calls } = await presetFixture(t);
+  const preview = await harness.behavior.callRpc('agents_preset_preview', { preset: 'lower-cost' });
+  const qa = preview.seats.find(entry => entry.key === 'qa');
+  // The QA seat changes on another screen while the apply reads the providers' models.
+  calls.onModels = async () => {
+    calls.onModels = null;
+    const saved = await bb.storage.kv.get('agents');
+    await bb.storage.kv.set('agents', { ...saved, roles: { ...saved.roles, qa: exec('claude-code', 'claude-sonnet-5-5', 'medium') } });
+  };
+  await assert.rejects(harness.behavior.callRpc('agents_preset_apply', { preset: 'lower-cost', seats: [{ key: 'qa', proposed: qa.proposed }] }), /changed since this preview/);
+  assert.equal((await roles()).qa.reasoningLevel, 'medium', 'the other change stands');
 });

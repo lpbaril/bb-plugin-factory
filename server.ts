@@ -19,6 +19,25 @@ import {
 import { z } from "zod";
 import { hostContract, isDisposableBranch, repoInspectionSchema, type RepoInspection } from "./host-contract";
 import { createFactoryStorage } from "./factory-storage";
+import {
+  AGENT_KEYS,
+  AGENT_LABELS,
+  PRESET_SEATS,
+  REASONING_LEVELS,
+  ROSTER_PRESETS,
+  ROSTER_PRESET_LABELS,
+  computePreset,
+  rosterWarnings,
+  sameExec,
+  showExec,
+  type AgentKey,
+  type CatalogModel,
+  type RosterCatalog,
+  type RosterPreset,
+} from "./roster";
+export { computePreset, rosterWarnings, ROSTER_PRESETS, ROSTER_PRESET_LABELS };
+export type { RosterWarning, PresetSeat } from "./roster";
+import type { RosterWarning } from "./roster";
 import type { Lesson, RunCursor, RunRow } from "./factory-storage";
 import {
   CORE_DESIGN_LENSES,
@@ -730,153 +749,6 @@ export function qaCarryNote(qa: Pick<QaResult, "verdict" | "sha"> | null | undef
   return `QA passed ${short}, and ${later} later ${later === 1 ? "commit hasn't" : "commits haven't"} had QA.`;
 }
 
-export type RosterWarning = { id: string; title: string; detail: string };
-/**
- * Checks that make no claim about which model is better: can each seat run, and does anything
- * independent check the Builder's work? `providers` is null when the provider list couldn't be
- * read, so a failed lookup never reads as "unavailable".
- */
-export function rosterWarnings(
-  roles: Record<string, { providerId: string }>,
-  providers: readonly { id: string; available: boolean }[] | null,
-  options: { shadowOn: boolean },
-): RosterWarning[] {
-  const warnings: RosterWarning[] = [];
-  const builder = roles.build?.providerId;
-  if (builder !== undefined && roles.review1?.providerId === builder && roles.security?.providerId === builder) {
-    const secondProvider = roles.review2 !== undefined && roles.review2.providerId !== builder;
-    warnings.push({
-      id: "roster-shared-provider",
-      title: `The Builder, Reviewer 1 and Security all run on ${builder}`,
-      detail: secondProvider
-        ? `Only large or sensitive PRs get a second provider, through Reviewer 2 (${roles.review2!.providerId}). Reviewers on the same provider tend to share blind spots, so move Reviewer 1 to another provider if you have one.`
-        : "No review comes from a second provider, and reviewers on the same provider tend to share blind spots. Move Reviewer 1 to another provider if you have one.",
-    });
-  }
-  if (providers !== null) {
-    const seats = AGENT_KEYS.filter((key) => options.shadowOn || (key !== "shadow" && key !== "comparison"));
-    const unavailable = new Map<string, string[]>();
-    for (const role of seats) {
-      const providerId = roles[role]?.providerId;
-      if (providerId === undefined || providers.some((provider) => provider.id === providerId && provider.available)) continue;
-      unavailable.set(providerId, [...(unavailable.get(providerId) ?? []), AGENT_LABELS[role]]);
-    }
-    for (const [providerId, labels] of unavailable) {
-      warnings.push({
-        id: `roster-unavailable-${providerId}`,
-        title: `${providerId} isn't available for ${labels.join(", ")}`,
-        detail: `Agents in these seats won't start until it's signed in or the seat moves to another provider.`,
-      });
-    }
-  }
-  return warnings;
-}
-
-// ----- Roster presets -----
-
-export const ROSTER_PRESETS = ["balanced", "lower-cost", "max-depth"] as const;
-export type RosterPreset = (typeof ROSTER_PRESETS)[number];
-export const ROSTER_PRESET_LABELS: Record<RosterPreset, string> = { balanced: "Balanced", "lower-cost": "Lower cost", "max-depth": "Maximum depth" };
-/** The trial seats keep what the person set up for the trial. */
-const PRESET_SEATS = ["lead", "plan", "explore", "build", "qa", "design", "review1", "review2", "security", "designreview"] as const;
-/** Reviewer seats stay the person's choice: proposed, but applied only when ticked. */
-const PRESET_REVIEWER_SEATS: readonly string[] = ["review1", "review2", "security"];
-/** Seats that read more than they write, where Lower cost lowers reasoning. */
-const PRESET_READING_SEATS: readonly string[] = ["lead", "qa", "explore", "designreview"];
-/** Seats where Maximum depth raises reasoning. */
-const PRESET_DEPTH_SEATS: readonly string[] = ["plan", "designreview", "review1", "review2", "security"];
-/** Reasoning levels in order. ultra and ultracode are special modes, never picked by a preset. */
-const EFFORT_ORDER = ["none", "low", "medium", "high", "xhigh", "max"];
-
-export type CatalogModel = { id: string; isDefault: boolean; defaultReasoningEffort: string; efforts: string[] };
-export type RosterCatalog = { providers: readonly { id: string; available: boolean }[]; models: Readonly<Record<string, readonly CatalogModel[]>> };
-export type PresetSeat = { key: string; current: AgentExec; proposed: AgentExec; why: string[]; changed: boolean; ticked: boolean; reviewer: boolean };
-
-/**
- * A preset's proposal for each seat, from the providers and models on this machine. Rules only: no
- * claim about which model is better. Balanced keeps each seat on an available provider at its default
- * model and reasoning, with Reviewer 1 on a provider other than the Builder's and design reviewers on
- * one other than the Planner's. Lower cost lowers reasoning on seats that read more than they write;
- * Maximum depth raises it where judgment matters, and puts Reviewer 2 on a third provider when there
- * is one. A seat that stays on its provider keeps a model picked by hand.
- */
-export function computePreset(preset: RosterPreset, roles: Readonly<Record<string, AgentExec>>, catalog: RosterCatalog): PresetSeat[] {
-  const available = catalog.providers.filter((provider) => provider.available).map((provider) => provider.id);
-  // Providers already in the roster come first, so a preset doesn't bring in one nobody uses.
-  const familiar = [...new Set(PRESET_SEATS.map((key) => roles[key]?.providerId).filter((id): id is string => id !== undefined && available.includes(id)))];
-  const order = [...familiar, ...available.filter((id) => !familiar.includes(id))];
-  const pick = (current: string, avoid: readonly string[]): string | null => {
-    if (available.includes(current) && !avoid.includes(current)) return current;
-    return order.find((id) => !avoid.includes(id)) ?? null;
-  };
-  const modelOf = (providerId: string, model: string | null) => {
-    const models = catalog.models[providerId] ?? [];
-    return model === null ? models.find((entry) => entry.isDefault) : models.find((entry) => entry.id === model);
-  };
-  const resolved: Record<string, string> = {};
-  const seatProvider = (key: string) => resolved[key] ?? roles[key]?.providerId ?? "";
-  const seats: PresetSeat[] = [];
-  for (const key of PRESET_SEATS) {
-    const current = roles[key];
-    if (current === undefined) continue;
-    const why: string[] = [];
-    let avoid: string[] = [];
-    if (key === "review1") avoid = [seatProvider("build")];
-    if (key === "designreview") avoid = [seatProvider("plan")];
-    if (key === "review2" && preset === "max-depth") avoid = [seatProvider("build"), seatProvider("review1")];
-    let providerId = pick(current.providerId, avoid);
-    // "third": Reviewer 2 found no third provider but is off the Builder's. "alone": no other provider at all.
-    let fallback: "third" | "alone" | null = null;
-    if (providerId === null && key === "review2") {
-      providerId = pick(current.providerId, [seatProvider("build")]);
-      if (providerId !== null) fallback = "third";
-    }
-    if (providerId === null && avoid.length > 0) {
-      // Keep the seat running rather than independent.
-      fallback = "alone";
-      providerId = pick(current.providerId, []);
-    }
-    providerId ??= current.providerId;
-    resolved[key] = providerId;
-    const moved = providerId !== current.providerId;
-    if (moved && !available.includes(current.providerId)) why.push(`Moved to ${providerId}: ${current.providerId} isn't available here`);
-    else if (fallback === "third") why.push(moved ? `Moved to ${providerId}: no third provider is available, so it at least runs on one other than the Builder's` : "No third provider is available, so it stays off the Builder's");
-    else if (fallback === "alone") why.push("No other provider is available here, so it can't be independent");
-    else if (moved) {
-      why.push(key === "review1" ? `Moved to ${providerId}: Reviewer 1 checks the Builder's work, so it runs on another provider`
-        : key === "designreview" ? `Moved to ${providerId}: design reviewers read the plan fresh, so they run on a provider other than the Planner's`
-        : key === "review2" ? `Moved to ${providerId}: at maximum depth, Reviewer 2 adds a third provider`
-        : `Moved to ${providerId}`);
-    }
-    const model = providerId === current.providerId ? current.model : null;
-    if (model !== null) why.push(`Keeps the model you picked (${model})`);
-    const entry = modelOf(providerId, model);
-    const efforts = (entry?.efforts ?? []).filter((effort) => EFFORT_ORDER.includes(effort)).sort((a, b) => EFFORT_ORDER.indexOf(a) - EFFORT_ORDER.indexOf(b));
-    let reasoningLevel: string | null = null;
-    if (preset === "lower-cost" && PRESET_READING_SEATS.includes(key)) {
-      const lowest = efforts.find((effort) => effort !== "none") ?? null;
-      reasoningLevel = lowest;
-      if (lowest !== null) why.push(`Lowest reasoning level its model offers (${lowest}): this seat reads more than it writes`);
-    } else if (preset === "max-depth" && PRESET_DEPTH_SEATS.includes(key)) {
-      const highest = efforts.at(-1) ?? null;
-      reasoningLevel = highest;
-      if (highest !== null) why.push(`Highest reasoning level its model offers (${highest})`);
-    }
-    else if (providerId === current.providerId && current.reasoningLevel !== null) {
-      // A level the person set stays while the seat keeps its provider and model; a seat that moves starts from defaults.
-      reasoningLevel = current.reasoningLevel;
-      why.push(`Keeps the reasoning level you set (${reasoningLevel})`);
-    }
-    if (reasoningLevel === null) why.push(`The model's default reasoning level${entry === undefined ? "" : ` (${entry.defaultReasoningEffort})`}`);
-    const reviewer = PRESET_REVIEWER_SEATS.includes(key);
-    if (reviewer) why.push("A reviewer seat: applied only if you tick it");
-    const proposed: AgentExec = { providerId, model, reasoningLevel };
-    const changed = proposed.providerId !== current.providerId || proposed.model !== current.model || proposed.reasoningLevel !== current.reasoningLevel;
-    seats.push({ key, current, proposed, why, changed, ticked: changed && !reviewer, reviewer });
-  }
-  return seats;
-}
-
 const median = (values: number[]): number | null => {
   if (values.length === 0) return null;
   const sorted = [...values].sort((a, b) => a - b);
@@ -1203,14 +1075,9 @@ const deleteResultSchema = z.object({
   threadsArchived: z.number(),
 });
 
-/** Reasoning levels bb understands; each model lists the ones it offers. */
-const REASONING_LEVELS = ["none", "low", "medium", "high", "xhigh", "max", "ultra", "ultracode"] as const;
 // BB 0.47 allows provider-defined reasoning identifiers.
 type ReasoningLevel = string;
 
-/** Agents whose provider, model and reasoning level the person picks: every role plus the trial comparison. */
-const AGENT_KEYS = [...ROLE_IDS, "comparison"] as const;
-type AgentKey = (typeof AGENT_KEYS)[number];
 const agentExecSchema = z.object({
   providerId: z.string().trim().min(1).max(100),
   /** null: the provider's default model. */
@@ -1241,10 +1108,6 @@ const DEFAULT_PROVIDERS: Record<AgentKey, string> = {
   designreview: "codex",
   comparison: "claude-code",
 };
-const AGENT_LABELS: Record<AgentKey, string> = {
-  ...Object.fromEntries(ROLE_IDS.map((role) => [role, ROLES[role].label])),
-  comparison: "Reviewer trial comparison",
-} as Record<AgentKey, string>;
 /** Published when an agent's provider, model or reasoning level changes. */
 const AGENTS_CHANGED = "agents-changed";
 const agentsViewSchema = z.object({
@@ -1276,8 +1139,12 @@ const presetPreviewSchema = z.object({
     ticked: z.boolean(),
     reviewer: z.boolean(),
   })),
-  /** The roster check's warnings for the roster as proposed, ticked seats applied. */
+  /** The roster check's warnings for the roster as proposed, default ticks applied. */
   warnings: z.array(z.object({ id: z.string(), title: z.string(), detail: z.string() })),
+  /** What the page needs to check the roster again as the person ticks seats. */
+  roster: z.record(z.string(), agentExecSchema),
+  providers: z.array(z.object({ id: z.string(), available: z.boolean() })),
+  shadowOn: z.boolean(),
 });
 export type PresetPreview = z.infer<typeof presetPreviewSchema>;
 
@@ -1476,7 +1343,8 @@ export const rpcContract = defineRpcContract({
     output: presetPreviewSchema,
   },
   agents_preset_apply: {
-    input: z.object({ preset: z.enum(ROSTER_PRESETS), keys: z.array(z.enum(AGENT_KEYS)).max(20) }),
+    /** Each seat the person ticked, with the proposal they saw: a different one now is refused. */
+    input: z.object({ preset: z.enum(ROSTER_PRESETS), seats: z.array(z.object({ key: z.enum(AGENT_KEYS), proposed: agentExecSchema })).min(1).max(20) }),
     output: agentsViewSchema,
   },
   agent_set: {
@@ -1878,40 +1746,63 @@ export default async function plugin(bb: BbPluginApi) {
     const { shadowMode } = await settings.get();
     return rosterWarnings((agents ?? (await readAgents())).roles, providers, { shadowOn: shadowMode !== "off" });
   }
-  /** The providers and models on this machine, as presets see them. A provider whose models can't be read offers no reasoning levels. */
+  /**
+   * The providers and models on this machine, as presets see them, read once and in parallel. A
+   * provider list that can't be read stops the preset rather than reading as "nothing available";
+   * a provider whose models can't be read has no entry, and presets leave its seats' levels alone.
+   */
   async function rosterCatalog(): Promise<RosterCatalog> {
-    const providers = (await listProviders()) ?? [];
+    const providers = await listProviders();
+    if (providers === null) {
+      throw new PluginCliError("Couldn't read the providers on this machine, so no preset can be proposed.", { code: "preset_providers_unreadable", hint: "Try again in a moment; `bb provider list` shows what bb sees." });
+    }
     const models: Record<string, CatalogModel[]> = {};
-    for (const provider of providers.filter((entry) => entry.available)) {
+    await Promise.all(providers.filter((entry) => entry.available).map(async (provider) => {
       try {
         const { models: list } = await bb.sdk.providers.models({ providerId: provider.id });
-        models[provider.id] = list.map((entry) => ({ id: entry.id, isDefault: entry.isDefault, defaultReasoningEffort: entry.defaultReasoningEffort, efforts: entry.supportedReasoningEfforts.map((effort) => effort.reasoningEffort) }));
+        models[provider.id] = list.map((entry) => ({ id: entry.id, model: entry.model, isDefault: entry.isDefault, defaultReasoningEffort: entry.defaultReasoningEffort, efforts: entry.supportedReasoningEfforts.map((effort) => effort.reasoningEffort) }));
       } catch (error) {
         bb.log.warn(`could not read ${provider.id}'s models for a preset: ${String(error)}`);
       }
-    }
+    }));
     return { providers, models };
   }
-  async function presetPreview(preset: RosterPreset): Promise<PresetPreview> {
+  async function presetPreview(preset: RosterPreset, catalog?: RosterCatalog): Promise<PresetPreview> {
     const agents = await readAgents();
-    const seats = computePreset(preset, agents.roles, await rosterCatalog());
+    catalog ??= await rosterCatalog();
+    const seats = computePreset(preset, agents.roles, catalog);
     const proposed = { ...agents.roles };
     for (const seat of seats) if (seat.ticked) proposed[seat.key as AgentKey] = seat.proposed;
-    const { shadowMode } = await settings.get();
+    const shadowOn = (await settings.get()).shadowMode !== "off";
     return {
       preset,
       label: ROSTER_PRESET_LABELS[preset],
       seats: seats.map((seat) => ({ ...seat, key: seat.key as AgentKey, label: AGENT_LABELS[seat.key as AgentKey] })),
-      warnings: rosterWarnings(proposed, await listProviders(), { shadowOn: shadowMode !== "off" }),
+      warnings: rosterWarnings(proposed, catalog.providers, { shadowOn }),
+      roster: agents.roles,
+      providers: [...catalog.providers],
+      shadowOn,
     };
   }
-  /** Applies the named seats of a fresh proposal, each checked like a change made by hand. The person only: the callers check. */
-  async function applyPreset(preset: RosterPreset, keys: readonly string[]): Promise<string[]> {
+  /**
+   * Applies the seats the person chose, each exactly as they saw it proposed. A proposal recomputed
+   * now must match, so a roster or provider change since the preview is refused rather than
+   * applied unseen. Proposals come from the catalog, so they need no separate check against it.
+   * The person only: the callers check.
+   */
+  async function applyPreset(preset: RosterPreset, chosen: readonly { key: string; proposed: AgentExec }[], catalog?: RosterCatalog): Promise<string[]> {
     const agents = await readAgents();
-    const seats = computePreset(preset, agents.roles, await rosterCatalog()).filter((seat) => keys.includes(seat.key) && seat.changed);
-    for (const seat of seats) await validateExec(seat.key as AgentKey, seat.proposed);
+    const fresh = computePreset(preset, agents.roles, catalog ?? (await rosterCatalog()));
+    const stale = () => new PluginCliError("The roster or the providers changed since this preview, so nothing was applied.", { code: "preset_stale", hint: "Look at the preset again and apply what it shows now." });
+    const seats = chosen.map(({ key, proposed }) => {
+      const seat = fresh.find((entry) => entry.key === key);
+      if (seat === undefined) throw new PluginCliError(`Not a preset seat: ${key}.`, { code: "preset_seat_unknown", hint: `Seats: ${PRESET_SEATS.join(", ")}.` });
+      if (!sameExec(seat.proposed, proposed)) throw stale();
+      return seat;
+    }).filter((seat) => seat.changed);
     if (seats.length > 0) {
       await writeAgents((current) => {
+        if (seats.some((seat) => !sameExec(current.roles[seat.key as AgentKey], seat.current))) throw stale();
         for (const seat of seats) current.roles[seat.key as AgentKey] = seat.proposed;
       });
     }
@@ -5824,9 +5715,9 @@ ${findings}`;
     },
     agents_get: async () => agentsView(),
     agents_preset_preview: async ({ preset }) => presetPreview(preset),
-    agents_preset_apply: async ({ preset, keys }, ctx) => {
+    agents_preset_apply: async ({ preset, seats }, ctx) => {
       if (ctx.experimental_caller?.kind !== "client") throw new Error("Only the plugin settings page can apply a preset.");
-      await applyPreset(preset, keys);
+      await applyPreset(preset, seats);
       return agentsView();
     },
     agent_set: async (input, ctx) => {
@@ -5944,10 +5835,14 @@ ${findings}`;
           async run(input, ctx) {
             const preset = z.enum(ROSTER_PRESETS).safeParse(input.positionals.preset);
             if (!preset.success) throw new PluginCliError(`The preset is ${ROSTER_PRESETS.join(", ")}.`, { code: "preset_input" });
-            const preview = await presetPreview(preset.data);
+            const named = input.options.seats?.split(",").map((key) => key.trim()).filter((key) => key !== "");
+            if (named !== undefined && !input.options.apply) throw new PluginCliError("--seats only works with --apply.", { code: "preset_input", hint: "Preview first without --seats, then apply with --apply --seats …." });
+            if (named !== undefined && named.length === 0) throw new PluginCliError("--seats needs at least one seat.", { code: "preset_input", hint: `Seats: ${PRESET_SEATS.join(", ")}.` });
+            const catalog = await rosterCatalog();
+            const preview = await presetPreview(preset.data, catalog);
             if (!input.options.apply) {
               if (input.options.json) return { exitCode: 0, stdout: JSON.stringify(preview) };
-              const show = (exec: AgentExec) => `${exec.providerId} · ${exec.model ?? "default model"} · ${exec.reasoningLevel ?? "default reasoning"}`;
+              const show = showExec;
               const lines = [`${preview.label} preset. Ticked seats change with --apply; reviewer seats only when you name them with --seats.`, ""];
               for (const seat of preview.seats) {
                 lines.push(`${seat.changed ? (seat.ticked ? "[x]" : "[ ]") : "   "} ${seat.label}: ${seat.changed ? `${show(seat.current)} → ${show(seat.proposed)}` : `no change (${show(seat.current)})`}`);
@@ -5959,11 +5854,10 @@ ${findings}`;
             if (ctx.threadId !== undefined) {
               throw new PluginCliError("Only the person can change which model an agent runs on.", { code: "person_only", hint: "Run this from your own terminal, or use Settings → Plugins → Factory → Agents." });
             }
-            const named = input.options.seats?.split(",").map((key) => key.trim()).filter((key) => key !== "");
             const unknown = (named ?? []).filter((key) => !preview.seats.some((seat) => seat.key === key));
             if (unknown.length > 0) throw new PluginCliError(`Not a preset seat: ${unknown.join(", ")}.`, { code: "preset_seat_unknown", hint: `Seats: ${preview.seats.map((seat) => seat.key).join(", ")}.` });
-            const keys = named ?? preview.seats.filter((seat) => seat.ticked).map((seat) => seat.key);
-            const applied = await applyPreset(preset.data, keys);
+            const chosen = preview.seats.filter((seat) => (named === undefined ? seat.ticked : named.includes(seat.key)));
+            const applied = await applyPreset(preset.data, chosen, catalog);
             return { exitCode: 0, stdout: applied.length === 0 ? "Nothing changed: those seats already match the preset." : `Applied the ${preview.label} preset to ${applied.map((key) => AGENT_LABELS[key as AgentKey]).join(", ")}.` };
           },
         }),

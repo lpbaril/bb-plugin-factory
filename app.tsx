@@ -3,7 +3,7 @@
 // One page per factory (/plugins/factory/factory/<PREFIX>): the agents strip
 // on top, with live status from the host's own thread cache, and the board
 // below, read from the server and refetched on its "board-changed" signal.
-import { memo, useCallback, useEffect, useMemo, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { DragEvent, FormEvent, ReactNode } from "react";
 import {
   Markdown,
@@ -37,6 +37,7 @@ import type {
 } from "./server";
 import type { RepoInspection } from "./host-contract";
 import { DESIGN_LENS_LABELS, ROLES, TRACKS, WORKER_ROLE_IDS, type AssignableRoleId, type ProjectMode, type Track } from "./roles";
+import { ROSTER_PRESETS, ROSTER_PRESET_LABELS, ROSTER_PRESET_NOTES, rosterWarnings, showExec, type RosterPreset } from "./roster";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import {
@@ -2351,12 +2352,6 @@ function AgentsSettings() {
   );
 }
 
-const PRESETS = [
-  { id: "balanced", label: "Balanced", note: "Default models and reasoning, with reviews kept on other providers" },
-  { id: "lower-cost", label: "Lower cost", note: "Less reasoning on seats that read more than they write" },
-  { id: "max-depth", label: "Maximum depth", note: "More reasoning where judgment matters, and a third provider for Reviewer 2" },
-] as const;
-
 /** A preset's proposal for each seat, with why, to tick and apply. Reviewer seats start unticked: they stay the person's choice. */
 function PresetPicker({ onApplied }: { onApplied: (view: AgentsView) => void }) {
   const rpc = useRpc<typeof rpcContract>();
@@ -2364,48 +2359,71 @@ function PresetPicker({ onApplied }: { onApplied: (view: AgentsView) => void }) 
   const [ticked, setTicked] = useState<Set<string>>(new Set());
   const [pending, setPending] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const load = async (preset: (typeof PRESETS)[number]["id"]) => {
+  const [refreshed, setRefreshed] = useState(false);
+  const applying = useRef(false);
+  const load = useCallback(async (preset: RosterPreset, keepTicks?: ReadonlySet<string>) => {
     setPending(preset);
     setError(null);
     try {
       const next = await rpc.call("agents_preset_preview", { preset });
       setPreview(next);
-      setTicked(new Set(next.seats.filter((seat) => seat.ticked).map((seat) => seat.key)));
+      // After a refresh, the person's ticks stay on seats the preset still changes.
+      setTicked(new Set(next.seats.filter((seat) => (keepTicks === undefined ? seat.ticked : seat.changed && keepTicks.has(seat.key))).map((seat) => seat.key)));
     } catch (cause) {
       setError(errorText(cause));
     } finally {
       setPending(null);
     }
-  };
+  }, [rpc]);
+  // The roster changed elsewhere (a row below, the CLI): show the preset as it is now, not as it was.
+  const latest = useRef({ preview, ticked });
+  latest.current = { preview, ticked };
+  useRealtime("agents-changed", () => {
+    const { preview: open, ticked: chosen } = latest.current;
+    if (open === null || applying.current) return;
+    setRefreshed(true);
+    void load(open.preset, chosen);
+  });
   const apply = async () => {
     if (preview === null) return;
+    applying.current = true;
     setPending("apply");
     setError(null);
     try {
-      onApplied(await rpc.call("agents_preset_apply", { preset: preview.preset, keys: [...ticked] as PresetPreview["seats"][number]["key"][] }));
+      const seats = preview.seats.filter((seat) => ticked.has(seat.key)).map((seat) => ({ key: seat.key, proposed: seat.proposed }));
+      onApplied(await rpc.call("agents_preset_apply", { preset: preview.preset, seats }));
       setPreview(null);
+      setRefreshed(false);
     } catch (cause) {
       setError(errorText(cause));
     } finally {
+      applying.current = false;
       setPending(null);
     }
   };
-  const show = (exec: AgentExec) => `${exec.providerId} · ${exec.model ?? "default model"} · ${exec.reasoningLevel ?? "default reasoning"}`;
+  // The warnings for the roster as it would be with the seats ticked now.
+  const warnings = useMemo(() => {
+    if (preview === null) return [];
+    const roster = { ...preview.roster };
+    for (const seat of preview.seats) if (ticked.has(seat.key)) roster[seat.key] = seat.proposed;
+    return rosterWarnings(roster, preview.providers, { shadowOn: preview.shadowOn });
+  }, [preview, ticked]);
   return (
     <div className="space-y-2 rounded border border-border p-2.5">
       <div className="text-xs font-medium">Presets</div>
       <div className="flex flex-wrap gap-1">
-        {PRESETS.map((preset) => (
-          <Button key={preset.id} size="sm" variant="outline" aria-pressed={preview?.preset === preset.id} disabled={pending !== null} onClick={() => void load(preset.id)}>
-            {pending === preset.id ? "Loading…" : preset.label}
+        {ROSTER_PRESETS.map((preset) => (
+          <Button key={preset} size="sm" variant="outline" aria-pressed={preview?.preset === preset} disabled={pending !== null} onClick={() => { setRefreshed(false); void load(preset); }}>
+            {pending === preset ? "Loading…" : ROSTER_PRESET_LABELS[preset]}
           </Button>
         ))}
       </div>
       <p className="text-xs text-muted-foreground">
-        {preview === null ? "Built from the providers and models on this machine. Nothing changes until you apply it." : PRESETS.find((preset) => preset.id === preview.preset)?.note}
+        {preview === null ? "Built from the providers and models on this machine. Nothing changes until you apply it." : ROSTER_PRESET_NOTES[preview.preset]}
       </p>
       {preview === null ? null : (
         <>
+          {refreshed ? <p className="text-xs text-muted-foreground">The roster changed, so this preview was updated.</p> : null}
           <ul className="divide-y divide-border text-xs">
             {preview.seats.map((seat) => (
               <li key={seat.key} className="flex items-start gap-2 py-1.5">
@@ -2417,13 +2435,13 @@ function PresetPicker({ onApplied }: { onApplied: (view: AgentsView) => void }) 
                 />
                 <div className="min-w-0">
                   <div className="font-medium">{seat.label}{seat.reviewer ? " (reviewer: your choice)" : ""}</div>
-                  <div className="text-muted-foreground">{seat.changed ? `${show(seat.current)} → ${show(seat.proposed)}` : `No change: ${show(seat.current)}`}</div>
+                  <div className="text-muted-foreground">{seat.changed ? `${showExec(seat.current)} → ${showExec(seat.proposed)}` : `No change: ${showExec(seat.current)}`}</div>
                   <div className="text-muted-foreground">{seat.why.join(". ")}.</div>
                 </div>
               </li>
             ))}
           </ul>
-          {preview.warnings.map((warning) => (
+          {warnings.map((warning) => (
             <div key={warning.id} className="rounded border border-amber-500/50 p-2 text-xs">
               <div className="font-medium">{warning.title}</div>
               <div className="text-muted-foreground">{warning.detail}</div>
@@ -2433,7 +2451,7 @@ function PresetPicker({ onApplied }: { onApplied: (view: AgentsView) => void }) 
             <Button size="sm" disabled={pending !== null || ticked.size === 0} onClick={() => void apply()}>
               {pending === "apply" ? "Applying…" : `Apply to ${ticked.size} seat${ticked.size === 1 ? "" : "s"}`}
             </Button>
-            <Button size="sm" variant="ghost" disabled={pending !== null} onClick={() => setPreview(null)}>Cancel</Button>
+            <Button size="sm" variant="ghost" disabled={pending !== null} onClick={() => { setPreview(null); setRefreshed(false); }}>Cancel</Button>
           </div>
         </>
       )}
