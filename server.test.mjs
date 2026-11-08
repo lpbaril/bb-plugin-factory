@@ -10,7 +10,7 @@ registerHooks({ resolve(specifier, context, next) {
   }
   return next(specifier, context);
 } });
-const { default: plugin, supervisorAction, turnsFromEvents, creditUsage, mergeBlockers, sortChecks, latestRuns, mergeOverlapNote, migrateQaResults, qaCarryNote, leadMayMerge, rosterWarnings, computeHealth, parseDay, prsOpenedBetween, qaHold, qaNextStep, parseCoverage, changeRounds, fixLoopAdvice } = await import('./server.ts');
+const { default: plugin, trackGate, parseApproaches, exploreAssignment, readRecommendation, sectionText, supervisorAction, turnsFromEvents, creditUsage, mergeBlockers, sortChecks, latestRuns, mergeOverlapNote, migrateQaResults, qaCarryNote, leadMayMerge, rosterWarnings, computeHealth, parseDay, prsOpenedBetween, qaHold, qaNextStep, parseCoverage, changeRounds, fixLoopAdvice } = await import('./server.ts');
 const { leadCharter, leadPrompt, reReviewMessage, workerPrompt, workerReminder } = await import('./roles.ts');
 const { createFactoryStorage } = await import('./factory-storage.ts');
 
@@ -46,6 +46,7 @@ async function fixture(t, fallback = false, initial = {}, overrides = {}) {
     pluginId: 'factory', settings: { superviseAgents: true },
     experimental_callHostRpc: overrides.hostRpc,
     sdk: {
+      ...(overrides.environments === undefined ? {} : { environments: overrides.environments }),
       projects: { get: async () => ({ name: 'Test', gitRemoteUrl: overrides.gitRemoteUrl === undefined ? 'https://github.com/owner/repo.git' : overrides.gitRemoteUrl, sources: [{ hostId: 'host_test', isDefault: true, path: overrides.projectPath ?? null }] }), ...overrides.projects },
       providers: { models: async () => ({ models: [] }) },
       threads: {
@@ -4120,4 +4121,271 @@ test('an empty list of required checks means every check counts, not none', asyn
   assert.notEqual(refused.exitCode, 0);
   assert.match(refused.stderr, /CI isn't green: Security Scan/);
   assert.equal(merges().length, 0);
+});
+
+// ----- Phase 2: tracks and the Explorer -----
+
+const trackState = (over = {}) => ({ tracks: {}, plans: [], ...over });
+
+test('trackGate: the role picks a track, and a Builder waits for what the track asks', () => {
+  assert.equal(trackGate(trackState(), 'T-1', 'plan'), 'plan');
+  assert.equal(trackGate(trackState({ tracks: { 'T-1': 'direct' } }), 'T-1', 'explore'), 'explore');
+  assert.equal(trackGate(trackState(), 'T-1', 'build'), 'direct', 'a Builder on a task with no track makes it direct');
+  assert.equal(trackGate(trackState({ tracks: { 'T-1': 'direct' } }), 'T-1', 'build'), null);
+  assert.equal(trackGate(trackState({ tracks: { 'T-1': 'explore' } }), 'T-1', 'qa'), null, 'other roles leave the track alone');
+  assert.throws(() => trackGate(trackState({ tracks: { 'T-1': 'explore' } }), 'T-1', 'build'), error => error.code === 'track_explore' && /bb factory track T-1 direct/.test(error.hint));
+  assert.throws(() => trackGate(trackState({ tracks: { 'T-1': 'plan' } }), 'T-1', 'build'), error => error.code === 'plan_not_ready' && /Assign the Planner first/.test(error.hint));
+  assert.throws(() => trackGate(trackState({ tracks: { 'T-1': 'plan' }, plans: [{ taskKey: 'T-1', threadId: 'thr_p', commentId: null }] }), 'T-1', 'build'), error => error.code === 'plan_not_ready' && /plan-ready/.test(error.hint));
+  assert.equal(trackGate(trackState({ tracks: { 'T-1': 'plan' }, plans: [{ taskKey: 'T-1', threadId: 'thr_p', commentId: 'c1' }] }), 'T-1', 'build'), null);
+});
+
+test('parseApproaches, readRecommendation and exploreAssignment read what agents write', () => {
+  assert.deepEqual(parseApproaches('Context first.\n1. Use a queue\n2) Poll the table\n3. Extra', 2), ['Use a queue', 'Poll the table']);
+  assert.equal(parseApproaches('1. Use a queue', 2), null);
+  assert.equal(parseApproaches(null, 2), null);
+  for (const [line, expected] of [['Recommendation: build', 'build'], ['**Recommendation: plan**', 'plan'], ['`Recommendation: explore more`.', 'explore more'], ['Recommendation: Close.', 'close'], ['Recommendation: ship it', null], ['I recommend build', null]]) {
+    assert.equal(readRecommendation(`## Hypothesis\nx\n## Recommendation\n\n${line}\nBecause.`), expected, line);
+  }
+  assert.equal(readRecommendation('no section'), null);
+  assert.equal(sectionText('## What was learned\nIt works.\n## Next\nx', '## What was learned'), 'It works.');
+  assert.equal(sectionText('## What was learned\n' + 'a'.repeat(700), '## What was learned', 100).length, 100);
+  const now = Date.parse('2026-11-07T20:00:00Z');
+  assert.equal(exploreAssignment({ index: 1, of: 1, approach: null }, 45, now), 'Time box: 45 minutes, until 20:45 UTC. Record your report before then, with what you have.');
+  assert.match(exploreAssignment({ index: 2, of: 3, approach: 'Poll the table' }, 45, now), /You're candidate 2 of 3\. Try only this approach: Poll the table\./);
+});
+
+const tracksFixture = (t, initial = {}, overrides = {}) =>
+  fixture(t, false, { tracksEnabled: true, agents: [leadAgent], ...initial }, { threads: { list: async () => [] }, ...overrides });
+
+test('with tracks on, a Builder makes a task direct, plan waits for READY, and only the Lead or person moves it', async t => {
+  const posted = [];
+  const { harness, bb, spawns } = await tracksFixture(t, {}, { tasksRpc: async ({ method, input }) => { if (method === 'createComment') posted.push(input.body); return undefined; } });
+  const read = async () => (await createFactoryStorage(bb.storage, value => value).read('TEST'));
+  assert.equal((await harness.behavior.runCli(['assign', 'TEST-1', '--role', 'build'])).exitCode, 0);
+  assert.equal((await read()).tracks['TEST-1'], 'direct');
+  const asOther = await harness.behavior.runCli(['track', 'TEST-1', 'plan'], { threadId: 'thr_spawned_1' });
+  assert.notEqual(asOther.exitCode, 0);
+  assert.match(asOther.stderr, /Only the factory's Lead or the person can change a task's track/);
+  assert.equal((await harness.behavior.runCli(['track', 'TEST-1', 'plan'], { threadId: 'thr_lead' })).exitCode, 0);
+  const refused = await harness.behavior.runCli(['assign', 'TEST-1', '--role', 'build']);
+  assert.notEqual(refused.exitCode, 0);
+  assert.match(refused.stderr, /on the plan track, and its plan isn't READY yet/);
+  assert.equal(spawns.length, 1);
+  assert.equal((await harness.behavior.runCli(['track', 'TEST-1', 'direct'])).exitCode, 0, 'the person can too');
+  assert.equal((await harness.behavior.runCli(['assign', 'TEST-1', '--role', 'build'])).exitCode, 0, 'direct needs no plan, even after a Planner was asked');
+  assert.equal((await harness.behavior.runCli(['track', 'TEST-1'])).stdout, 'TEST-1: direct');
+  assert.match((await harness.behavior.runCli(['track', 'TEST-1', 'fast'])).stderr, /direct, plan or explore/);
+  assert.ok(posted.includes('Track: **plan**, set by the Lead.'), JSON.stringify(posted));
+  assert.ok(posted.includes('Track: **direct**, set by the person.'));
+});
+
+test('tracks off: no Explorer, no track changes, and the old plan gate', async t => {
+  const { harness, spawns } = await fixture(t, false, { agents: [leadAgent], plans: [{ taskKey: 'TEST-1', threadId: 'thr_p', commentId: null }] });
+  const explore = await harness.behavior.runCli(['assign', 'TEST-1', '--role', 'explore']);
+  assert.notEqual(explore.exitCode, 0);
+  assert.match(explore.stderr, /has tracks off, so it has no Explorer/);
+  assert.match((await harness.behavior.runCli(['track', 'TEST-1', 'plan'])).stderr, /has tracks off/);
+  assert.match((await harness.behavior.runCli(['assign', 'TEST-1', '--role', 'build'])).stderr, /waiting for its Planner/);
+  assert.equal(spawns.length, 0);
+  assert.equal((await harness.behavior.runCli(['tracks', 'TEST'])).stdout, 'TEST: tracks off');
+  assert.match((await harness.behavior.runCli(['tracks', 'TEST', 'on'], { threadId: 'thr_lead' })).stderr, /Only the person can change this/);
+  assert.equal((await harness.behavior.runCli(['tracks', 'TEST', 'on'])).exitCode, 0);
+  assert.equal((await harness.behavior.runCli(['tracks', 'TEST'])).stdout, 'TEST: tracks on');
+});
+
+test('an Explorer gets its own worktree, a time box and no Builder after it until the person decides', async t => {
+  const { harness, bb, spawns } = await tracksFixture(t);
+  const assigned = await harness.behavior.runCli(['assign', 'TEST-1', '--role', 'explore']);
+  assert.equal(assigned.exitCode, 0, assigned.stderr);
+  assert.match(assigned.stdout, /to an Explorer: thr_spawned_1\. The time box is 45 minutes/);
+  const spawn = spawns[0];
+  assert.equal(spawn.environment.workspace.type, 'managed-worktree');
+  assert.match(spawn.prompt, /# You are the Explorer/);
+  assert.match(spawn.prompt, /Time box: 45 minutes, until \d\d:\d\d UTC/);
+  assert.match(spawn.prompt, /never push, open a pull request or merge/);
+  assert.doesNotMatch(spawn.prompt, /candidate \d of/);
+  const factory = await createFactoryStorage(bb.storage, value => value).read('TEST');
+  assert.equal(factory.tracks['TEST-1'], 'explore');
+  assert.deepEqual(factory.explorations.map(entry => [entry.threadId, entry.candidate, entry.of, entry.ownWorktree]), [['thr_spawned_1', 1, 1, true]]);
+  assert.match((await harness.behavior.runCli(['assign', 'TEST-1', '--role', 'build'])).stderr, /on the explore track, so it doesn't get a Builder yet/);
+  const again = await harness.behavior.runCli(['assign', 'TEST-1', '--role', 'explore']);
+  assert.equal(again.exitCode, 0, 'its thread is idle, so another round can start');
+});
+
+test('a running exploration refuses a second round', async t => {
+  const running = { taskKey: 'TEST-1', threadId: 'thr_x', round: 'r1', candidate: 1, of: 1, approach: null, startedAt: new Date().toISOString(), timeboxMinutes: 45, ownWorktree: true };
+  const { harness, spawns } = await tracksFixture(t, { explorations: [running] }, { threads: { list: async () => [], get: async () => makeThreadResponse({ id: 'thr_x', status: 'active' }) } });
+  const refused = await harness.behavior.runCli(['assign', 'TEST-1', '--role', 'explore']);
+  assert.notEqual(refused.exitCode, 0);
+  assert.match(refused.stderr, /TEST-1 is already being explored \(thr_x\)/);
+  assert.equal(spawns.length, 0);
+});
+
+test('several candidates need one numbered approach each, and each is told only its own', async t => {
+  const { harness, spawns, bb } = await tracksFixture(t);
+  const missing = await harness.behavior.runCli(['assign', 'TEST-1', '--role', 'explore', '--candidates', '2', '--instructions', '1. Use a queue']);
+  assert.notEqual(missing.exitCode, 0);
+  assert.match(missing.stderr, /With 2 candidates, --instructions needs one numbered approach for each/);
+  assert.match((await harness.behavior.runCli(['assign', 'TEST-1', '--role', 'build', '--candidates', '2'])).stderr, /--candidates only applies to --role explore/);
+  assert.equal(spawns.length, 0);
+  const ok = await harness.behavior.runCli(['assign', 'TEST-1', '--role', 'explore', '--candidates', '2', '--instructions', 'Find the fastest import.\n1. Use a queue\n2. Poll the table', '--json']);
+  assert.equal(ok.exitCode, 0, ok.stderr);
+  assert.deepEqual(JSON.parse(ok.stdout).threadIds, ['thr_spawned_1', 'thr_spawned_2']);
+  assert.match(spawns[0].prompt, /You're candidate 1 of 2\. Try only this approach: Use a queue\./);
+  assert.match(spawns[1].prompt, /You're candidate 2 of 2\. Try only this approach: Poll the table\./);
+  const factory = await createFactoryStorage(bb.storage, value => value).read('TEST');
+  assert.equal(new Set(factory.explorations.map(entry => entry.round)).size, 1);
+});
+
+const report = (over = '') => `Factory exploration: queue\n\n## Hypothesis\nA queue is faster.\n## What was tried\nA spike.\n## What was learned\nIt halves the time.\n## Recommendation\nRecommendation: build${over}\nIt works.\n## Not checked\nLoad above 1k rows.`;
+const twoCandidates = () => ['Use a queue', 'Poll the table'].map((approach, index) => ({ taskKey: 'TEST-1', threadId: `thr_e${index + 1}`, round: 'r1', candidate: index + 1, of: 2, approach, startedAt: new Date().toISOString(), timeboxMinutes: 45, ownWorktree: true }));
+
+test('an Explorer records a complete report, and the Lead gets the comparison once all candidates have', async t => {
+  const task = { id: 'task_1', key: 'TEST-1', projectId: 'tracker', title: 'Test', description: '', status: 'in_progress', priority: 'none', position: 0, labelIds: [], createdAt: '', updatedAt: '' };
+  const { harness, comments, messages, bb } = await tracksFixture(t, { explorations: twoCandidates(), tracks: { 'TEST-1': 'explore' } }, { tasksRpc: async ({ method }) => (method === 'listTasks' ? { tasks: [task] } : undefined) });
+  comments.push(
+    { id: 'c_other', kind: 'agent', authorName: 'x', threadId: 'thr_e2', body: report(), createdAt: '' },
+    { id: 'c_bad', kind: 'agent', authorName: 'x', threadId: 'thr_e1', body: 'Factory exploration: short\n## Hypothesis\nx', createdAt: '' },
+    { id: 'c_rec', kind: 'agent', authorName: 'x', threadId: 'thr_e1', body: report().replace('Recommendation: build', 'Recommendation: ship it'), createdAt: '' },
+    { id: 'c1', kind: 'agent', authorName: 'x', threadId: 'thr_e1', body: report(), createdAt: '' },
+    { id: 'c2', kind: 'agent', authorName: 'x', threadId: 'thr_e2', body: report().replace('Recommendation: build', 'Recommendation: close'), createdAt: '' },
+  );
+  assert.match((await harness.behavior.runCli(['explore-report', 'TEST-1', '--comment', 'c1'], { threadId: 'thr_lead' })).stderr, /Only an Explorer on this task can record its report/);
+  assert.match((await harness.behavior.runCli(['explore-report', 'TEST-1', '--comment', 'c_other'], { threadId: 'thr_e1' })).stderr, /Post your report as a task comment from this thread first/, 'another thread\'s comment');
+  assert.match((await harness.behavior.runCli(['explore-report', 'TEST-1', '--comment', 'c_bad'], { threadId: 'thr_e1' })).stderr, /has these headings/);
+  assert.match((await harness.behavior.runCli(['explore-report', 'TEST-1', '--comment', 'c_rec'], { threadId: 'thr_e1' })).stderr, /must be exactly `Recommendation: build`/);
+  const first = await harness.behavior.runCli(['explore-report', 'TEST-1', '--comment', 'c1'], { threadId: 'thr_e1' });
+  assert.equal(first.exitCode, 0, first.stderr);
+  assert.match(first.stdout, /recommends build/);
+  assert.match((await harness.behavior.runCli(['explore-report', 'TEST-1', '--comment', 'c1'], { threadId: 'thr_e1' })).stderr, /already recorded/);
+  assert.equal(messages.filter(message => /candidates exploring/.test(message.input[0].text)).length, 0, 'not until both have reported');
+  assert.equal((await harness.behavior.runCli(['explore-report', 'TEST-1', '--comment', 'c2'], { threadId: 'thr_e2' })).exitCode, 0);
+  const told = messages.filter(message => /candidates exploring/.test(message.input[0].text));
+  assert.equal(told.length, 1);
+  assert.match(told[0].input[0].text, /All 2 candidates exploring TEST-1 have reported:\n1\. Use a queue: recommends build \(task comment c1\)\n2\. Poll the table: recommends close \(task comment c2\)/);
+  assert.match(told[0].input[0].text, /Only the person closes a task/);
+  const factory = await createFactoryStorage(bb.storage, value => value).read('TEST');
+  assert.deepEqual(factory.closeAdvice['TEST-1'].commentId, 'c2');
+  assert.equal(factory.explorations[0].learned, 'It halves the time.');
+  assert.match(factory.explorations[0].summary, /^Recommendation: build\nIt works\.$/);
+  const status = (await harness.behavior.runCli(['status', 'TEST'])).stdout;
+  assert.match(status, /Track explore · the Explorer recommends closing it \(comment c2\); only the person can/);
+  assert.match(status, /Explorer 1\/2 thr_e1 \(Use a queue\): recommends build · comment c1/);
+});
+
+test('the time box: a reminder near the end, the Lead told once past it, and the worktree deleted after the report', async t => {
+  const minutesAgo = minutes => new Date(Date.now() - minutes * 60_000).toISOString();
+  const explorations = [
+    { taskKey: 'TEST-1', threadId: 'thr_near', round: 'r1', candidate: 1, of: 1, approach: null, startedAt: minutesAgo(38), timeboxMinutes: 45, ownWorktree: true },
+    { taskKey: 'TEST-2', threadId: 'thr_over', round: 'r2', candidate: 1, of: 1, approach: null, startedAt: minutesAgo(50), timeboxMinutes: 45, ownWorktree: true },
+    { taskKey: 'TEST-3', threadId: 'thr_done', round: 'r3', candidate: 1, of: 1, approach: null, startedAt: minutesAgo(30), timeboxMinutes: 45, ownWorktree: true, reportCommentId: 'c9', recommendation: 'plan', reportedAt: minutesAgo(5), roundNotifiedAt: minutesAgo(5) },
+    { taskKey: 'TEST-4', threadId: 'thr_shared', round: 'r4', candidate: 1, of: 1, approach: null, startedAt: minutesAgo(30), timeboxMinutes: 45, ownWorktree: false, reportCommentId: 'c8', recommendation: 'build', reportedAt: minutesAgo(5), roundNotifiedAt: minutesAgo(5) },
+  ];
+  const deleted = [];
+  const archived = new Set();
+  const status = { thr_near: 'active', thr_over: 'active', thr_done: 'idle', thr_shared: 'idle' };
+  const branchCalls = [];
+  const { harness, messages, bb } = await tracksFixture(t, { explorations }, {
+    projectPath: '/repo/sand',
+    hostRpc: async ({ method, input }) => {
+      if (method === 'delete_explorer_branch') { branchCalls.push(input); return { deleted: true, missing: false, error: null }; }
+      return { code: 0, stdout: '[]', stderr: '' };
+    },
+    threads: {
+      // bb keeps listing an archived thread's branch, which is how the factory finds it after the worktree goes.
+      list: async ({ threadIds = [], archived }) => threadIds.filter(id => id === 'thr_done').map(id => ({ id, environmentBranchName: 'bb/test-3-explorer-csv-thr_done' })),
+      get: async ({ threadId }) => makeThreadResponse({ id: threadId, status: status[threadId], environmentId: `env_${threadId}`, archivedAt: archived.has(threadId) ? 1 : null }),
+      send: async args => { messages.push(args); return {}; },
+      archive: async ({ threadId }) => { archived.add(threadId); return {}; },
+    },
+    // As bb does: a worktree with a thread that isn't archived can't be deleted.
+    environments: { delete: async ({ environmentId }) => { if (!archived.has(environmentId.replace('env_', ''))) throw new Error('HTTP 409: Environment still has live threads'); deleted.push(environmentId); return { ok: true }; } },
+  });
+  for (let pass = 0; pass < 2; pass++) {
+    const service = harness.behavior.runService('explore-watch');
+    await new Promise(resolve => setTimeout(resolve, 60));
+    service.controller.abort();
+    await service.done;
+  }
+  const to = threadId => messages.filter(message => message.threadId === threadId).map(message => message.input[0].text);
+  assert.equal(to('thr_near').length, 1, 'reminded once');
+  assert.match(to('thr_near')[0], /About 7 minutes left in your 45-minute time box/);
+  const overrun = to('thr_lead').filter(text => /passed its 45-minute time box/.test(text));
+  assert.equal(overrun.length, 1, 'the Lead hears once');
+  assert.match(overrun[0], /TEST-2's Explorer \(thr_over\) passed its 45-minute time box without a report.*bb thread stop thr_over/);
+  assert.ok(!to('thr_lead').some(text => /TEST-1/.test(text)), 'not past it yet');
+  assert.deepEqual(deleted, ['env_thr_done'], 'only a worktree made for that Explorer, once it has reported and finished');
+  assert.deepEqual([...archived], ['thr_done'], 'its thread is archived first, and only its');
+  assert.deepEqual(branchCalls, [{ projectPath: '/repo/sand', branch: 'bb/test-3-explorer-csv-thr_done' }], 'then its local branch, once');
+  const factory = await createFactoryStorage(bb.storage, value => value).read('TEST');
+  const done = factory.explorations.find(entry => entry.threadId === 'thr_done');
+  assert.equal(done.branch, 'bb/test-3-explorer-csv-thr_done');
+  assert.ok(done.branchDeletedAt !== null);
+  assert.equal(factory.explorations.find(entry => entry.threadId === 'thr_shared').branchDeletedAt, null, 'not a branch the factory didn\'t make');
+  assert.ok(factory.explorations.find(entry => entry.threadId === 'thr_done').worktreeDeletedAt !== null);
+});
+
+test('a comparison that didn\'t reach the Lead is sent again on the next pass', async t => {
+  let down = true;
+  const sent = [];
+  const reported = twoCandidates().map((entry, index) => ({ ...entry, reportCommentId: `c${index + 1}`, recommendation: 'build', reportedAt: new Date().toISOString() }));
+  const { harness } = await tracksFixture(t, { explorations: reported }, {
+    threads: { list: async () => [], get: async ({ threadId }) => makeThreadResponse({ id: threadId, status: 'active' }), send: async args => { if (down) throw new Error('down'); sent.push(args); return {}; } },
+    environments: { delete: async () => ({ ok: true }) },
+  });
+  const pass = async () => { const service = harness.behavior.runService('explore-watch'); await new Promise(resolve => setTimeout(resolve, 60)); service.controller.abort(); await service.done; };
+  await pass();
+  assert.equal(sent.length, 0);
+  down = false;
+  await pass();
+  await pass();
+  assert.equal(sent.filter(message => /candidates exploring/.test(message.input[0].text)).length, 1);
+});
+
+test('the Planner can end with NEEDS SPIKE or RECOMMEND CLOSE instead of a plan', async t => {
+  const planner = { threadId: 'thr_planner', role: 'plan', taskKey: 'TEST-1', providerId: 'codex', createdAt: '', pr: null };
+  const { harness, comments, bb } = await tracksFixture(t, { agents: [leadAgent, planner], plans: [{ taskKey: 'TEST-1', threadId: 'thr_planner', commentId: null }], tracks: { 'TEST-1': 'plan' } });
+  comments.push(
+    { id: 'spike', kind: 'agent', authorName: 'Planner', threadId: 'thr_planner', body: 'Factory plan: NEEDS SPIKE\nTry a queue.', createdAt: '' },
+    { id: 'close', kind: 'agent', authorName: 'Planner', threadId: 'thr_planner', body: 'Factory plan: RECOMMEND CLOSE\nAlready done.', createdAt: '' },
+  );
+  assert.match((await harness.behavior.runCli(['plan-outcome', 'TEST-1', 'needs-spike', '--comment', 'spike'], { threadId: 'thr_lead' })).stderr, /Only this task's current Planner/);
+  assert.match((await harness.behavior.runCli(['plan-outcome', 'TEST-1', 'needs-spike', '--comment', 'close'], { threadId: 'thr_planner' })).stderr, /starts with "Factory plan: NEEDS SPIKE"/);
+  assert.match((await harness.behavior.runCli(['plan-outcome', 'TEST-1', 'later', '--comment', 'spike'], { threadId: 'thr_planner' })).stderr, /needs-spike or recommend-close/);
+  assert.equal((await harness.behavior.runCli(['plan-outcome', 'TEST-1', 'needs-spike', '--comment', 'spike'], { threadId: 'thr_planner' })).exitCode, 0);
+  let factory = await createFactoryStorage(bb.storage, value => value).read('TEST');
+  assert.equal(factory.tracks['TEST-1'], 'explore');
+  assert.equal((await harness.behavior.runCli(['plan-outcome', 'TEST-1', 'recommend-close', '--comment', 'close'], { threadId: 'thr_planner' })).exitCode, 0);
+  factory = await createFactoryStorage(bb.storage, value => value).read('TEST');
+  assert.deepEqual([factory.closeAdvice['TEST-1'].role, factory.closeAdvice['TEST-1'].commentId], ['plan', 'close']);
+});
+
+test('NEEDS SPIKE needs tracks on', async t => {
+  const planner = { threadId: 'thr_planner', role: 'plan', taskKey: 'TEST-1', providerId: 'codex', createdAt: '', pr: null };
+  const { harness, comments } = await fixture(t, false, { agents: [leadAgent, planner], plans: [{ taskKey: 'TEST-1', threadId: 'thr_planner', commentId: null }] });
+  comments.push({ id: 'spike', kind: 'agent', authorName: 'Planner', threadId: 'thr_planner', body: 'Factory plan: NEEDS SPIKE\nx', createdAt: '' });
+  assert.match((await harness.behavior.runCli(['plan-outcome', 'TEST-1', 'needs-spike', '--comment', 'spike'], { threadId: 'thr_planner' })).stderr, /has tracks off, so there's no explore track/);
+});
+
+test('the Factory page can set a track, and nothing else can call it', async t => {
+  const { harness, bb } = await tracksFixture(t);
+  await assert.rejects(harness.behavior.callRpc('task_set_track', { taskKey: 'TEST-1', track: 'plan' }, { experimental_caller: { kind: 'plugin', pluginId: 'other' } }), /Only the Factory page/);
+  const result = await harness.behavior.callRpc('task_set_track', { taskKey: 'TEST-1', track: 'plan' });
+  assert.equal(result.track, 'plan');
+  assert.equal((await createFactoryStorage(bb.storage, value => value).read('TEST')).tracks['TEST-1'], 'plan');
+});
+
+test('tracks reach the prompts and standing rules, within bb\'s limit', () => {
+  const on = leadCharter({ factoryName: 'BusinessOS', prefix: 'BOS', mergePolicy: 'person', evidenceContract: true, tracks: true });
+  assert.ok(on.length < 4096, `${on.length}`);
+  assert.match(on, /bb factory track <KEY> direct\|plan\|explore/);
+  assert.doesNotMatch(leadCharter({ factoryName: 'B', prefix: 'B', tracks: false }), /factory track/);
+  assert.match(leadPrompt({ factoryName: 'F', prefix: 'F', goal: null, tracks: true }), /## Tracks[\s\S]*--candidates 2/);
+  assert.doesNotMatch(leadPrompt({ factoryName: 'F', prefix: 'F', goal: null }), /## Tracks/);
+  const task = { key: 'T-1', title: 't', description: '' };
+  assert.match(workerPrompt({ role: 'plan', factoryName: 'F', prefix: 'F', task, instructions: null, builderThreadId: null, tracks: true }), /Factory plan: NEEDS SPIKE[\s\S]*recommend-close/);
+  assert.doesNotMatch(workerPrompt({ role: 'plan', factoryName: 'F', prefix: 'F', task, instructions: null, builderThreadId: null }), /NEEDS SPIKE/);
+  assert.match(workerReminder({ role: 'plan', factoryName: 'F', taskKey: 'T-1', tracks: true }), /NEEDS SPIKE/);
+  assert.match(workerReminder({ role: 'explore', factoryName: 'F', taskKey: 'T-1', evidenceContract: true }), /never push or open a pull request[\s\S]*## Not checked/);
+  for (const role of ['plan', 'explore', 'design']) assert.ok(workerReminder({ role, factoryName: 'BusinessOS', taskKey: 'BOS-123', evidenceContract: true, tracks: true }).length < 4096);
 });

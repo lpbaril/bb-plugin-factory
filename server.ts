@@ -21,8 +21,14 @@ import { hostContract, repoInspectionSchema, type RepoInspection } from "./host-
 import { createFactoryStorage } from "./factory-storage";
 import type { Lesson, RunCursor, RunRow } from "./factory-storage";
 import {
+  EXPLORE_RECOMMENDATIONS,
+  EXPLORE_REPORT_HEADINGS,
+  EXPLORE_TIMEBOX_MINUTES,
+  MAX_EXPLORE_CANDIDATES,
   MERGE_POLICIES,
   TASK_KINDS,
+  TRACKS,
+  type Track,
   PROJECT_MODES,
   PR_REVIEW_ROLES,
   ROLES,
@@ -304,6 +310,77 @@ export function branchRulesHold(mergeStateStatus: string | null | undefined): st
   if (mergeStateStatus === "BLOCKED") return "GitHub's rules for the base branch block it, for example a required check that hasn't reported yet or a required review";
   if (mergeStateStatus === "BEHIND") return "it's behind the base branch, and GitHub requires it to be up to date";
   return null;
+}
+
+/**
+ * With tracks on: the track an assignment puts the task on, or null to leave it, and a refusal when the
+ * track says this role can't start yet. Assigning plan or explore moves the task there; a Builder on a
+ * task with no track yet makes it direct. A Builder waits for a READY plan on plan, and on explore for
+ * the person to decide, which the Lead records by changing the track.
+ */
+export function trackGate(factory: Pick<Factory, "tracks" | "plans">, taskKey: string, role: WorkerRoleId): Track | null {
+  const current = factory.tracks[taskKey] ?? null;
+  if (role === "plan") return "plan";
+  if (role === "explore") return "explore";
+  if (role !== "build") return null;
+  if (current === null) return "direct";
+  if (current === "explore") {
+    throw new PluginCliError(`${taskKey} is on the explore track, so it doesn't get a Builder yet.`, {
+      code: "track_explore",
+      hint: `Once the exploration reports, the person decides how to continue. Then set the track with \`bb factory track ${taskKey} direct\` or \`plan\`.`,
+    });
+  }
+  if (current === "plan") {
+    const plan = factory.plans.find((entry) => entry.taskKey === taskKey);
+    if (plan === undefined || plan.commentId === null) {
+      throw new PluginCliError(`${taskKey} is on the plan track, and its plan isn't READY yet.`, {
+        code: "plan_not_ready",
+        hint: plan === undefined
+          ? `Assign the Planner first with \`bb factory assign ${taskKey} --role plan\`, or, if it's a small explicit change, set the track to direct.`
+          : "Resolve the Planner's questions; it must run bb factory plan-ready with its READY task comment.",
+      });
+    }
+  }
+  return null;
+}
+
+/** The approaches for several Explorers, one numbered line each ("1. ...", "2) ..."), or null if any is missing. */
+export function parseApproaches(instructions: string | null, count: number): string[] | null {
+  const found = new Map<number, string>();
+  for (const line of (instructions ?? "").split("\n")) {
+    const match = /^\s*(\d+)[.)]\s+(.+?)\s*$/.exec(line);
+    if (match !== null && !found.has(Number(match[1]))) found.set(Number(match[1]), match[2]!);
+  }
+  const approaches = Array.from({ length: count }, (_, index) => found.get(index + 1));
+  return approaches.every((approach) => approach !== undefined) ? approaches as string[] : null;
+}
+
+/** What an Explorer is told about its time box and, with several candidates, its approach. */
+export function exploreAssignment(candidate: { index: number; of: number; approach: string | null }, minutes: number, now = Date.now()): string {
+  const until = new Date(now + minutes * 60_000).toISOString().slice(11, 16);
+  const box = `Time box: ${minutes} minutes, until ${until} UTC. Record your report before then, with what you have.`;
+  if (candidate.of === 1) return box;
+  return `${box}\n\nYou're candidate ${candidate.index} of ${candidate.of}. Try only this approach: ${candidate.approach}. The other candidates are trying the others; don't switch to theirs.`;
+}
+
+/** The first line under "## Recommendation", or null if it isn't one of the allowed ones. */
+export function readRecommendation(body: string): (typeof EXPLORE_RECOMMENDATIONS)[number] | null {
+  const section = body.split("## Recommendation")[1];
+  // Agents often bold or quote it: **Recommendation: plan**, `Recommendation: build`.
+  const line = section?.split("\n").map((entry) => entry.replace(/[`*_]/g, "").trim()).find((entry) => entry !== "");
+  const match = /^Recommendation:\s*(.+?)\.?\s*$/i.exec(line ?? "");
+  const value = match?.[1]?.toLowerCase().trim();
+  return (EXPLORE_RECOMMENDATIONS as readonly string[]).includes(value ?? "") ? value as (typeof EXPLORE_RECOMMENDATIONS)[number] : null;
+}
+/** A heading's text, up to the next heading, shortened for the comparison. */
+export function sectionText(body: string, heading: string, max = 600): string | null {
+  const start = body.indexOf(heading);
+  if (start < 0) return null;
+  const rest = body.slice(start + heading.length);
+  const end = rest.search(/\n## /);
+  const text = (end < 0 ? rest : rest.slice(0, end)).trim();
+  if (text === "") return null;
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
 }
 
 /** The factory's Lead merges only under `when-green`, and never a large or sensitive PR. */
@@ -601,6 +678,34 @@ export function computeHealth(prs: readonly Pr[], tokensByTask: ReadonlyMap<stri
   };
 }
 
+/** One Explorer's run. Candidates started together share a round and are compared once all have reported. */
+const explorationSchema = z.object({
+  taskKey: z.string(),
+  threadId: z.string(),
+  round: z.string(),
+  candidate: z.number(),
+  of: z.number(),
+  approach: z.string().nullable(),
+  startedAt: z.string(),
+  timeboxMinutes: z.number(),
+  /** Whether it got its own worktree, the only kind the factory deletes after the report. */
+  ownWorktree: z.boolean(),
+  reportCommentId: z.string().nullable().default(null),
+  recommendation: z.enum(EXPLORE_RECOMMENDATIONS).nullable().default(null),
+  /** The report's recommendation and what was learned, shortened, for the comparison. */
+  summary: z.string().nullable().default(null),
+  learned: z.string().nullable().default(null),
+  reportedAt: z.string().nullable().default(null),
+  remindedAt: z.string().nullable().default(null),
+  overrunNotifiedAt: z.string().nullable().default(null),
+  roundNotifiedAt: z.string().nullable().default(null),
+  worktreeDeletedAt: z.string().nullable().default(null),
+  /** Its local branch, read before the worktree goes; deleting the worktree leaves the branch. */
+  branch: z.string().nullable().default(null),
+  branchDeletedAt: z.string().nullable().default(null),
+});
+export type Exploration = z.infer<typeof explorationSchema>;
+
 const factorySchema = z.object({
   /** The tracker prefix, which is also the factory's id. */
   prefix: z.string(),
@@ -629,6 +734,12 @@ const factorySchema = z.object({
   qaResults: z.record(z.string(), qaResultSchema).default({}),
   /** Tasks marked as coordination or person-owned, which are never reported as stalled. */
   taskKinds: z.record(z.string(), z.enum(TASK_KINDS)).default({}),
+  /** Tracks: on for new factories, and a person's choice for existing ones. */
+  tracksEnabled: z.boolean().default(false),
+  tracks: z.record(z.string(), z.enum(TRACKS)).default({}),
+  explorations: z.array(explorationSchema).default([]),
+  /** A Planner's or Explorer's advice to close a task, which only the person can act on. */
+  closeAdvice: z.record(z.string(), z.object({ role: z.enum(["plan", "explore"]), threadId: z.string(), commentId: z.string(), at: z.string() })).default({}),
 });
 export type Factory = z.infer<typeof factorySchema>;
 
@@ -653,6 +764,11 @@ const boardTaskSchema = z.object({
   priority: z.string(),
   updatedAt: z.string(),
   pr: prSummarySchema.nullable(),
+  /** Null when the factory has tracks off or the task has none yet. */
+  track: z.enum(TRACKS).nullable().default(null),
+  /** The task's latest exploration round, for the side-by-side comparison. */
+  exploration: z.array(explorationSchema.pick({ threadId: true, candidate: true, of: true, approach: true, startedAt: true, timeboxMinutes: true, reportCommentId: true, recommendation: true, summary: true, learned: true })).nullable().default(null),
+  closeAdvice: z.object({ role: z.enum(["plan", "explore"]), commentId: z.string() }).nullable().default(null),
 });
 export type BoardTask = z.infer<typeof boardTaskSchema>;
 
@@ -756,6 +872,7 @@ export type AgentsConfig = { roles: Record<AgentKey, AgentExec>; shadowCustomMod
 const DEFAULT_PROVIDERS: Record<AgentKey, string> = {
   lead: "claude-code",
   plan: "claude-code",
+  explore: "claude-code",
   build: "claude-code",
   qa: "codex",
   design: "claude-code",
@@ -955,6 +1072,10 @@ export const rpcContract = defineRpcContract({
     input: z.object({ prefix: z.string(), pr: z.number().int().positive(), headSha: z.string().regex(/^[0-9a-f]{40}$/) }),
     output: z.object({ ok: z.boolean(), message: z.string() }),
   },
+  task_set_track: {
+    input: z.object({ taskKey: z.string(), track: z.enum(TRACKS) }),
+    output: z.object({ track: z.enum(TRACKS) }),
+  },
   task_assign: {
     input: z.object({
       taskKey: z.string(),
@@ -1117,7 +1238,7 @@ const LEGACY_REASONING = ["default", "low", "medium", "high", "xhigh", "max"];
  */
 const LEGACY_AGENT_SETTINGS = {
   ...Object.fromEntries(
-    ROLE_IDS.filter((role) => role !== "shadow").map((role) => [
+    ROLE_IDS.filter((role) => role !== "shadow" && role !== "explore").map((role) => [
       `${role}Provider`,
       // What these settings have always defaulted to, so an unset value on an old install reads as what it ran on.
       { type: "select", label: `${ROLES[role].label} runs on (moving to Agents)`, options: LEGACY_PROVIDERS, default: role === "review1" ? "claude-code" : DEFAULT_PROVIDERS[role] },
@@ -1126,7 +1247,7 @@ const LEGACY_AGENT_SETTINGS = {
   shadowProvider: { type: "select", label: "Shadow security reviewer runs on (moving to Agents)", options: LEGACY_PROVIDERS, default: "acp-cursor" },
   shadowModel: { type: "string", label: "Shadow security reviewer model (moving to Agents)", default: "gemini-4-argon-high" },
   ...Object.fromEntries(
-    AGENT_KEYS.map((key) => [
+    AGENT_KEYS.filter((key) => key !== "explore").map((key) => [
       `${key}Reasoning`,
       { type: "select", label: `${AGENT_LABELS[key]} reasoning level (moving to Agents)`, options: LEGACY_REASONING, default: "default" },
     ]),
@@ -1512,7 +1633,18 @@ export default async function plugin(bb: BbPluginApi) {
       priority: task.priority,
       updatedAt: task.updatedAt,
       pr: prSummary(factory, task.key),
+      track: factory.tracksEnabled ? factory.tracks[task.key] ?? null : null,
+      exploration: latestRound(factory, task.key)?.map((entry) => ({
+        threadId: entry.threadId, candidate: entry.candidate, of: entry.of, approach: entry.approach, startedAt: entry.startedAt,
+        timeboxMinutes: entry.timeboxMinutes, reportCommentId: entry.reportCommentId, recommendation: entry.recommendation, summary: entry.summary, learned: entry.learned,
+      })) ?? null,
+      closeAdvice: factory.closeAdvice[task.key] === undefined ? null : { role: factory.closeAdvice[task.key]!.role, commentId: factory.closeAdvice[task.key]!.commentId },
     };
+  }
+  /** The task's most recent exploration round, in candidate order, or null if it has none. */
+  function latestRound(factory: Pick<Factory, "explorations">, taskKey: string): Exploration[] | null {
+    const round = factory.explorations.filter((entry) => entry.taskKey === taskKey).at(-1)?.round;
+    return round === undefined ? null : factory.explorations.filter((entry) => entry.round === round).sort((a, b) => a.candidate - b.candidate);
   }
   function latestPr(factory: Factory, taskKey: string): Pr | null {
     const prs = factory.prs.filter((pr) => pr.taskKey === taskKey);
@@ -1602,9 +1734,9 @@ export default async function plugin(bb: BbPluginApi) {
     const entry = agentsByThread.get(threadId);
     if (entry === undefined || entry.factory.archivedAt !== null) return null;
     const { factory, agent } = entry;
-    if (agent.role === "lead") return leadCharter({ factoryName: factory.name, prefix: factory.prefix, mergePolicy: factory.mergePolicy, evidenceContract: factory.evidenceContract });
+    if (agent.role === "lead") return leadCharter({ factoryName: factory.name, prefix: factory.prefix, mergePolicy: factory.mergePolicy, evidenceContract: factory.evidenceContract, tracks: factory.tracksEnabled });
     if (agent.taskKey === null) return null;
-    return workerReminder({ role: agent.role, factoryName: factory.name, taskKey: agent.taskKey, evidenceContract: factory.evidenceContract });
+    return workerReminder({ role: agent.role, factoryName: factory.name, taskKey: agent.taskKey, evidenceContract: factory.evidenceContract, tracks: factory.tracksEnabled });
   });
   /** Serializes read-modify-write of one factory record; keep `change` free of slow I/O. */
   const factoryLocks = new Map<string, Promise<unknown>>();
@@ -1680,6 +1812,10 @@ export default async function plugin(bb: BbPluginApi) {
       evidenceContract: true,
       qaResults: {},
       taskKinds: {},
+      tracksEnabled: true,
+      tracks: {},
+      explorations: [],
+      closeAdvice: {},
       leadThreadId: null,
       agents: [],
       createdAt: new Date().toISOString(),
@@ -2113,7 +2249,7 @@ export default async function plugin(bb: BbPluginApi) {
       permissionMode: await permissionModeFor(providerId),
       title: `${currentFactory.name} · Lead`,
       pinned: true,
-      prompt: leadPrompt({ evidenceContract: currentFactory.evidenceContract, factoryName: currentFactory.name, prefix: currentFactory.prefix, goal, alignment, mergePolicy: currentFactory.mergePolicy }),
+      prompt: leadPrompt({ tracks: currentFactory.tracksEnabled, evidenceContract: currentFactory.evidenceContract, factoryName: currentFactory.name, prefix: currentFactory.prefix, goal, alignment, mergePolicy: currentFactory.mergePolicy }),
       pluginMetadata: { factory: currentFactory.prefix, role: "lead" },
     });
     await mutateFactory(currentFactory.prefix, (current) => {
@@ -2185,7 +2321,40 @@ export default async function plugin(bb: BbPluginApi) {
     finally { if (assignmentLocks.get(key) === pending) assignmentLocks.delete(key); }
   }
   function assign(args: Parameters<typeof assignUnlocked>[0]): Promise<string> {
+    if (args.role === "explore" && args.candidate === undefined) {
+      return startExploration({ taskKey: args.taskKey, instructions: args.instructions, candidates: 1 }).then((ids) => ids[0]!);
+    }
     return withTaskLock(args.taskKey, () => assignUnlocked(args));
+  }
+  /**
+   * One Explorer, or several candidates each trying one approach from the Lead's numbered list. They
+   * share a round, and the factory compares them once all have reported.
+   */
+  async function startExploration(args: { taskKey: string; instructions: string | null; candidates: number }): Promise<string[]> {
+    if (!Number.isInteger(args.candidates) || args.candidates < 1 || args.candidates > MAX_EXPLORE_CANDIDATES) {
+      throw new PluginCliError(`--candidates is 1 to ${MAX_EXPLORE_CANDIDATES}.`, { code: "explore_candidates" });
+    }
+    const approaches = args.candidates === 1 ? [null] : parseApproaches(args.instructions, args.candidates);
+    if (approaches === null) {
+      throw new PluginCliError(`With ${args.candidates} candidates, --instructions needs one numbered approach for each: "1. ..." to "${args.candidates}. ...".`, { code: "explore_approaches" });
+    }
+    return withTaskLock(args.taskKey, async () => {
+      const task = await getTaskByKey(args.taskKey);
+      const factory = await factoryForTaskKey(task.key);
+      const running = [];
+      for (const entry of latestRound(factory, task.key) ?? []) {
+        if (entry.reportCommentId === null && !(await threadDone(entry.threadId))) running.push(entry.threadId);
+      }
+      if (running.length > 0) {
+        throw new PluginCliError(`${task.key} is already being explored (${running.join(", ")}).`, { code: "explore_running", hint: "Wait for its report, or stop its Explorers first." });
+      }
+      const round = `${task.key}:${Date.now()}`;
+      const threads: string[] = [];
+      for (const [index, approach] of approaches.entries()) {
+        threads.push(await assignUnlocked({ taskKey: task.key, role: "explore", instructions: args.instructions, candidate: { round, index: index + 1, of: args.candidates, approach } }));
+      }
+      return threads;
+    });
   }
   async function markPlanReady(taskKey: string, commentId: string, threadId: string | null): Promise<void> {
     await withTaskLock(taskKey, async () => {
@@ -2208,12 +2377,216 @@ export default async function plugin(bb: BbPluginApi) {
     });
   }
 
+  // ----- Tracks and exploration -----
+
+  function isLeadThread(factory: Factory, threadId: string | null): boolean {
+    return threadId !== null && (threadId === factory.leadThreadId || factory.agents.some((agent) => agent.threadId === threadId && agent.role === "lead"));
+  }
+
+  /** Lead or person. Agents in other roles can't move a task around the gates. */
+  async function setTrack(taskKey: string, track: Track, threadId: string | null): Promise<Track> {
+    const task = await getTaskByKey(taskKey);
+    const factory = await factoryForTaskKey(task.key);
+    if (!factory.tracksEnabled) {
+      throw new PluginCliError(`${factory.prefix} has tracks off.`, { code: "tracks_off", hint: `Only the person can turn them on, with \`bb factory tracks ${factory.prefix} on\`.` });
+    }
+    if (threadId !== null && !isLeadThread(factory, threadId)) {
+      throw new PluginCliError("Only the factory's Lead or the person can change a task's track.", { code: "track_not_allowed" });
+    }
+    if (factory.tracks[task.key] === track) return track;
+    await mutateFactory(factory.prefix, (current) => { current.tracks[task.key] = track; });
+    await comment(task.id, `Track: **${track}**, set by ${threadId === null ? "the person" : "the Lead"}.`);
+    bb.realtime.publish(BOARD_CHANGED, { prefix: factory.prefix });
+    return track;
+  }
+
+  async function recordExploreReport(taskKey: string, commentId: string, threadId: string | null): Promise<Exploration> {
+    return withTaskLock(taskKey, async () => {
+      const task = await getTaskByKey(taskKey);
+      const factory = await factoryForTaskKey(task.key);
+      const entry = factory.explorations.find((candidate) => candidate.taskKey === task.key && candidate.threadId === threadId);
+      if (threadId === null || entry === undefined) {
+        throw new PluginCliError("Only an Explorer on this task can record its report.", { code: "not_the_explorer" });
+      }
+      if (entry.reportCommentId !== null) {
+        throw new PluginCliError(`Your report is already recorded: task comment ${entry.reportCommentId}.`, { code: "explore_reported" });
+      }
+      const { comments } = await tasksRpc("listComments", { taskId: task.id }, z.object({ comments: z.array(commentSchema) }));
+      const document = comments.find((candidate) => candidate.id === commentId && candidate.kind === "agent" && candidate.threadId === threadId);
+      if (document === undefined || !document.body.startsWith("Factory exploration:") || !EXPLORE_REPORT_HEADINGS.every((heading) => document.body.includes(heading))) {
+        throw new PluginCliError(`Post your report as a task comment from this thread first. It starts with "Factory exploration:" and has these headings: ${EXPLORE_REPORT_HEADINGS.map((heading) => `"${heading}"`).join(", ")}.`, { code: "explore_report_incomplete" });
+      }
+      const recommendation = readRecommendation(document.body);
+      if (recommendation === null) {
+        throw new PluginCliError("The first line under \"## Recommendation\" must be exactly `Recommendation: build`, `Recommendation: plan`, `Recommendation: explore more` or `Recommendation: close`.", { code: "explore_recommendation" });
+      }
+      const now = new Date().toISOString();
+      const recorded = await mutateFactory(factory.prefix, (current) => {
+        const target = current.explorations.find((candidate) => candidate.threadId === threadId && candidate.round === entry.round)!;
+        target.reportCommentId = document.id;
+        target.recommendation = recommendation;
+        target.summary = sectionText(document.body, "## Recommendation");
+        target.learned = sectionText(document.body, "## What was learned");
+        target.reportedAt = now;
+        if (recommendation === "close") current.closeAdvice[task.key] = { role: "explore", threadId, commentId: document.id, at: now };
+        return { ...target };
+      });
+      const which = entry.of > 1 ? ` (candidate ${entry.candidate} of ${entry.of}${entry.approach === null ? "" : `: ${entry.approach}`})` : "";
+      await comment(task.id, `**Exploration report**${which}: recommends **${recommendation}** · comment \`${document.id}\``);
+      bb.realtime.publish(BOARD_CHANGED, { prefix: factory.prefix });
+      await announceRound(factory.prefix, entry.round);
+      return recorded;
+    });
+  }
+
+  /** Once every candidate of a round has reported, the Lead gets the recommendation or the comparison, once. */
+  async function announceRound(prefix: string, round: string): Promise<void> {
+    const factory = await findFactory(prefix);
+    const entries = factory.explorations.filter((entry) => entry.round === round).sort((a, b) => a.candidate - b.candidate);
+    if (entries.length === 0 || entries.some((entry) => entry.reportCommentId === null || entry.roundNotifiedAt !== null)) return;
+    const key = entries[0]!.taskKey;
+    const next = `Show the person ${entries.length === 1 ? "the report" : "this comparison, which is also on the Factory page,"} and ask how to continue: set the track with \`bb factory track ${key} direct\` or \`plan\`, explore again, or, if they choose to, close the task. Only the person closes a task.`;
+    const text = entries.length === 1
+      ? `[factory] ${key}'s exploration has reported: it recommends ${entries[0]!.recommendation} (task comment ${entries[0]!.reportCommentId}). ${next}`
+      : `[factory] All ${entries.length} candidates exploring ${key} have reported:\n${entries.map((entry) => `${entry.candidate}. ${entry.approach ?? "approach not named"}: recommends ${entry.recommendation} (task comment ${entry.reportCommentId})`).join("\n")}\n\n${next}`;
+    if (!(await tellLead(factory, text))) return;
+    const now = new Date().toISOString();
+    await mutateFactory(prefix, (current) => {
+      for (const entry of current.explorations) if (entry.round === round) entry.roundNotifiedAt = now;
+    });
+  }
+
+  /**
+   * Each pass: remind an Explorer near the end of its time box, tell the Lead once when it runs past, retry
+   * a comparison that didn't reach the Lead, and delete the worktree of an Explorer that has reported and
+   * finished, archiving its thread first, then its local branch. Only a worktree the factory made for that Explorer is ever deleted.
+   */
+  /** Logged once per Explorer: the watch retries every minute. */
+  const worktreeDeleteWarned = new Set<string>();
+  async function maintainExplorations(prefix: string, now = Date.now()): Promise<void> {
+    const factory = await findFactory(prefix);
+    for (const entry of factory.explorations) {
+      const elapsed = now - Date.parse(entry.startedAt);
+      const box = entry.timeboxMinutes * 60_000;
+      if (entry.reportCommentId === null) {
+        if (entry.remindedAt === null && elapsed >= box * 0.8) {
+          const left = Math.max(1, Math.round((box - elapsed) / 60_000));
+          if (!(await threadDone(entry.threadId))) {
+            await tellThread(entry.threadId, `[factory] About ${left} minute${left === 1 ? "" : "s"} left in your ${entry.timeboxMinutes}-minute time box. Wrap up and record your report with what you have: \`bb factory explore-report ${entry.taskKey} --comment <comment-id>\`.`);
+          }
+          await mutateFactory(prefix, (current) => {
+            const target = current.explorations.find((candidate) => candidate.threadId === entry.threadId && candidate.round === entry.round);
+            if (target !== undefined) target.remindedAt = new Date(now).toISOString();
+          });
+        }
+        if (entry.overrunNotifiedAt === null && elapsed >= box) {
+          const told = await tellLead(factory, `[factory] ${entry.taskKey}'s Explorer (${entry.threadId}) passed its ${entry.timeboxMinutes}-minute time box without a report. Ask it to record its report now with what it has, or stop it with \`bb thread stop ${entry.threadId}\`.`);
+          if (told) {
+            await mutateFactory(prefix, (current) => {
+              const target = current.explorations.find((candidate) => candidate.threadId === entry.threadId && candidate.round === entry.round);
+              if (target !== undefined) target.overrunNotifiedAt = new Date(now).toISOString();
+            });
+          }
+        }
+        continue;
+      }
+      if (entry.roundNotifiedAt === null) await announceRound(prefix, entry.round);
+      if (entry.ownWorktree && entry.worktreeDeletedAt === null && (await threadDone(entry.threadId))) {
+        const thread = await bb.sdk.threads.get({ threadId: entry.threadId }).catch(() => null);
+        const branch = entry.branch ?? (await explorerBranch(factory, entry.threadId));
+        if (branch !== null && entry.branch === null) await updateExploration(prefix, entry, (target) => { target.branch = branch; });
+        try {
+          if (thread !== null && thread.environmentId !== null) {
+            // bb won't delete a worktree while a thread on it isn't archived. The report is on the task.
+            if (thread.archivedAt === null) await bb.sdk.threads.archive({ threadId: entry.threadId });
+            await bb.sdk.environments.delete({ environmentId: thread.environmentId });
+          }
+        } catch (error) {
+          if (!worktreeDeleteWarned.has(entry.threadId)) bb.log.warn(`could not delete the worktree of Explorer ${entry.threadId}: ${String(error)}`);
+          worktreeDeleteWarned.add(entry.threadId);
+          continue;
+        }
+        await updateExploration(prefix, entry, (target) => { target.worktreeDeletedAt = new Date(now).toISOString(); });
+        entry.worktreeDeletedAt = new Date(now).toISOString();
+      }
+      if (entry.ownWorktree && entry.worktreeDeletedAt !== null && entry.branchDeletedAt === null) {
+        await deleteExplorerBranch(factory, entry, now);
+      }
+    }
+  }
+  function updateExploration(prefix: string, entry: Pick<Exploration, "threadId" | "round">, change: (target: Exploration) => void): Promise<void> {
+    return mutateFactory(prefix, (current) => {
+      const target = current.explorations.find((candidate) => candidate.threadId === entry.threadId && candidate.round === entry.round);
+      if (target !== undefined) change(target);
+    });
+  }
+  /** The branch bb gave the Explorer's worktree. It's still listed once the thread is archived. */
+  async function explorerBranch(factory: Factory, threadId: string): Promise<string | null> {
+    for (const archived of [false, true]) {
+      const listed = await bb.sdk.threads.list({ projectId: factory.bbProjectId, threadIds: [threadId], includeHidden: true, archived }).catch(() => []);
+      const branch = listed.find((thread) => thread.id === threadId)?.environmentBranchName ?? null;
+      if (branch !== null) return branch;
+    }
+    return null;
+  }
+  /**
+   * The host worker deletes the branch only if it's named as an Explorer's, and git refuses one still
+   * checked out. A branch that isn't there needs nothing more; one the Explorer pushed stays on GitHub.
+   */
+  async function deleteExplorerBranch(factory: Factory, entry: Exploration, now: number): Promise<void> {
+    const branch = entry.branch ?? (await explorerBranch(factory, entry.threadId));
+    const done = () => updateExploration(factory.prefix, entry, (target) => { target.branch = branch; target.branchDeletedAt = new Date(now).toISOString(); });
+    if (branch === null) return done();
+    const { hostId, projectPath } = await projectHost(factory);
+    if (projectPath === null) return;
+    try {
+      const result = await host.call("delete_explorer_branch", { projectPath, branch }, { hostId, timeoutMs: 60_000 });
+      if (result.deleted || result.missing) return done();
+      if (!worktreeDeleteWarned.has(`branch:${entry.threadId}`)) bb.log.warn(`could not delete Explorer branch ${branch}: ${result.error}`);
+    } catch (error) {
+      if (!worktreeDeleteWarned.has(`branch:${entry.threadId}`)) bb.log.warn(`could not delete Explorer branch ${branch}: ${String(error)}`);
+    }
+    worktreeDeleteWarned.add(`branch:${entry.threadId}`);
+  }
+
+  /** A Planner ending without a plan: NEEDS SPIKE moves the task to explore; RECOMMEND CLOSE is advice for the person. */
+  async function recordPlanOutcome(taskKey: string, outcome: "needs-spike" | "recommend-close", commentId: string, threadId: string | null): Promise<void> {
+    await withTaskLock(taskKey, async () => {
+      const task = await getTaskByKey(taskKey);
+      const factory = await factoryForTaskKey(task.key);
+      const plan = factory.plans.find((entry) => entry.taskKey === task.key);
+      if (threadId === null || plan?.threadId !== threadId) {
+        throw new PluginCliError("Only this task's current Planner can record its outcome.", { code: "not_the_planner" });
+      }
+      if (outcome === "needs-spike" && !factory.tracksEnabled) {
+        throw new PluginCliError(`${factory.prefix} has tracks off, so there's no explore track. Post a DRAFT plan and block the task instead.`, { code: "tracks_off" });
+      }
+      const marker = outcome === "needs-spike" ? "Factory plan: NEEDS SPIKE" : "Factory plan: RECOMMEND CLOSE";
+      const { comments } = await tasksRpc("listComments", { taskId: task.id }, z.object({ comments: z.array(commentSchema) }));
+      const document = comments.find((entry) => entry.id === commentId && entry.kind === "agent" && entry.threadId === threadId);
+      if (document === undefined || !document.body.startsWith(marker)) {
+        throw new PluginCliError(`Post a task comment from this Planner that starts with "${marker}" first.`, { code: "plan_outcome_comment" });
+      }
+      const now = new Date().toISOString();
+      await mutateFactory(factory.prefix, (current) => {
+        if (outcome === "needs-spike") current.tracks[task.key] = "explore";
+        else current.closeAdvice[task.key] = { role: "plan", threadId, commentId: document.id, at: now };
+      });
+      await comment(task.id, outcome === "needs-spike"
+        ? `**Planner: needs a spike** · comment \`${document.id}\`. Track: **explore**.`
+        : `**Planner: recommends closing** · comment \`${document.id}\`. Only the person can close the task.`);
+      bb.realtime.publish(BOARD_CHANGED, { prefix: factory.prefix });
+    });
+  }
+
   async function assignUnlocked(args: {
     taskKey: string;
     role: WorkerRoleId;
     instructions: string | null;
     pr?: { number: number; url: string } | null;
     findings?: string | null;
+    /** An Explorer: which candidate of its round, and the approach it was given. */
+    candidate?: { round: string; index: number; of: number; approach: string | null };
   }): Promise<string> {
     const task = await getTaskByKey(args.taskKey);
     const factory = await factoryForTaskKey(task.key);
@@ -2225,7 +2598,12 @@ export default async function plugin(bb: BbPluginApi) {
       });
     }
     const plan = factory.plans.find((entry) => entry.taskKey === task.key);
-    if (args.role === "build" && plan !== undefined && plan.commentId === null) {
+    const track = factory.tracksEnabled ? trackGate(factory, task.key, args.role) : null;
+    if (!factory.tracksEnabled && args.role === "explore") {
+      throw new PluginCliError(`${factory.prefix} has tracks off, so it has no Explorer.`, { code: "tracks_off", hint: `Only the person can turn them on, with \`bb factory tracks ${factory.prefix} on\`.` });
+    }
+    // With tracks on, the track decides: a direct task needs no plan, even if a Planner was asked earlier.
+    if (!factory.tracksEnabled && args.role === "build" && plan !== undefined && plan.commentId === null) {
       throw new PluginCliError(`${task.key} is waiting for its Planner to mark the plan ready.`, {
         code: "plan_not_ready", hint: "Resolve the Planner's questions; it must run bb factory plan-ready with its READY task comment.",
       });
@@ -2262,8 +2640,10 @@ export default async function plugin(bb: BbPluginApi) {
         factoryName: factory.name,
         prefix: factory.prefix,
         task,
+        tracks: factory.tracksEnabled,
         instructions: [
           args.instructions,
+          args.candidate === undefined ? null : exploreAssignment(args.candidate, EXPLORE_TIMEBOX_MINUTES),
           openPr === undefined || continuing === null ? null : `PR #${openPr.number} is already open for ${task.key}, on this worktree's branch (\`${openPr.branch}\`). You're continuing it: stay on this branch, commit and push to it, and don't open another PR.`,
           plan?.commentId == null ? null : `Canonical plan for ${task.key}: task comment ${plan.commentId}. ${(PR_REVIEW_ROLES as readonly string[]).includes(args.role) ? `Read it with bb factory plan ${task.key}, which leaves out other reviewers' verdicts` : `Read it directly with bb tasks show ${task.key} (including comments)`}; preserve its acceptance criteria.`,
         ].filter((part) => part != null).join("\n\n") || null,
@@ -2274,6 +2654,7 @@ export default async function plugin(bb: BbPluginApi) {
       pluginMetadata: { factory: factory.prefix, role: args.role, taskKey: task.key, ...(pr === null ? {} : { pr: pr.number }) },
     };
     let thread;
+    let ownWorktree = false;
     if (role.environment === "project") {
       thread = await bb.sdk.threads.spawn({ ...base, environment: { type: "project-default" } });
     } else if (builder !== null || continuing !== null) {
@@ -2291,6 +2672,7 @@ export default async function plugin(bb: BbPluginApi) {
             workspace: { type: "managed-worktree", baseBranch: { kind: "default" } },
           },
         });
+        ownWorktree = true;
       } catch (error) {
         // Not a Git project (or no commits yet): work in the project checkout.
         bb.log.warn(`worktree spawn failed; using the project checkout: ${String(error)}`);
@@ -2298,6 +2680,16 @@ export default async function plugin(bb: BbPluginApi) {
       }
     }
     await mutateFactory(factory.prefix, (current) => {
+      // Assigning a role is a choice of track for a task that has none, and plan and explore move it there.
+      if (current.tracksEnabled && track !== null) current.tracks[task.key] = track;
+      if (args.role === "explore" && args.candidate !== undefined) {
+        current.explorations.push({
+          taskKey: task.key, threadId: thread.id, round: args.candidate.round, candidate: args.candidate.index, of: args.candidate.of,
+          approach: args.candidate.approach, startedAt: new Date().toISOString(), timeboxMinutes: EXPLORE_TIMEBOX_MINUTES, ownWorktree,
+          reportCommentId: null, recommendation: null, summary: null, learned: null, reportedAt: null, remindedAt: null,
+          overrunNotifiedAt: null, roundNotifiedAt: null, worktreeDeletedAt: null, branch: null, branchDeletedAt: null,
+        });
+      }
       if (args.role === "plan") {
         current.plans = current.plans.filter((entry) => entry.taskKey !== task.key);
         current.plans.push({ taskKey: task.key, threadId: thread.id, commentId: null });
@@ -4042,6 +4434,23 @@ ${findings}`;
     },
   });
 
+  const EXPLORE_POLL_MS = 60_000;
+  bb.background.service("explore-watch", {
+    async start(signal) {
+      while (!signal.aborted) {
+        for (const factory of await listFactories().catch(() => [])) {
+          const pending = factory.explorations.some((entry) => entry.worktreeDeletedAt === null || (entry.ownWorktree && entry.branchDeletedAt === null));
+          if (factory.archivedAt !== null || !pending) continue;
+          await maintainExplorations(factory.prefix).catch((error: unknown) => bb.log.warn(`exploration watch failed for ${factory.prefix}: ${String(error)}`));
+        }
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, EXPLORE_POLL_MS);
+          signal.addEventListener("abort", () => { clearTimeout(timer); resolve(); }, { once: true });
+        });
+      }
+    },
+  });
+
   // Suppressing routine review replies must not hide a reviewer that forgot its verdict.
   bb.events.on("thread.idle", async ({ thread }) => {
     const entry = agentsByThread.get(thread.id);
@@ -4449,6 +4858,10 @@ ${findings}`;
       }
     },
     task_assign: async (input) => ({ threadId: await assign(input) }),
+    task_set_track: async ({ taskKey, track }, ctx) => {
+      if (ctx.experimental_caller?.kind !== "client") throw new Error("Only the Factory page can change a track this way.");
+      return { track: await setTrack(taskKey, track, null) };
+    },
     shadow_dismiss: async ({ taskKey, reason }, ctx) => {
       // Allow-list: only a client call (the Factory page) may dismiss; other plugins and unknown callers may not.
       if (ctx.experimental_caller?.kind !== "client") throw new Error("Only the Factory page can dismiss a shadow block.");
@@ -4721,11 +5134,23 @@ ${findings}`;
               description: "Reviewer roles only: the PR to review, to replace a reviewer that failed",
             },
             "track-only": { type: "boolean", description: "With --pr: track and validate the PR locally without starting a reviewer or writing to GitHub" },
+            candidates: { type: "integer", min: 1, max: MAX_EXPLORE_CANDIDATES, description: `Explore only: how many Explorers try different approaches, 1 to ${MAX_EXPLORE_CANDIDATES}; --instructions lists one numbered approach for each` },
             json,
           },
           async run(input) {
             const role = input.options.role as WorkerRoleId;
             const prNumber = input.options.pr ?? null;
+            if (input.options.candidates !== undefined && role !== "explore") throw new PluginCliError("--candidates only applies to --role explore.", { code: "explore_candidates" });
+            if (role === "explore") {
+              if (prNumber !== null) throw new PluginCliError("--pr doesn't apply to an Explorer: it opens no PR.", { code: "pr_not_reviewer" });
+              const threads = await startExploration({ taskKey: input.positionals.task, instructions: input.options.instructions ?? null, candidates: input.options.candidates ?? 1 });
+              return {
+                exitCode: 0,
+                stdout: input.options.json
+                  ? JSON.stringify({ threadId: threads[0], threadIds: threads })
+                  : `Assigned ${input.positionals.task.toUpperCase()} to ${threads.length === 1 ? "an Explorer" : `${threads.length} Explorers`}: ${threads.join(", ")}. The time box is ${EXPLORE_TIMEBOX_MINUTES} minutes.`,
+              };
+            }
             if (input.options["track-only"] && prNumber === null) throw new PluginCliError("--track-only requires --pr.", { code: "missing_pr" });
             if (prNumber !== null) {
               if (!(PR_REVIEW_ROLES as readonly string[]).includes(role)) {
@@ -5008,6 +5433,65 @@ ${findings}`;
             const reports = await Promise.all(factories.map(async (factory) => ({ prefix: factory.prefix, report: await readNightlyReport(factory.prefix) })));
             if (input.options.json) return { exitCode: 0, stdout: JSON.stringify(reports) };
             return { exitCode: 0, stdout: reports.map(({ prefix, report }) => formatNightlyReport(prefix, report)).join("\n") };
+          },
+        }),
+        tracks: cliCommand({
+          summary: "Show or set whether a factory uses tracks (direct, plan, explore) and the Explorer: on or off (setting it is for the person only)",
+          positionals: [
+            { name: "factory", description: "Factory prefix", required: true },
+            { name: "state", description: "on or off; omit to show it" },
+          ],
+          async run(input, ctx) {
+            const factory = await findFactory(input.positionals.factory);
+            const requested = input.positionals.state;
+            if (requested === undefined) return { exitCode: 0, stdout: `${factory.prefix}: tracks ${factory.tracksEnabled ? "on" : "off"}` };
+            if (requested !== "on" && requested !== "off") throw new PluginCliError("The state is on or off.", { code: "tracks_input" });
+            if (ctx.threadId != null) throw new PluginCliError("Only the person can change this, from outside an agent thread.", { code: "tracks_person_only" });
+            await mutateFactory(factory.prefix, (current) => { current.tracksEnabled = requested === "on"; });
+            bb.realtime.publish(BOARD_CHANGED, { prefix: factory.prefix });
+            return { exitCode: 0, stdout: `${factory.prefix}: tracks ${requested}. Agents already running keep their first brief; their standing rules change on their next turn.` };
+          },
+        }),
+        track: cliCommand({
+          summary: "Show or set a task's track: direct, plan or explore (Lead or person)",
+          positionals: [
+            { name: "task", description: "Task key, such as APP-12", required: true },
+            { name: "track", description: "direct, plan or explore; omit to show it" },
+          ],
+          async run(input, ctx) {
+            const task = await getTaskByKey(input.positionals.task);
+            const requested = input.positionals.track;
+            if (requested === undefined) {
+              const factory = await factoryForTaskKey(task.key);
+              return { exitCode: 0, stdout: factory.tracksEnabled ? `${task.key}: ${factory.tracks[task.key] ?? "no track yet"}` : `${factory.prefix} has tracks off.` };
+            }
+            const track = z.enum(TRACKS).safeParse(requested);
+            if (!track.success) throw new PluginCliError("The track is direct, plan or explore.", { code: "track_input" });
+            await setTrack(task.key, track.data, ctx.threadId ?? null);
+            return { exitCode: 0, stdout: `${task.key}: ${track.data}` };
+          },
+        }),
+        "explore-report": cliCommand({
+          summary: "Record an Explorer's report, a task comment starting \"Factory exploration:\" (that Explorer only)",
+          positionals: [{ name: "task", description: "Task key", required: true }],
+          options: { comment: { type: "string", required: true, description: "ID of your report's task comment" } },
+          async run(input, ctx) {
+            const entry = await recordExploreReport(input.positionals.task, input.options.comment, ctx.threadId ?? null);
+            return { exitCode: 0, stdout: `Recorded your report on ${entry.taskKey}: recommends ${entry.recommendation}. Your worktree is deleted once you finish, so stop here.` };
+          },
+        }),
+        "plan-outcome": cliCommand({
+          summary: "Record that a task needs a spike, or that it should be closed, instead of a plan (current Planner only)",
+          positionals: [
+            { name: "task", description: "Task key", required: true },
+            { name: "outcome", description: "needs-spike or recommend-close", required: true },
+          ],
+          options: { comment: { type: "string", required: true, description: "ID of your task comment starting with \"Factory plan: NEEDS SPIKE\" or \"Factory plan: RECOMMEND CLOSE\"" } },
+          async run(input, ctx) {
+            const outcome = z.enum(["needs-spike", "recommend-close"]).safeParse(input.positionals.outcome);
+            if (!outcome.success) throw new PluginCliError("The outcome is needs-spike or recommend-close.", { code: "plan_outcome_input" });
+            await recordPlanOutcome(input.positionals.task, outcome.data, input.options.comment, ctx.threadId ?? null);
+            return { exitCode: 0, stdout: outcome.data === "needs-spike" ? `${input.positionals.task.toUpperCase()} moves to the explore track.` : `Recorded your advice to close ${input.positionals.task.toUpperCase()}. Only the person can close it.` };
           },
         }),
         "task-kind": cliCommand({
@@ -5309,6 +5793,10 @@ ${findings}`;
                   .filter((agent) => agent.taskKey === task.key)
                   .map((agent) => `${ROLES[agent.role].label} ${agent.threadId}`);
                 lines.push(`  ${task.key}  ${task.title}${agents.length > 0 ? `  [${agents.join(", ")}]` : ""}`);
+                if (task.track !== null) lines.push(`      Track ${task.track}${task.closeAdvice === null ? "" : ` · the ${task.closeAdvice.role === "plan" ? "Planner" : "Explorer"} recommends closing it (comment ${task.closeAdvice.commentId}); only the person can`}`);
+                for (const entry of task.exploration ?? []) {
+                  lines.push(`      Explorer${entry.of > 1 ? ` ${entry.candidate}/${entry.of}` : ""} ${entry.threadId}${entry.approach === null ? "" : ` (${entry.approach})`}: ${entry.recommendation === null ? `exploring, ${entry.timeboxMinutes}-minute time box` : `recommends ${entry.recommendation} · comment ${entry.reportCommentId}`}`);
+                }
                 const plan = factory.plans.find((entry) => entry.taskKey === task.key);
                 if (plan !== undefined) lines.push(`      Plan ${plan.commentId === null ? "pending" : `ready · comment ${plan.commentId}`} · Planner ${plan.threadId}`);
                 const builderBranch = factory.agents.find((agent) => agent.role === "build" && agent.taskKey === task.key);

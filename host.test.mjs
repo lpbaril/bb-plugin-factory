@@ -47,3 +47,31 @@ test('scaffolding leaves an existing document alone', async t => {
   assert.ok(existing.includes('AGENTS.md'));
   assert.equal(await readFile(join(dir, 'AGENTS.md'), 'utf8'), 'mine');
 });
+
+test('the host worker deletes only an Explorer\'s branch, and not one still checked out', async t => {
+  const dir = await repo(t);
+  const git = (...args) => execFileSync('git', ['-c', 'user.email=t@example.org', '-c', 'user.name=T', ...args], { cwd: dir, encoding: 'utf8' });
+  git('commit', '-q', '--allow-empty', '-m', 'start');
+  const explorer = 'bb/app-16-explorer-tips-from-csv-thr_abc123';
+  git('branch', explorer);
+  git('branch', 'bb/app-15-builder-add-tax-thr_def456');
+  const del = branch => hostEntry.handlers.delete_explorer_branch({ projectPath: dir, branch }, { signal: new AbortController().signal });
+  assert.deepEqual(await del(explorer), { deleted: true, missing: false, error: null });
+  assert.equal(git('branch', '--list', explorer).trim(), '');
+  assert.deepEqual(await del(explorer), { deleted: false, missing: true, error: null }, 'gone already: nothing more to do');
+  for (const branch of ['bb/app-15-builder-add-tax-thr_def456', 'main', 'master', '-D', 'bb/app-16-explorer-../../x', 'bb/app-16-explorer-x --force']) {
+    const result = await del(branch);
+    assert.equal(result.deleted, false, branch);
+    assert.match(result.error, /isn't an Explorer's branch/, branch);
+  }
+  assert.notEqual(git('branch', '--list', 'bb/app-15-builder-add-tax-thr_def456').trim(), '', 'a Builder\'s branch stays');
+  const busy = 'bb/app-17-explorer-still-here-thr_ghi789';
+  const elsewhere = join(dir, '..', `${dir.split('/').at(-1)}-wt`);
+  t.after(() => rm(elsewhere, { recursive: true, force: true }));
+  git('worktree', 'add', '-q', '-b', busy, elsewhere);
+  const refused = await del(busy);
+  assert.equal(refused.deleted, false, 'git refuses a branch still checked out');
+  assert.ok(refused.error !== null && refused.error.length > 0);
+  const missingDir = await hostEntry.handlers.delete_explorer_branch({ projectPath: '/nowhere/at/all', branch: explorer }, { signal: new AbortController().signal });
+  assert.match(missingDir.error, /isn't an accessible directory/);
+});

@@ -78,6 +78,42 @@ Builders receive the canonical comment reference, accessible from their worktree
 This gate does not stop an already-running Builder; the Lead must pause or steer
 it when replanning. Child tasks need explicit references to their parent plan.
 
+## Tracks and exploration
+
+Each task gets a track that decides its path before the production line. The Lead
+picks it when it takes the task, with `bb factory track APP-12 direct|plan|explore`,
+and you can change it from the task on the Factory page. Assigning a role also picks
+one: the Planner makes a task plan, an Explorer makes it explore, and a Builder makes
+a task with no track yet direct.
+
+- **direct:** a small, explicit change. It goes straight to a Builder.
+- **plan:** the Planner's READY plan comes first. The factory refuses a Builder until
+  the plan is marked ready.
+- **explore:** nobody knows yet which approach works, or whether the task is worth
+  doing. `bb factory assign APP-12 --role explore` starts an Explorer in its own
+  worktree with a 45-minute time box. It opens no PR and ends with a report, a task
+  comment recorded with `bb factory explore-report`: hypothesis, what was tried, what
+  was learned, a recommendation (build, plan, explore more or close) and what wasn't
+  checked. The factory reminds it near the end of the time box, and tells the Lead if
+  it runs past. Once it has reported and finished, the factory archives its thread
+  and deletes its worktree and local branch. The host worker deletes only a branch
+  named as an Explorer's, never one still checked out, and a branch an Explorer
+  pushed anyway stays on GitHub. A Builder
+  isn't started on an explore task: you decide what comes next, and the Lead records
+  it by changing the track.
+
+One Explorer is the default. To compare approaches, ask for up to 3 candidates:
+`--candidates 2 --instructions "1. ... 2. ..."` on separate lines, one numbered
+approach for each. Each candidate tries only its own. When all have reported, the
+Lead gets them side by side, and the task on the Factory page shows them in columns.
+
+A Planner can also end without a plan: NEEDS SPIKE moves the task to explore, and
+RECOMMEND CLOSE, like an Explorer's close recommendation, marks the task "Close
+advised". Only you close a task on an agent's advice.
+
+Tracks are on for new factories. Existing factories keep working as before until you
+turn them on, from outside an agent thread: `bb factory tracks APP on`.
+
 The Lead escalates technical disputes and substantive replanning to the Planner,
 and product decisions to you. It cannot waive review gates. New PR reviewers
 send parent notifications only when stuck; Factory reports the complete review
