@@ -10,7 +10,7 @@ registerHooks({ resolve(specifier, context, next) {
   }
   return next(specifier, context);
 } });
-const { default: plugin, computePreset, computeTokenProfile, parsePersonQuestions, personQuestionsGate, parseDesignFindings, planSensitivePaths, designRoundState, designGate, trackGate, parseApproaches, exploreAssignment, readRecommendation, sectionText, supervisorAction, turnsFromEvents, creditUsage, mergeBlockers, sortChecks, latestRuns, mergeOverlapNote, migrateQaResults, qaCarryNote, leadMayMerge, rosterWarnings, computeHealth, parseDay, prsOpenedBetween, qaHold, qaNextStep, parseCoverage, changeRounds, fixLoopAdvice } = await import('./server.ts');
+const { default: plugin, computePreset, computeTokenProfile, leadCompactionDue, LEAD_COMPACT_COOLDOWN_MS, parsePersonQuestions, personQuestionsGate, parseDesignFindings, planSensitivePaths, designRoundState, designGate, trackGate, parseApproaches, exploreAssignment, readRecommendation, sectionText, supervisorAction, turnsFromEvents, creditUsage, mergeBlockers, sortChecks, latestRuns, mergeOverlapNote, migrateQaResults, qaCarryNote, leadMayMerge, rosterWarnings, computeHealth, parseDay, prsOpenedBetween, qaHold, qaNextStep, parseCoverage, changeRounds, fixLoopAdvice } = await import('./server.ts');
 const { shareBarWidth, sharePercent } = await import('./token-profile.ts');
 const { leadCharter, leadPrompt, reReviewMessage, workerPrompt, workerReminder, designReviewPrompt } = await import('./roles.ts');
 const { createFactoryStorage } = await import('./factory-storage.ts');
@@ -5485,4 +5485,119 @@ test('bb factory health shows the Lead\'s growth per thread', async t => {
   [10_000, 12_000, 30_000].forEach((cached, i) => insert.run('thr_lead_b', i + 1, 100 + i, 101 + i, cached + 10, cached));
   const text = (await harness.behavior.runCli(['health', 'TEST'])).stdout;
   assert.match(text, /  Lead's cached tokens per turn: 110K in the first quarter of a Lead thread's turns, 1M in the last \(1 Lead thread with at least 8 turns\)\.\n/);
+});
+
+// ----- Keeping the Lead's context small -----
+
+test('leadCompactionDue: above the threshold, nothing waiting for the person, not in the last half hour', () => {
+  const base = { usedTokens: 400_000, threshold: 300_000, lastCompactedAt: null, now: 10_000_000, waitingForPerson: false };
+  assert.equal(leadCompactionDue(base), true);
+  assert.equal(leadCompactionDue({ ...base, usedTokens: 300_000 }), false, 'at the threshold is fine');
+  assert.equal(leadCompactionDue({ ...base, usedTokens: null }), false, 'bb couldn\'t say');
+  assert.equal(leadCompactionDue({ ...base, threshold: 0 }), false, '0 is off');
+  assert.equal(leadCompactionDue({ ...base, waitingForPerson: true }), false);
+  assert.equal(leadCompactionDue({ ...base, lastCompactedAt: base.now - LEAD_COMPACT_COOLDOWN_MS + 1 }), false);
+  assert.equal(leadCompactionDue({ ...base, lastCompactedAt: base.now - LEAD_COMPACT_COOLDOWN_MS }), true);
+  assert.equal(LEAD_COMPACT_COOLDOWN_MS, 30 * 60_000);
+});
+
+async function leadFixture(t, { used = 400_000, pending = [], timelineFails = false, compactFails = false, initial = {} } = {}) {
+  const calls = { compact: [], timeline: [], interactions: 0 };
+  const state = { used, pending };
+  const lead = { threadId: 'thr_lead', role: 'lead', taskKey: null, providerId: 'claude-code', createdAt: '', pr: null };
+  const result = await fixture(t, false, { agents: [lead, { threadId: 'thr_builder', role: 'build', taskKey: 'TEST-1', providerId: 'codex', createdAt: '', pr: null }], ...initial }, { threads: {
+    timeline: async args => {
+      calls.timeline.push(args);
+      if (timelineFails) throw new Error('timeline unavailable');
+      return { contextWindowUsage: state.used === null ? undefined : { usedTokens: state.used, modelContextWindow: 1_000_000, estimated: true } };
+    },
+    compact: async args => { if (compactFails) throw new Error('provider busy'); calls.compact.push(args.threadId); return { ok: true }; },
+    interactions: { list: async () => { calls.interactions += 1; return state.pending; } },
+  } });
+  const idle = threadId => result.harness.behavior.emitThreadEvent('thread.idle', { thread: makeThreadResponse({ id: threadId }), lastAssistantText: null });
+  return { ...result, calls, state, idle };
+}
+
+test('an idle Lead above the threshold is compacted once, and not again within half an hour', async t => {
+  const { calls, idle, bb } = await leadFixture(t);
+  await idle('thr_lead');
+  assert.deepEqual(calls.compact, ['thr_lead']);
+  assert.deepEqual(calls.timeline[0], { threadId: 'thr_lead', summaryOnly: 'true', segmentLimit: '1', deferContent: 'true' }, 'a summary, not the whole timeline');
+  const record = await bb.storage.kv.get('lead-compaction:thr_lead');
+  assert.equal(record.usedTokens, 400_000);
+  assert.ok(Date.now() - Date.parse(record.at) < 60_000);
+  await idle('thr_lead');
+  assert.deepEqual(calls.compact, ['thr_lead'], 'the compaction\'s own idle doesn\'t start another');
+  await bb.storage.kv.set('lead-compaction:thr_lead', { ...record, at: new Date(Date.now() - LEAD_COMPACT_COOLDOWN_MS - 1000).toISOString() });
+  await idle('thr_lead');
+  assert.deepEqual(calls.compact, ['thr_lead', 'thr_lead'], 'after half an hour, again if it grew back');
+});
+
+test('the Lead is left alone below the threshold, with the setting at 0, while you have a question waiting, and for other threads', async t => {
+  const small = await leadFixture(t, { used: 250_000 });
+  await small.idle('thr_lead');
+  assert.deepEqual(small.calls.compact, []);
+  const off = await leadFixture(t);
+  await off.harness.behavior.setSettings({ leadCompactAtTokens: 0 });
+  await off.idle('thr_lead');
+  assert.deepEqual(off.calls.compact, []);
+  assert.equal(off.calls.timeline.length, 0, 'off reads nothing');
+  const asking = await leadFixture(t, { pending: [{ id: 'int_1' }] });
+  await asking.idle('thr_lead');
+  assert.deepEqual(asking.calls.compact, []);
+  asking.state.pending = [];
+  await asking.idle('thr_lead');
+  assert.deepEqual(asking.calls.compact, ['thr_lead'], 'once you\'ve answered');
+  const replaced = await leadFixture(t, { initial: { leadThreadId: 'thr_new_lead' } });
+  await replaced.idle('thr_lead');
+  assert.deepEqual(replaced.calls.compact, [], 'a replaced Lead\'s old thread');
+  const worker = await leadFixture(t);
+  await worker.idle('thr_builder');
+  assert.deepEqual(worker.calls.compact, []);
+  assert.equal(worker.calls.timeline.length, 0);
+  const custom = await leadFixture(t, { used: 450_000 });
+  await custom.harness.behavior.setSettings({ leadCompactAtTokens: 500_000 });
+  await custom.idle('thr_lead');
+  assert.deepEqual(custom.calls.compact, [], 'the person\'s threshold');
+});
+
+test('a Lead whose size bb can\'t read, or whose compaction fails, is left as it was and tried again later', async t => {
+  const unknown = await leadFixture(t, { timelineFails: true });
+  await unknown.idle('thr_lead');
+  assert.deepEqual(unknown.calls.compact, []);
+  const noUsage = await leadFixture(t, { used: null });
+  await noUsage.idle('thr_lead');
+  assert.deepEqual(noUsage.calls.compact, []);
+  const failing = await leadFixture(t, { compactFails: true });
+  await failing.idle('thr_lead');
+  assert.equal(await failing.bb.storage.kv.get('lead-compaction:thr_lead'), undefined, 'not recorded, so the next idle tries again');
+});
+
+test('bb factory lead-context shows the Lead\'s context, the threshold and the last compaction', async t => {
+  const { harness, idle } = await leadFixture(t, { used: 724_675 });
+  let text = (await harness.behavior.runCli(['lead-context', 'TEST'])).stdout;
+  assert.match(text, /^Lead thr_lead: 724\.7K of 1M tokens in context\.\nThe factory compacts it when it's idle above 300K, at most once every 30 minutes, and not while something waits for you\.\nThe factory hasn't compacted it yet\.$/);
+  await idle('thr_lead');
+  text = (await harness.behavior.runCli(['lead-context', 'TEST'])).stdout;
+  assert.match(text, /Last compacted by the factory \d{4}-\d\d-\d\dT[^,]+, at 724\.7K\./);
+  const json = JSON.parse((await harness.behavior.runCli(['lead-context', 'TEST', '--json'])).stdout);
+  assert.deepEqual([json.usedTokens, json.windowTokens, json.compactAtTokens, json.lastCompaction.usedTokens], [724_675, 1_000_000, 300_000, 724_675]);
+  await harness.behavior.setSettings({ leadCompactAtTokens: 0 });
+  assert.match((await harness.behavior.runCli(['lead-context', 'TEST'])).stdout, /Early compaction is off \(setting: 0\)\./);
+});
+
+test('the Lead reads evidence, not code, and workers keep their final message short', async t => {
+  const { leadCharter, workerReminder, WORKER_ROLE_IDS, FINAL_MESSAGE } = await import('./roles.ts');
+  const charter = leadCharter({ factoryName: 'F', prefix: 'F', mergePolicy: 'when-green', evidenceContract: true, tracks: true, designReview: true });
+  assert.match(charter, /Don't read source files or diffs yourself: read the task's comments, and send a specialist when code needs a look\./);
+  assert.match(charter, /Check an agent's claim against its evidence \(QA's verdict, CI, a task comment, `git diff --stat`\), not its report; ask QA or a reviewer to look deeper\./);
+  assert.doesNotMatch(charter, /against the diff/);
+  assert.ok(charter.length <= 4096, `${charter.length} characters`);
+  for (const role of WORKER_ROLE_IDS) {
+    const reminder = workerReminder({ role, factoryName: 'F', taskKey: 'F-1', evidenceContract: true, tracks: true, designReview: true });
+    if (role === 'shadow') assert.ok(!reminder.includes(FINAL_MESSAGE), 'the shadow reports to its trial, not the Lead');
+    else assert.ok(reminder.includes(FINAL_MESSAGE), role);
+  }
+  assert.ok(!workerReminder({ role: 'shadow', factoryName: 'F', taskKey: 'F-1' }).includes(FINAL_MESSAGE), 'the shadow reports to its trial, not the Lead');
+  assert.match(FINAL_MESSAGE, /three lines or fewer/);
 });

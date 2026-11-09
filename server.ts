@@ -789,6 +789,20 @@ export function prsOpenedBetween<T extends Pick<Pr, "openedAt">>(prs: readonly T
   return { prs: inside, undated };
 }
 
+/** After compacting a Lead, wait this long before compacting it again, so the compaction's own turn can't start another. */
+export const LEAD_COMPACT_COOLDOWN_MS = 30 * 60_000;
+
+/**
+ * Whether to compact an idle Lead's context now: it holds more than the person's threshold (0 is
+ * off), nothing waits for the person in its chat (a merge card or a question), and it wasn't
+ * compacted in the last half hour.
+ */
+export function leadCompactionDue(args: { usedTokens: number | null; threshold: number; lastCompactedAt: number | null; now: number; waitingForPerson: boolean }): boolean {
+  if (args.threshold <= 0 || args.usedTokens === null || args.usedTokens <= args.threshold) return false;
+  if (args.waitingForPerson) return false;
+  return args.lastCompactedAt === null || args.now - args.lastCompactedAt >= LEAD_COMPACT_COOLDOWN_MS;
+}
+
 /**
  * The redesign's baseline: how much rework a PR takes and what a merged task costs. Each number
  * carries its sample size, because a factory's history is small enough for one PR to move a median.
@@ -1558,6 +1572,14 @@ export default async function plugin(bb: BbPluginApi) {
       description:
         "When a PR is ready for you to merge, show a card in the Lead's chat with its approvals, QA, CI and changed files, and a Merge button that runs the same checks as bb factory merge. While the card waits, it takes the place of the chat's message box until you merge or choose Not now. It also sends a notification. This is a convenience, not a lock: agents could make the same call.",
       default: true,
+    },
+    leadCompactAtTokens: {
+      type: "number",
+      label: "Compact the Lead's context above this many tokens",
+      description:
+        "When a Lead is idle and its context holds more than this, the factory asks bb to compact it, so each later turn re-reads less. It waits while a merge card or a question waits for you, and compacts at most once every 30 minutes. The Lead's standing rules come from the plugin, so they survive compaction. 0 turns it off.",
+      experimental_schema: z.number().int().min(0).max(2_000_000),
+      default: 300_000,
     },
     prReviews: {
       type: "boolean",
@@ -5313,6 +5335,55 @@ ${findings}`;
     },
   });
 
+  // ----- Keeping the Lead's context small -----
+
+  /** The Lead's context as bb measures it, or null when bb can't say. */
+  async function leadContext(threadId: string): Promise<{ usedTokens: number; windowTokens: number } | null> {
+    try {
+      const timeline = await bb.sdk.threads.timeline({ threadId, summaryOnly: "true", segmentLimit: "1", deferContent: "true" });
+      const usage = timeline.contextWindowUsage;
+      return usage === undefined ? null : { usedTokens: usage.usedTokens, windowTokens: usage.modelContextWindow };
+    } catch (error) {
+      bb.log.warn(`could not read the context size of ${threadId}: ${String(error)}`);
+      return null;
+    }
+  }
+  type LeadCompaction = { at: string; usedTokens: number; windowTokens: number };
+  const leadCompactionKey = (threadId: string) => `lead-compaction:${threadId}`;
+  /** Leads being checked or compacted right now, so two idle events don't compact twice. */
+  const leadCompacting = new Set<string>();
+  async function maybeCompactLead(factory: Factory, threadId: string): Promise<void> {
+    if (factory.archivedAt !== null || threadId !== factory.leadThreadId || leadCompacting.has(threadId)) return;
+    leadCompacting.add(threadId);
+    try {
+      const threshold = (await settings.get()).leadCompactAtTokens;
+      if (threshold <= 0) return;
+      const last = (await bb.storage.kv.get(leadCompactionKey(threadId))) as LeadCompaction | undefined;
+      const context = await leadContext(threadId);
+      const pending = openMergeCards.has(factory.prefix) ? 1 : (await bb.sdk.threads.interactions.list({ threadId }).catch(() => [{}])).length;
+      const due = leadCompactionDue({
+        usedTokens: context?.usedTokens ?? null,
+        threshold,
+        lastCompactedAt: last === undefined ? null : Date.parse(last.at),
+        now: Date.now(),
+        waitingForPerson: pending > 0,
+      });
+      if (!due || context === null) return;
+      await bb.sdk.threads.compact({ threadId });
+      await bb.storage.kv.set(leadCompactionKey(threadId), { at: new Date().toISOString(), usedTokens: context.usedTokens, windowTokens: context.windowTokens } satisfies LeadCompaction);
+      bb.log.info(`compacted the ${factory.prefix} Lead at ${context.usedTokens} tokens (threshold ${threshold})`);
+    } catch (error) {
+      bb.log.warn(`could not compact the ${factory.prefix} Lead: ${String(error)}`);
+    } finally {
+      leadCompacting.delete(threadId);
+    }
+  }
+  bb.events.on("thread.idle", async ({ thread }) => {
+    const entry = agentsByThread.get(thread.id);
+    if (entry === undefined || entry.agent.role !== "lead") return;
+    await maybeCompactLead(await findFactory(entry.factory.prefix), thread.id);
+  });
+
   // Suppressing routine review replies must not hide a reviewer that forgot its verdict.
   bb.events.on("thread.idle", async ({ thread }) => {
     const entry = agentsByThread.get(thread.id);
@@ -6633,6 +6704,28 @@ ${findings}`;
             const factory = await findFactory(input.positionals.factory);
             const health = healthFor(factory, input.options.since ?? null, input.options.before ?? null);
             return { exitCode: 0, stdout: input.options.json ? JSON.stringify(health) : formatHealth(factory.prefix, health) };
+          },
+        }),
+        "lead-context": cliCommand({
+          summary: "Show how full the Lead's context is, when the factory compacts it, and when it last did",
+          positionals: [{ name: "factory", description: "Factory prefix", required: true }],
+          options: { json },
+          async run(input) {
+            const factory = await findFactory(input.positionals.factory);
+            if (factory.leadThreadId === null) throw new PluginCliError(`Factory ${factory.prefix} has no Lead yet.`, { code: "no_lead", hint: `Start one with \`bb factory start ${factory.prefix}\`.` });
+            const context = await leadContext(factory.leadThreadId);
+            const threshold = (await settings.get()).leadCompactAtTokens;
+            const last = ((await bb.storage.kv.get(leadCompactionKey(factory.leadThreadId))) as LeadCompaction | undefined) ?? null;
+            const report = { threadId: factory.leadThreadId, usedTokens: context?.usedTokens ?? null, windowTokens: context?.windowTokens ?? null, compactAtTokens: threshold, lastCompaction: last };
+            if (input.options.json) return { exitCode: 0, stdout: JSON.stringify(report) };
+            return {
+              exitCode: 0,
+              stdout: [
+                `Lead ${factory.leadThreadId}: ${context === null ? "bb can't say how full its context is right now" : `${compactTokens(context.usedTokens)} of ${compactTokens(context.windowTokens)} tokens in context`}.`,
+                threshold <= 0 ? "Early compaction is off (setting: 0)." : `The factory compacts it when it's idle above ${compactTokens(threshold)}, at most once every 30 minutes, and not while something waits for you.`,
+                last === null ? "The factory hasn't compacted it yet." : `Last compacted by the factory ${last.at}, at ${compactTokens(last.usedTokens)}.`,
+              ].join("\n"),
+            };
           },
         }),
         dismiss: cliCommand({
