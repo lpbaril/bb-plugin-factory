@@ -10,6 +10,11 @@ export const AGENT_LABELS: Record<AgentKey, string> = {
   comparison: "Reviewer trial comparison",
 } as Record<AgentKey, string>;
 
+/** A role's name for people, or the role itself when it isn't one the factory knows. */
+export function roleName(role: string): string {
+  return (AGENT_KEYS as readonly string[]).includes(role) ? AGENT_LABELS[role as AgentKey] : role;
+}
+
 /** Reasoning levels bb understands, lowest first; each model lists the ones it offers. */
 export const REASONING_LEVELS = ["none", "low", "medium", "high", "xhigh", "max", "ultra", "ultracode"] as const;
 

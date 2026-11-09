@@ -154,16 +154,27 @@ test('tokensByTask sums each task, leaves out cached input and other factories',
   assert.deepEqual([...store.tokensByTask('P')].sort(), [['P-1', 70], ['P-2', 0]]);
 });
 
-test('runsStartedBetween keeps turns that started from one time up to another, in order', async t => {
+test('tokenTurns keeps turns that started in a window, with tokens defined as tokensByTask defines them', async t => {
   const { bb, harness } = createFakePluginHost({ pluginId: 'factory' });
   t.after(() => harness.lifecycle.dispose());
   const store = createFactoryStorage(bb.storage, identity);
-  const run = (endSeq, startedAt, prefix = 'BIG') => ({ threadId: 'thr', endSeq, prefix, taskKey: null, role: 'lead', providerId: 'codex', model: null, reasoning: null, outcome: 'completed', error: null, startedAt, endedAt: startedAt + 10, tokensTotal: 1, tokensCached: 0, tokensOutput: 0 });
-  store.appendRuns('thr', [run(3, 3000), run(1, 1000), run(2, 2000)], { lastSeq: 3, usageSeq: 3, tokensTotal: 3, tokensCached: 0, tokensOutput: 0 });
-  store.appendRuns('other', [{ ...run(1, 1500, 'OTHER'), threadId: 'other' }], { lastSeq: 1, usageSeq: 1, tokensTotal: 1, tokensCached: 0, tokensOutput: 0 });
-  const seqs = (from, until) => store.runsStartedBetween('BIG', from, until).map(row => row.endSeq);
-  assert.deepEqual(seqs(null, null), [1, 2, 3], 'oldest first, one factory only');
-  assert.deepEqual(seqs(2000, null), [2, 3], 'from is inclusive');
-  assert.deepEqual(seqs(null, 2000), [1], 'until is exclusive');
-  assert.deepEqual(seqs(1001, 3000), [2]);
+  const run = (endSeq, startedAt, tokens = {}, prefix = 'BIG') => ({ threadId: 'thr', endSeq, prefix, taskKey: 'BIG-1', role: 'build', providerId: 'codex', model: null, reasoning: null, outcome: 'completed', error: 'a long error text', startedAt, endedAt: startedAt + 10, tokensTotal: 100, tokensCached: 30, tokensOutput: 5, ...tokens });
+  store.appendRuns('thr', [
+    run(3, 3000, { tokensTotal: 50, tokensCached: 60 }),
+    run(1, 1000),
+    run(2, 2000, { tokensTotal: 40, tokensCached: -5 }),
+    run(4, 4000, { tokensTotal: null, tokensCached: null, tokensOutput: null }),
+  ], { lastSeq: 4, usageSeq: 4, tokensTotal: 190, tokensCached: 85, tokensOutput: 5 });
+  store.appendRuns('other', [{ ...run(1, 1500, {}, 'OTHER'), threadId: 'other' }], { lastSeq: 1, usageSeq: 1, tokensTotal: 1, tokensCached: 0, tokensOutput: 0 });
+  assert.deepEqual(store.tokenTurns('BIG', null, null), [
+    { threadId: 'thr', role: 'build', taskKey: 'BIG-1', outcome: 'completed', startedAt: 1000, fresh: 70, cached: 30 },
+    { threadId: 'thr', role: 'build', taskKey: 'BIG-1', outcome: 'completed', startedAt: 2000, fresh: 40, cached: 0 },
+    { threadId: 'thr', role: 'build', taskKey: 'BIG-1', outcome: 'completed', startedAt: 3000, fresh: 0, cached: 60 },
+    { threadId: 'thr', role: 'build', taskKey: 'BIG-1', outcome: 'completed', startedAt: 4000, fresh: null, cached: null },
+  ], 'oldest first, one factory only, nothing below zero, only what the profile reads');
+  const starts = (from, until) => store.tokenTurns('BIG', from, until).map(row => row.startedAt);
+  assert.deepEqual(starts(2000, null), [2000, 3000, 4000], 'from is inclusive');
+  assert.deepEqual(starts(null, 2000), [1000], 'until is exclusive');
+  assert.deepEqual(starts(1001, 3000), [2000]);
+  assert.equal(store.tokensByTask('BIG').get('BIG-1'), 70 + 40 + 0, 'the same definition: the profile and tokens per task agree');
 });

@@ -39,6 +39,7 @@ import type {
 import type { RepoInspection } from "./host-contract";
 import { DESIGN_LENS_LABELS, ROLES, TRACKS, WORKER_ROLE_IDS, type AssignableRoleId, type ProjectMode, type Track } from "./roles";
 import { ROSTER_PRESETS, ROSTER_PRESET_LABELS, ROSTER_PRESET_NOTES, rosterWarnings, showExec, type RosterPreset } from "./roster";
+import { TOKEN_OUTCOME_LABELS, shareBarWidth, sharePercent } from "./token-profile";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import {
@@ -1026,20 +1027,12 @@ function HealthDialog({ open, prefix, onClose }: { open: boolean; prefix: string
   );
 }
 
-const OUTCOME_LABELS: Record<TokenProfile["byOutcome"][number]["outcome"], { label: string; note: string }> = {
-  merged: { label: "Merged", note: "Tasks with a merged PR" },
-  closed: { label: "Closed without merging", note: "Every PR closed, none merged" },
-  open: { label: "PR still open", note: "Work in progress" },
-  "no-pr": { label: "No PR", note: "Plans, explorations, or work that never reached a PR" },
-  "no-task": { label: "Not tied to a task", note: "Mostly the Lead coordinating" },
-};
-
 /** Where a factory's tokens go, from the run ledger: by role, by what became of the task, in failed turns, and the Lead's growth. */
 function TokenProfileView({ profile, windowed }: { profile: TokenProfile; windowed: boolean }) {
-  const share = (part: number, whole: number) => (whole === 0 ? "—" : `${Math.round((part / whole) * 100)}%`);
+  const share = sharePercent;
   const bar = (part: number, whole: number) => (
     <div className="mt-1 h-1.5 w-full rounded bg-muted" aria-hidden>
-      <div className="h-1.5 rounded bg-primary" style={{ width: whole === 0 ? 0 : `${Math.max(1, (part / whole) * 100)}%` }} />
+      <div className="h-1.5 rounded bg-primary" style={{ width: shareBarWidth(part, whole) }} />
     </div>
   );
   return (
@@ -1062,7 +1055,7 @@ function TokenProfileView({ profile, windowed }: { profile: TokenProfile; window
                 <tr key={role.role} className="align-top">
                   <td className="py-1.5 pr-2">
                     <div className="font-medium">{role.label}</div>
-                    <div className="text-muted-foreground">{role.turns} turn{role.turns === 1 ? "" : "s"}{role.failed === 0 ? "" : `, ${role.failed} failed`}</div>
+                    <div className="text-muted-foreground">{role.turns} turn{role.turns === 1 ? "" : "s"}{role.failed === 0 ? "" : `, ${role.failed} failed`}{role.interrupted === 0 ? "" : `, ${role.interrupted} interrupted`}</div>
                     {bar(role.fresh + role.cached, profile.fresh + profile.cached)}
                   </td>
                   <td className="text-right tabular-nums">{TOKENS.format(role.fresh)} <span className="text-muted-foreground">{share(role.fresh, profile.fresh)}</span></td>
@@ -1076,8 +1069,8 @@ function TokenProfileView({ profile, windowed }: { profile: TokenProfile; window
             {profile.byOutcome.map((entry) => (
               <li key={entry.outcome} className="flex items-baseline justify-between gap-4 py-1.5">
                 <div className="min-w-0">
-                  <div className="font-medium">{OUTCOME_LABELS[entry.outcome].label}{entry.outcome === "no-task" ? "" : ` (${entry.tasks} task${entry.tasks === 1 ? "" : "s"})`}</div>
-                  <div className="text-muted-foreground">{OUTCOME_LABELS[entry.outcome].note}</div>
+                  <div className="font-medium">{TOKEN_OUTCOME_LABELS[entry.outcome].label}{entry.outcome === "no-task" ? "" : ` (${entry.tasks} task${entry.tasks === 1 ? "" : "s"})`}</div>
+                  <div className="text-muted-foreground">{TOKEN_OUTCOME_LABELS[entry.outcome].note}</div>
                 </div>
                 <div className="shrink-0 text-right tabular-nums">
                   {share(entry.fresh, profile.fresh)} excluding cached, {share(entry.cached, profile.cached)} cached
@@ -1088,7 +1081,10 @@ function TokenProfileView({ profile, windowed }: { profile: TokenProfile; window
           <div className="space-y-1 text-xs text-muted-foreground">
             <div>Failed or interrupted turns: {profile.failedTurns.turns}, with {share(profile.failedTurns.fresh, profile.fresh)} of tokens excluding cached and {share(profile.failedTurns.cached, profile.cached)} of cached.</div>
             {profile.leadGrowth === null ? null : (
-              <div>The Lead's cached tokens per turn: {TOKENS.format(profile.leadGrowth.firstQuarter)} in its first quarter of turns, {TOKENS.format(profile.leadGrowth.lastQuarter)} in its last.</div>
+              <div>
+                The Lead's cached tokens per turn: {TOKENS.format(profile.leadGrowth.firstQuarter)} in the first quarter of a Lead thread's turns, {TOKENS.format(profile.leadGrowth.lastQuarter)} in the last
+                ({profile.leadGrowth.threads} Lead thread{profile.leadGrowth.threads === 1 ? "" : "s"} with at least 8 turns).
+              </div>
             )}
             <div>Cached tokens per turn grow with both the context and the steps in a turn. Providers count cached input differently, so compare roles on the same provider.</div>
           </div>
