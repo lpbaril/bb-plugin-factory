@@ -792,15 +792,32 @@ export function prsOpenedBetween<T extends Pick<Pr, "openedAt">>(prs: readonly T
 /** After compacting a Lead, wait this long before compacting it again, so the compaction's own turn can't start another. */
 export const LEAD_COMPACT_COOLDOWN_MS = 30 * 60_000;
 
+/** After failed compactions, wait the cooldown, doubled for each failure in a row, up to a day. */
+export const LEAD_COMPACT_MAX_BACKOFF_MS = 24 * 60 * 60_000;
+export function leadCompactBackoffMs(failures: number): number {
+  return failures <= 0 ? 0 : Math.min(LEAD_COMPACT_MAX_BACKOFF_MS, LEAD_COMPACT_COOLDOWN_MS * 2 ** (failures - 1));
+}
+
 /**
  * Whether to compact an idle Lead's context now: it holds more than the person's threshold (0 is
- * off), nothing waits for the person in its chat (a merge card or a question), and it wasn't
- * compacted in the last half hour.
+ * off), nothing waits for the person in its chat (a merge card or a question), it wasn't compacted
+ * in the last half hour, and it isn't backing off after failed attempts. A time that isn't a real
+ * time counts as no time, so a damaged record can't switch compaction off for good.
  */
-export function leadCompactionDue(args: { usedTokens: number | null; threshold: number; lastCompactedAt: number | null; now: number; waitingForPerson: boolean }): boolean {
+export function leadCompactionDue(args: {
+  usedTokens: number | null;
+  threshold: number;
+  lastCompactedAt: number | null;
+  now: number;
+  waitingForPerson: boolean;
+  lastFailedAt?: number | null;
+  failures?: number;
+}): boolean {
   if (args.threshold <= 0 || args.usedTokens === null || args.usedTokens <= args.threshold) return false;
   if (args.waitingForPerson) return false;
-  return args.lastCompactedAt === null || args.now - args.lastCompactedAt >= LEAD_COMPACT_COOLDOWN_MS;
+  const since = (at: number | null | undefined) => (at == null || !Number.isFinite(at) ? Number.POSITIVE_INFINITY : args.now - at);
+  if (since(args.lastCompactedAt) < LEAD_COMPACT_COOLDOWN_MS) return false;
+  return since(args.lastFailedAt) >= leadCompactBackoffMs(args.failures ?? 0);
 }
 
 /**
@@ -2271,6 +2288,7 @@ export default async function plugin(bb: BbPluginApi) {
     const previous = factoryLocks.get(factory.prefix) ?? Promise.resolve();
     await previous;
     await factoryStorage.remove(factory.prefix);
+    await bb.storage.kv.delete(`lead-compaction:${factory.prefix}`).catch(() => undefined);
     indexFactory(factory.prefix, null);
     factoryLocks.delete(factory.prefix);
     signatures.delete(factory.prefix);
@@ -5348,32 +5366,61 @@ ${findings}`;
       return null;
     }
   }
-  type LeadCompaction = { at: string; usedTokens: number; windowTokens: number };
-  const leadCompactionKey = (threadId: string) => `lead-compaction:${threadId}`;
+  /**
+   * One record per factory, for its current Lead thread: a new Lead starts afresh, and the record
+   * goes with the factory. failures counts failed attempts in a row since the last success.
+   */
+  type LeadCompaction = { threadId: string; at: string | null; usedTokens: number | null; windowTokens: number | null; failedAt: string | null; failures: number; error: string | null };
+  const leadCompactionKey = (prefix: string) => `lead-compaction:${prefix}`;
+  async function leadCompactionRecord(factory: Factory): Promise<LeadCompaction | null> {
+    const record = (await bb.storage.kv.get(leadCompactionKey(factory.prefix))) as Partial<LeadCompaction> | undefined;
+    if (record === undefined || record.threadId !== factory.leadThreadId) return null;
+    return { threadId: record.threadId, at: record.at ?? null, usedTokens: record.usedTokens ?? null, windowTokens: record.windowTokens ?? null, failedAt: record.failedAt ?? null, failures: record.failures ?? 0, error: record.error ?? null };
+  }
+  const parseTime = (value: string | null) => (value === null ? null : Date.parse(value));
   /** Leads being checked or compacted right now, so two idle events don't compact twice. */
   const leadCompacting = new Set<string>();
   async function maybeCompactLead(factory: Factory, threadId: string): Promise<void> {
     if (factory.archivedAt !== null || threadId !== factory.leadThreadId || leadCompacting.has(threadId)) return;
     leadCompacting.add(threadId);
+    let context: { usedTokens: number; windowTokens: number } | null = null;
+    let record: LeadCompaction | null = null;
     try {
       const threshold = (await settings.get()).leadCompactAtTokens;
       if (threshold <= 0) return;
-      const last = (await bb.storage.kv.get(leadCompactionKey(threadId))) as LeadCompaction | undefined;
-      const context = await leadContext(threadId);
+      // The size first: most idles end here, without the other reads.
+      context = await leadContext(threadId);
+      if (context === null || context.usedTokens <= threshold) return;
+      record = await leadCompactionRecord(factory);
       const pending = openMergeCards.has(factory.prefix) ? 1 : (await bb.sdk.threads.interactions.list({ threadId }).catch(() => [{}])).length;
       const due = leadCompactionDue({
-        usedTokens: context?.usedTokens ?? null,
+        usedTokens: context.usedTokens,
         threshold,
-        lastCompactedAt: last === undefined ? null : Date.parse(last.at),
+        lastCompactedAt: parseTime(record?.at ?? null),
         now: Date.now(),
         waitingForPerson: pending > 0,
+        lastFailedAt: parseTime(record?.failedAt ?? null),
+        failures: record?.failures ?? 0,
       });
-      if (!due || context === null) return;
+      if (!due) return;
+      // A new turn could have started during the reads above: compact only a Lead that's still idle.
+      const thread = await bb.sdk.threads.get({ threadId }).catch(() => null);
+      if (thread === null || thread.status !== "idle") return;
       await bb.sdk.threads.compact({ threadId });
-      await bb.storage.kv.set(leadCompactionKey(threadId), { at: new Date().toISOString(), usedTokens: context.usedTokens, windowTokens: context.windowTokens } satisfies LeadCompaction);
+      await bb.storage.kv.set(leadCompactionKey(factory.prefix), { threadId, at: new Date().toISOString(), usedTokens: context.usedTokens, windowTokens: context.windowTokens, failedAt: null, failures: 0, error: null } satisfies LeadCompaction);
       bb.log.info(`compacted the ${factory.prefix} Lead at ${context.usedTokens} tokens (threshold ${threshold})`);
     } catch (error) {
-      bb.log.warn(`could not compact the ${factory.prefix} Lead: ${String(error)}`);
+      const failures = (record?.failures ?? 0) + 1;
+      bb.log.warn(`could not compact the ${factory.prefix} Lead (${failures} in a row; next try in ${Math.round(leadCompactBackoffMs(failures) / 60_000)} min): ${String(error)}`);
+      await bb.storage.kv.set(leadCompactionKey(factory.prefix), {
+        threadId,
+        at: record?.at ?? null,
+        usedTokens: record?.usedTokens ?? null,
+        windowTokens: record?.windowTokens ?? null,
+        failedAt: new Date().toISOString(),
+        failures,
+        error: String(error).slice(0, 300),
+      } satisfies LeadCompaction).catch(() => undefined);
     } finally {
       leadCompacting.delete(threadId);
     }
@@ -5381,7 +5428,11 @@ ${findings}`;
   bb.events.on("thread.idle", async ({ thread }) => {
     const entry = agentsByThread.get(thread.id);
     if (entry === undefined || entry.agent.role !== "lead") return;
-    await maybeCompactLead(await findFactory(entry.factory.prefix), thread.id);
+    try {
+      await maybeCompactLead(await findFactory(entry.factory.prefix), thread.id);
+    } catch (error) {
+      bb.log.warn(`could not check the context of Lead ${thread.id}: ${String(error)}`);
+    }
   });
 
   // Suppressing routine review replies must not hide a reviewer that forgot its verdict.
@@ -6715,15 +6766,18 @@ ${findings}`;
             if (factory.leadThreadId === null) throw new PluginCliError(`Factory ${factory.prefix} has no Lead yet.`, { code: "no_lead", hint: `Start one with \`bb factory start ${factory.prefix}\`.` });
             const context = await leadContext(factory.leadThreadId);
             const threshold = (await settings.get()).leadCompactAtTokens;
-            const last = ((await bb.storage.kv.get(leadCompactionKey(factory.leadThreadId))) as LeadCompaction | undefined) ?? null;
-            const report = { threadId: factory.leadThreadId, usedTokens: context?.usedTokens ?? null, windowTokens: context?.windowTokens ?? null, compactAtTokens: threshold, lastCompaction: last };
+            const record = await leadCompactionRecord(factory);
+            const last = record?.at == null ? null : { at: record.at, usedTokens: record.usedTokens, windowTokens: record.windowTokens };
+            const failing = record === null || record.failures === 0 ? null : { failures: record.failures, failedAt: record.failedAt, error: record.error };
+            const report = { threadId: factory.leadThreadId, usedTokens: context?.usedTokens ?? null, windowTokens: context?.windowTokens ?? null, compactAtTokens: threshold, lastCompaction: last, failing };
             if (input.options.json) return { exitCode: 0, stdout: JSON.stringify(report) };
             return {
               exitCode: 0,
               stdout: [
                 `Lead ${factory.leadThreadId}: ${context === null ? "bb can't say how full its context is right now" : `${compactTokens(context.usedTokens)} of ${compactTokens(context.windowTokens)} tokens in context`}.`,
                 threshold <= 0 ? "Early compaction is off (setting: 0)." : `The factory compacts it when it's idle above ${compactTokens(threshold)}, at most once every 30 minutes, and not while something waits for you.`,
-                last === null ? "The factory hasn't compacted it yet." : `Last compacted by the factory ${last.at}, at ${compactTokens(last.usedTokens)}.`,
+                last === null ? "The factory hasn't compacted it yet." : `Last compacted by the factory ${last.at}${last.usedTokens === null ? "" : `, at ${compactTokens(last.usedTokens)}`}.`,
+                ...(failing === null ? [] : [`The last ${failing.failures === 1 ? "attempt" : `${failing.failures} attempts`} failed (${failing.failedAt}): ${failing.error}. It tries again after ${Math.round(leadCompactBackoffMs(failing.failures) / 60_000)} min.`]),
               ].join("\n"),
             };
           },

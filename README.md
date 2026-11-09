@@ -69,8 +69,10 @@ Settings → Plugins → Factory, or `bb plugin config factory`:
 - **Compact the Lead's context above this many tokens** (300,000 by default; 0 turns it off).
   - **Why:** every Lead turn re-reads its whole conversation, and providers only compact
     near the end of the model's window, which is 967K of 1M on Claude.
-  - **When:** while the Lead is idle, the factory asks bb to compact it. It waits while a
-    merge card or a question waits for you, and compacts at most once every 30 minutes.
+  - **When:** while the Lead is idle, the factory asks bb to compact it, after checking it's
+    still idle. It waits while a merge card or a question waits for you, and compacts at most
+    once every 30 minutes. After a failed attempt it waits 30 minutes, doubling with each
+    failure in a row up to a day, so a provider that can't compact isn't asked every turn.
   - **What stays:** the Lead's standing rules come from the plugin, so they survive.
   - **Checking it:** `bb factory lead-context APP` shows how full the Lead's context is and
     when the factory last compacted it. Health's **Where tokens go** shows the effect on

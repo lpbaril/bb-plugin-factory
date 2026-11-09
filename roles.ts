@@ -309,8 +309,13 @@ This restates your role in case earlier context was compacted. Your first messag
 - After a context reset, run \`bb factory status ${args.prefix}\` and \`bb factory doctor ${args.prefix}\` to see the board, who is working on what, and each task's PR before you act.${args.evidenceContract ? `\n- Check an agent's claim against its evidence (QA's verdict, CI, a task comment, \`git diff --stat\`), not its report; ask QA or a reviewer to look deeper. A PR needs QA to pass, or \`bb factory qa-skip <KEY> --reason "<why>"\`. Follow what a round-complete message says about going to the Planner or the person.` : ""}${args.tracks ? `\n- Give each task a track before work starts: \`bb factory track <KEY> direct|plan|explore\`. direct goes to a Builder; plan needs a READY plan first; explore runs a time-boxed Explorer (\`--role explore\`, more candidates only when the person asks) that opens no PR. Bring each exploration's report to the person; they pick the next step. Only the person closes a task on an agent's advice.` : ""}${args.designReview ? `\n- A READY plan gets fresh design reviewers before any Builder; wait for the factory to say it passed. Bring each ESCALATE, and each question a plan lists for the person, to the person; record answers with \`bb factory design-decide\` or \`bb factory plan-answer\`. Set \`bb factory design-depth <KEY> full\` before the plan is READY when the work is risky.` : ""}`;
 }
 
-/** A worker's last message lands in the Lead's context, which every later Lead turn re-reads. */
-export const FINAL_MESSAGE = "Your final message goes into the Lead's context, so keep it to three lines or fewer: the outcome, a reference to your task comment or PR, and anything blocking. Put your full report, with its evidence and \"Not checked:\", in that comment.";
+/**
+ * A worker's last message lands in the Lead's context, which every later Lead turn re-reads. Only
+ * these roles' final messages reach the Lead: PR reviewers' are suppressed, design reviewers report
+ * through the factory, and the shadow's final message is what its trial compares.
+ */
+export const FINAL_MESSAGE_ROLES: readonly WorkerRoleId[] = ["plan", "explore", "build", "qa", "design"];
+export const FINAL_MESSAGE = "Your final message goes into the Lead's context, so keep it to three lines or fewer: the outcome, a reference to your task comment, and anything blocking. Put your full report, with its evidence, in that comment.";
 
 /** Reviewers feed recurring findings to the factory; the shadow stays out, it reports only to its trial. */
 const REVIEW_LESSONS = `- If a repository rule would have prevented a blocking finding, and it is not a one-off bug: run \`bb factory lessons <PREFIX>\` (the prefix of the task key). If a listed lesson matches, run \`bb factory lesson <KEY> --same-as <id>\`; otherwise run \`bb factory lesson <KEY> --rule "<one imperative sentence>"\`. If \`AGENTS.md\` or the Constitution already states the rule, cite it in your finding instead. The factory tells the Lead once the same lesson appears on a second task.`;
@@ -357,7 +362,7 @@ export function workerReminder(args: { role: WorkerRoleId; factoryName: string; 
   const track = [args.tracks ? TRACK_REMINDERS[args.role] : undefined, args.designReview ? DESIGN_REMINDERS[args.role] : undefined].filter((part) => part !== undefined).join(" ") || undefined;
   return `# Standing role: ${ROLES[args.role].label} in the "${args.factoryName}" software factory, on task ${args.taskKey}
 
-Your first message has your full brief. If it is no longer in your context, re-read the task with \`bb tasks show ${args.taskKey}\`. ${args.role === "designreview" ? "If you can't finish, say why in your final message; never block the task, which others are working on." : `If you cannot continue, run \`bb factory block ${args.taskKey} --reason "<what you need>"\` instead of stalling.`} Don't move the task to Done. ${args.role === "shadow" ? "" : `${FINAL_MESSAGE} `}${WORKER_RULES[args.role]}${track === undefined ? "" : ` ${track}`}${args.evidenceContract ? ` ${EVIDENCE_REMINDERS[args.role]}` : ""}`;
+Your first message has your full brief. If it is no longer in your context, re-read the task with \`bb tasks show ${args.taskKey}\`. ${args.role === "designreview" ? "If you can't finish, say why in your final message; never block the task, which others are working on." : `If you cannot continue, run \`bb factory block ${args.taskKey} --reason "<what you need>"\` instead of stalling.`} Don't move the task to Done. ${FINAL_MESSAGE_ROLES.includes(args.role) ? `${FINAL_MESSAGE} ` : ""}${WORKER_RULES[args.role]}${track === undefined ? "" : ` ${track}`}${args.evidenceContract ? ` ${EVIDENCE_REMINDERS[args.role]}` : ""}`;
 }
 
 const WORKER_CONTRACTS: Record<WorkerRoleId, string> = {
@@ -564,7 +569,7 @@ export function workerPrompt(args: {
 2. Do the work. Comment meaningful progress and evidence on the task with \`bb tasks comment ${args.task.key}\`.
 3. If you cannot continue (missing access, a decision only the person can make, a broken dependency), run \`bb factory block ${args.task.key} --reason "<what you need>"\` and say so in your final message. Do not stall silently.
 4. Do not move the task to Done; the Lead decides that.
-5. End with a short final message: the outcome, the evidence, and anything uncertain or unchecked.`;
+5. Post your full report as a task comment: the outcome, the evidence, and anything uncertain or unchecked. Then end with a final message of three lines or fewer, since it goes into the Lead's context: the outcome, that comment's reference, and anything blocking.`;
   const findings =
     args.findings == null
       ? ""
