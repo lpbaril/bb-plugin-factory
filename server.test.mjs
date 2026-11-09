@@ -11,6 +11,7 @@ registerHooks({ resolve(specifier, context, next) {
   return next(specifier, context);
 } });
 const { default: plugin, computePreset, computeTokenProfile, parsePersonQuestions, personQuestionsGate, parseDesignFindings, planSensitivePaths, designRoundState, designGate, trackGate, parseApproaches, exploreAssignment, readRecommendation, sectionText, supervisorAction, turnsFromEvents, creditUsage, mergeBlockers, sortChecks, latestRuns, mergeOverlapNote, migrateQaResults, qaCarryNote, leadMayMerge, rosterWarnings, computeHealth, parseDay, prsOpenedBetween, qaHold, qaNextStep, parseCoverage, changeRounds, fixLoopAdvice } = await import('./server.ts');
+const { shareBarWidth, sharePercent } = await import('./token-profile.ts');
 const { leadCharter, leadPrompt, reReviewMessage, workerPrompt, workerReminder, designReviewPrompt } = await import('./roles.ts');
 const { createFactoryStorage } = await import('./factory-storage.ts');
 
@@ -5384,26 +5385,49 @@ test('applying refuses when the roster changes while the preset is being worked 
 
 // ----- Token profile in Health -----
 
-const turn = (over = {}) => ({ threadId: 'thr', endSeq: 1, prefix: 'TEST', taskKey: null, role: 'lead', providerId: 'claude-code', model: null, reasoning: null, outcome: 'completed', error: null, startedAt: 0, endedAt: 1, tokensTotal: 100, tokensCached: 80, tokensOutput: 5, ...over });
+const turn = (over = {}) => ({ threadId: 'thr', role: 'lead', taskKey: null, outcome: 'completed', startedAt: 0, fresh: 20, cached: 80, ...over });
 
-test('the token profile splits tokens by role, largest first, with failed turns and cached per turn', () => {
+test('the token profile splits tokens by role, largest first, with failed and interrupted turns apart', () => {
   const profile = computeTokenProfile([
-    turn({ role: 'security', taskKey: 'T-1', tokensTotal: 50, tokensCached: 60 }),
-    turn({ role: 'qa', taskKey: 'T-1', tokensTotal: 200, tokensCached: 100 }),
-    turn({ role: 'qa', taskKey: 'T-1', tokensTotal: 0, tokensCached: -5 }),
-    turn({ role: 'build', taskKey: 'T-1', tokensTotal: 1000, tokensCached: 900 }),
-    turn({ role: 'build', taskKey: 'T-1', tokensTotal: 3000, tokensCached: 2500, outcome: 'failed' }),
-    turn({ role: 'build', taskKey: 'T-1', tokensTotal: null, tokensCached: null, outcome: 'interrupted' }),
+    turn({ role: 'security', taskKey: 'T-1', fresh: 0, cached: 60 }),
+    turn({ role: 'qa', taskKey: 'T-1', fresh: 100, cached: 100 }),
+    turn({ role: 'build', taskKey: 'T-1', fresh: 100, cached: 900 }),
+    turn({ role: 'build', taskKey: 'T-1', fresh: 500, cached: 2500, outcome: 'failed' }),
+    turn({ role: 'build', taskKey: 'T-1', fresh: null, cached: null, outcome: 'interrupted' }),
   ], [{ taskKey: 'T-1', state: 'merged' }]);
-  assert.equal(profile.turns, 6);
+  assert.equal(profile.turns, 5);
   assert.equal(profile.unmeasured, 1, 'counted, adding nothing');
-  assert.deepEqual([profile.fresh, profile.cached], [600 + 100 + 0, 3400 + 100 + 60]);
+  assert.deepEqual([profile.fresh, profile.cached], [700, 3560]);
   assert.deepEqual(profile.byRole.map(role => role.role), ['build', 'qa', 'security'], 'largest first, whatever the order of the turns');
-  assert.equal(profile.byRole[1].cached, 100, 'a negative cached count adds nothing');
   const build = profile.byRole[0];
-  assert.deepEqual([build.label, build.turns, build.failed, build.fresh, build.cached, build.cachedPerTurn], ['Builder', 3, 2, 600, 3400, 1700], 'the median of measured turns only');
-  assert.equal(profile.byRole[2].fresh, 0, 'cached above the total never makes a negative');
-  assert.deepEqual(profile.failedTurns, { turns: 2, fresh: 500, cached: 2500 });
+  assert.deepEqual([build.label, build.turns, build.failed, build.interrupted, build.fresh, build.cached, build.cachedPerTurn], ['Builder', 3, 1, 1, 600, 3400, 1700], 'the median of measured turns only');
+  assert.equal(computeTokenProfile([turn({ role: 'mystery' })], []).byRole[0].label, 'mystery', 'a role the factory doesn\'t know keeps its name');
+  assert.deepEqual(profile.failedTurns, { turns: 2, fresh: 500, cached: 2500 }, 'failed and interrupted together');
+});
+
+test('the token profile compares each Lead thread\'s first and last quarter of turns, once it has 8', () => {
+  const lead = (threadId, startedAt, cached) => turn({ threadId, startedAt, cached });
+  assert.equal(computeTokenProfile(Array.from({ length: 7 }, (_, i) => lead('a', i, 100)), []).leadGrowth, null);
+  // Thread a grows; thread b, a replacement Lead, starts small and grows too. Pooled in time order,
+  // b's small start would land in a's "last quarter" and hide the growth.
+  const a = [100, 120, 300, 400, 500, 600, 900, 1100].map((cached, i) => lead('a', i, cached));
+  const b = [10, 12, 30, 40, 50, 60, 90, 110].map((cached, i) => lead('b', 100 + i, cached));
+  const growth = computeTokenProfile([...b.reverse(), ...a, turn({ role: 'build', threadId: 'a', cached: 99999 })], []).leadGrowth;
+  assert.deepEqual(growth, { threads: 2, turns: 16, firstQuarter: 56, lastQuarter: 505 }, 'each thread in its own start order; pooled in time order it read 210 then 75');
+  const short = computeTokenProfile([...a, ...b.slice(0, 5)], []).leadGrowth;
+  assert.deepEqual([short.threads, short.turns, short.firstQuarter, short.lastQuarter], [1, 8, 110, 1000], 'a thread with fewer than 8 turns is left out');
+  const unmeasured = computeTokenProfile([...a.slice(0, 7), turn({ threadId: 'a', startedAt: 50, fresh: null, cached: null })], []).leadGrowth;
+  assert.equal(unmeasured, null, 'turns without counts don\'t make up the 8');
+});
+
+test('a share bar is empty for nothing and at least a sliver for anything', () => {
+  assert.equal(shareBarWidth(0, 1000), '0%');
+  assert.equal(shareBarWidth(5, 0), '0%');
+  assert.equal(shareBarWidth(1, 1000), '1%');
+  assert.equal(shareBarWidth(250, 1000), '25%');
+  assert.equal(shareBarWidth(2000, 1000), '100%');
+  assert.equal(sharePercent(1, 3), '33%');
+  assert.equal(sharePercent(1, 0), '—');
 });
 
 test('the token profile sorts tokens by what became of each task', () => {
@@ -5427,29 +5451,21 @@ test('the token profile sorts tokens by what became of each task', () => {
   assert.deepEqual(computeTokenProfile([turn({ taskKey: 'X' })], []).byOutcome.map(entry => entry.outcome), ['no-pr'], 'outcomes with no turns are left out');
 });
 
-test('the token profile compares the Lead\'s first and last quarter of turns, once there are 8', () => {
-  const lead = (startedAt, cached) => turn({ startedAt, tokensTotal: cached + 10, tokensCached: cached });
-  assert.equal(computeTokenProfile(Array.from({ length: 7 }, (_, i) => lead(i, 100)), []).leadGrowth, null);
-  const turns = [lead(5, 500), lead(1, 100), lead(2, 120), lead(3, 300), lead(4, 400), lead(6, 600), lead(7, 900), lead(8, 1100), turn({ role: 'build', startedAt: 9, tokensCached: 99999, tokensTotal: 99999 })];
-  assert.deepEqual(computeTokenProfile(turns, []).leadGrowth, { turns: 8, firstQuarter: 110, lastQuarter: 1000 }, 'in start order, the Lead only');
-  const unmeasured = [...turns.slice(0, 8), turn({ startedAt: 0, tokensTotal: null, tokensCached: null })];
-  assert.equal(computeTokenProfile(unmeasured, []).leadGrowth.turns, 8, 'turns without counts are left out');
-});
-
 test('bb factory health shows where tokens go, for the turns that started in the window', async t => {
-  const events = [requested(1), started(2), usage(3, 1000, 700, 100), completed(4), requested(5), started(6), usage(7, 1600, 1000, 150), completed(8, 'failed', 'boom')];
+  const events = [requested(1), started(2), usage(3, 1000, 700, 100), completed(4), requested(5), started(6), usage(7, 1600, 1000, 150), completed(8, 'failed', 'boom'), requested(9), started(10), usage(11, 1700, 1050, 160), completed(12, 'interrupted')];
   const prs = [prRecord(healthPr({ number: 1, taskKey: 'TEST-1', openedAt: local(3), reviews: [approved('review1', SHA_B)] }))];
   const { harness } = await fixture(t, false, { prs }, { threads: { ...eventLog(events) } });
   await harness.behavior.emitThreadEvent('thread.idle', { thread: makeThreadResponse({ id: 'thr_builder' }), lastAssistantText: null });
   const health = await harness.behavior.callRpc('factory_health', { prefix: 'TEST' });
-  assert.equal(health.tokenProfile.turns, 2);
-  assert.deepEqual(health.tokenProfile.byRole.map(role => [role.role, role.turns, role.failed, role.fresh, role.cached]), [['build', 2, 1, 600, 1000]]);
+  assert.equal(health.tokenProfile.turns, 3);
+  assert.deepEqual(health.tokenProfile.byRole.map(role => [role.role, role.turns, role.failed, role.interrupted, role.fresh, role.cached]), [['build', 3, 1, 1, 650, 1050]]);
   assert.deepEqual(health.tokenProfile.byOutcome.map(entry => [entry.outcome, entry.tasks]), [['merged', 1]]);
   const text = (await harness.behavior.runCli(['health', 'TEST'])).stdout;
-  assert.match(text, /\n\nWhere tokens go: 2 turn\(s\)\.\n  Excluding cached: 600\. Cached: 1K\./);
-  assert.match(text, /    Builder: 2 turn\(s\), 1 failed: 600 \(100%\), 1K \(100%\), 500\n/);
-  assert.match(text, /    Merged \(1 task\): 600 \(100%\), 1K \(100%\)/);
-  assert.match(text, /  Failed or interrupted turns: 1, with 50% of tokens excluding cached and 30% of cached\./);
+  assert.match(text, /Tokens per merged task, excluding cached: 650 \(median of 1\)/, 'the same definition as the profile');
+  assert.match(text, /\n\nWhere tokens go: 3 turn\(s\)\.\n  Excluding cached: 650\. Cached: 1\.1K\./);
+  assert.match(text, /    Builder: 3 turn\(s\), 1 failed, 1 interrupted: 650 \(100%\), 1\.1K \(100%\), 300\n/);
+  assert.match(text, /    Merged \(1 task\): 650 \(100%\), 1\.1K \(100%\)/);
+  assert.match(text, /  Failed or interrupted turns: 2, with 54% of tokens excluding cached and 33% of cached\./);
   assert.match(text, /compare roles on the same provider/);
   // The ledger's turns started in 1970, so a window from 2026 holds none of them.
   const windowed = (await harness.behavior.runCli(['health', 'TEST', '--since', '2026-11-05'])).stdout;
@@ -5457,5 +5473,16 @@ test('bb factory health shows where tokens go, for the turns that started in the
   // The task's PR opened after the window, yet its outcome is still what became of it.
   const early = await harness.behavior.callRpc('factory_health', { prefix: 'TEST', before: '2026-11-03' });
   assert.equal(early.prs, 0);
-  assert.deepEqual(early.tokenProfile.byOutcome.map(entry => [entry.outcome, entry.turns]), [['merged', 2]]);
+  assert.deepEqual(early.tokenProfile.byOutcome.map(entry => [entry.outcome, entry.turns]), [['merged', 3]]);
+});
+
+test('bb factory health shows the Lead\'s growth per thread', async t => {
+  const { harness, bb } = await fixture(t);
+  await harness.behavior.callRpc('factory_health', { prefix: 'TEST' }); // the ledger's tables exist once the plugin has read them
+  const insert = bb.storage.database().prepare(`INSERT INTO factory_runs (thread_id, end_seq, prefix, task_key, role, provider_id, model, reasoning, outcome, error, started_at, ended_at, tokens_total, tokens_cached, tokens_output)
+    VALUES (?, ?, 'TEST', NULL, 'lead', 'claude-code', NULL, NULL, 'completed', NULL, ?, ?, ?, ?, 0)`);
+  [100_000, 120_000, 300_000, 400_000, 500_000, 600_000, 900_000, 1_100_000].forEach((cached, i) => insert.run('thr_lead_a', i + 1, i, i + 1, cached + 10, cached));
+  [10_000, 12_000, 30_000].forEach((cached, i) => insert.run('thr_lead_b', i + 1, 100 + i, 101 + i, cached + 10, cached));
+  const text = (await harness.behavior.runCli(['health', 'TEST'])).stdout;
+  assert.match(text, /  Lead's cached tokens per turn: 110K in the first quarter of a Lead thread's turns, 1M in the last \(1 Lead thread with at least 8 turns\)\.\n/);
 });

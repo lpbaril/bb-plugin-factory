@@ -290,15 +290,16 @@ can't be placed in a window, so it's left out and counted.
 
 **Where tokens go**, below the PR numbers, reads the run ledger, for the turns that started in the window:
 
-- **By role:** tokens excluding cached, cached tokens, each role's share, failed turns, and the median cached tokens per turn.
+- **By role:** tokens excluding cached, cached tokens, each role's share, failed and interrupted turns, and the median cached tokens per turn.
 - **By what became of the task:** merged, closed without merging, PR still open, no PR (plans, explorations or work that never reached one), and turns not tied to a task, mostly the Lead's. A task's outcome counts every PR, whenever it opened.
 - **Failed or interrupted turns,** and their share.
-- **The Lead's cached tokens per turn,** in its first and last quarter of turns, once it has 8.
+- **The Lead's cached tokens per turn,** in the first and last quarter of each Lead thread's turns, for threads with at least 8. A replaced Lead starts with a fresh context, so each thread is read on its own.
 
 Cached tokens per turn grow with both the context and the steps in a turn, so they're a
 sign of growth, not a measure of context size. Providers count cached input differently,
 so compare roles on the same provider. Turns from before the ledger counted tokens are
-counted but add none.
+counted but add none. A turn never counts below zero, even when a provider reports more
+cached input than its total; tokens per merged task use the same definition.
 
 ## Run ledger
 

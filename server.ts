@@ -23,6 +23,7 @@ import {
   AGENT_KEYS,
   AGENT_LABELS,
   PRESET_SEATS,
+  roleName,
   REASONING_LEVELS,
   ROSTER_PRESETS,
   ROSTER_PRESET_LABELS,
@@ -36,6 +37,8 @@ import {
   type RosterPreset,
 } from "./roster";
 export { computePreset, rosterWarnings, ROSTER_PRESETS, ROSTER_PRESET_LABELS };
+import { TOKEN_OUTCOMES, TOKEN_OUTCOME_LABELS, compactTokens, computeTokenProfile, sharePercent, type TokenProfile } from "./token-profile";
+export { computeTokenProfile };
 export type { RosterWarning, PresetSeat } from "./roster";
 import type { RosterWarning } from "./roster";
 import type { Lesson, RunCursor, RunRow } from "./factory-storage";
@@ -827,65 +830,6 @@ export function computeHealth(prs: readonly Pr[], tokensByTask: ReadonlyMap<stri
   };
 }
 
-export const TOKEN_OUTCOMES = ["merged", "closed", "open", "no-pr", "no-task"] as const;
-export type TokenOutcome = (typeof TOKEN_OUTCOMES)[number];
-
-/**
- * Where tokens go, from the run ledger: by role, by what became of the task, in failed turns, and
- * whether the Lead's cached tokens per turn grow. Cached tokens per turn grow with both the context
- * and the number of steps in a turn, so they're a sign of context growth, not a measure of it.
- * Providers count cached input differently, so compare roles on one provider.
- */
-export function computeTokenProfile(runs: readonly RunRow[], prs: readonly Pick<Pr, "taskKey" | "state">[]): TokenProfile {
-  const measured = runs.filter((run) => run.tokensTotal !== null);
-  const cachedOf = (run: RunRow) => Math.max(0, run.tokensCached ?? 0);
-  const freshOf = (run: RunRow) => Math.max(0, (run.tokensTotal ?? 0) - cachedOf(run));
-  const split = (rows: readonly RunRow[]) => ({
-    turns: rows.length,
-    fresh: rows.reduce((sum, run) => sum + freshOf(run), 0),
-    cached: rows.reduce((sum, run) => sum + cachedOf(run), 0),
-  });
-  const failed = (run: RunRow) => run.outcome !== "completed";
-  const roles = [...new Set(runs.map((run) => run.role))];
-  const byRole = roles.map((role) => {
-    const rows = runs.filter((run) => run.role === role);
-    return {
-      role,
-      label: (AGENT_LABELS as Record<string, string>)[role] ?? role,
-      ...split(rows),
-      failed: rows.filter(failed).length,
-      cachedPerTurn: median(rows.filter((run) => run.tokensTotal !== null).map(cachedOf)),
-    };
-  }).sort((a, b) => b.fresh + b.cached - (a.fresh + a.cached));
-  const states = new Map<string, Set<Pr["state"]>>();
-  for (const pr of prs) states.set(pr.taskKey, new Set([...(states.get(pr.taskKey) ?? []), pr.state]));
-  const outcomeOf = (taskKey: string | null): TokenOutcome => {
-    if (taskKey === null) return "no-task";
-    const seen = states.get(taskKey);
-    if (seen === undefined) return "no-pr";
-    return seen.has("merged") ? "merged" : seen.has("open") ? "open" : "closed";
-  };
-  const byOutcome = TOKEN_OUTCOMES.map((outcome) => {
-    const rows = runs.filter((run) => outcomeOf(run.taskKey) === outcome);
-    return { outcome, tasks: new Set(rows.flatMap((run) => (run.taskKey === null ? [] : [run.taskKey]))).size, ...split(rows) };
-  }).filter((entry) => entry.turns > 0);
-  const leadTurns = measured.filter((run) => run.role === "lead").sort((a, b) => a.startedAt - b.startedAt);
-  const quarter = Math.floor(leadTurns.length / 4);
-  return {
-    turns: runs.length,
-    unmeasured: runs.length - measured.length,
-    ...(({ fresh, cached }) => ({ fresh, cached }))(split(runs)),
-    byRole,
-    byOutcome,
-    failedTurns: split(runs.filter(failed)),
-    leadGrowth: leadTurns.length < 8 ? null : {
-      turns: leadTurns.length,
-      firstQuarter: median(leadTurns.slice(0, quarter).map(cachedOf))!,
-      lastQuarter: median(leadTurns.slice(-quarter).map(cachedOf))!,
-    },
-  };
-}
-
 /** A question in a READY plan that only the person can answer, and their answer. */
 const personQuestionSchema = z.object({
   id: z.string(),
@@ -1074,15 +1018,18 @@ const tokenProfileSchema = z.object({
   unmeasured: z.number(),
   fresh: z.number(),
   cached: z.number(),
-  byRole: z.array(tokenSplitSchema.extend({ role: z.string(), label: z.string(), failed: z.number(), cachedPerTurn: z.number().nullable() })),
+  byRole: z.array(tokenSplitSchema.extend({ role: z.string(), label: z.string(), failed: z.number(), interrupted: z.number(), cachedPerTurn: z.number().nullable() })),
   /** What became of each task the turns worked on. no-task: turns not tied to a task, mostly the Lead's. */
   byOutcome: z.array(tokenSplitSchema.extend({ outcome: z.enum(TOKEN_OUTCOMES), tasks: z.number() })),
   /** Turns that failed or were interrupted. */
   failedTurns: tokenSplitSchema,
-  /** Median cached tokens per Lead turn in the first and last quarter of its turns, or null with fewer than 8. */
-  leadGrowth: z.object({ turns: z.number(), firstQuarter: z.number(), lastQuarter: z.number() }).nullable(),
-});
-export type TokenProfile = z.infer<typeof tokenProfileSchema>;
+  /**
+   * Median cached tokens per Lead turn in the first and last quarter of each Lead thread's turns,
+   * pooled over the threads with at least 8; null when none has.
+   */
+  leadGrowth: z.object({ threads: z.number(), turns: z.number(), firstQuarter: z.number(), lastQuarter: z.number() }).nullable(),
+}) satisfies z.ZodType<TokenProfile>;
+export type { TokenProfile };
 const factoryHealthSchema = z.object({
   prs: z.number(),
   open: z.number(),
@@ -5510,7 +5457,7 @@ ${findings}`;
       recent: factoryStorage.recentRuns(factory.prefix, taskKey, 50),
     };
   }
-  const roleLabel = (role: string) => ROLES[role as RoleId]?.label ?? role;
+  const roleLabel = roleName;
   function formatRunReport(prefix: string, taskKey: string | null, report: RunReport): string {
     if (report.groups.length === 0) {
       return `No runs recorded for ${taskKey ?? prefix}. Add --sync to read existing threads.`;
@@ -5547,7 +5494,7 @@ ${findings}`;
       before: until === null ? null : before!.trim(),
       undated: window.undated,
       // Every PR, not just the window's: a task's outcome is what became of it, whenever its PR opened.
-      tokenProfile: computeTokenProfile(factoryStorage.runsStartedBetween(factory.prefix, from, until), factory.prs),
+      tokenProfile: computeTokenProfile(factoryStorage.tokenTurns(factory.prefix, from, until), factory.prs),
     };
   }
 
@@ -5569,25 +5516,26 @@ ${findings}`;
   }
 
   function formatTokenProfile(profile: TokenProfile, window: string): string[] {
-    const compact = (value: number) => new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 }).format(Math.round(value));
-    const share = (part: number, whole: number) => (whole === 0 ? "—" : `${Math.round((part / whole) * 100)}%`);
     const head = `Where tokens go${window === "" ? "" : `, turns started ${window}`}: ${profile.turns} turn(s)${profile.unmeasured === 0 ? "" : `, ${profile.unmeasured} without token counts`}.`;
     if (profile.turns === 0) return [head];
-    const outcomeLabel: Record<TokenOutcome, string> = { merged: "Merged", closed: "Closed without merging", open: "PR still open", "no-pr": "No PR", "no-task": "Not tied to a task" };
+    const both = (part: { fresh: number; cached: number }) =>
+      `${compactTokens(part.fresh)} (${sharePercent(part.fresh, profile.fresh)}), ${compactTokens(part.cached)} (${sharePercent(part.cached, profile.cached)})`;
     const lines = [
       head,
-      `  Excluding cached: ${compact(profile.fresh)}. Cached: ${compact(profile.cached)}.`,
+      `  Excluding cached: ${compactTokens(profile.fresh)}. Cached: ${compactTokens(profile.cached)}.`,
       "  By role (excluding cached, cached, median cached per turn):",
-      ...profile.byRole.map((role) =>
-        `    ${role.label}: ${role.turns} turn(s)${role.failed === 0 ? "" : `, ${role.failed} failed`}: ${compact(role.fresh)} (${share(role.fresh, profile.fresh)}), ${compact(role.cached)} (${share(role.cached, profile.cached)}), ${role.cachedPerTurn === null ? "—" : compact(role.cachedPerTurn)}`),
+      ...profile.byRole.map((role) => {
+        const trouble = [role.failed === 0 ? null : `${role.failed} failed`, role.interrupted === 0 ? null : `${role.interrupted} interrupted`].filter((part) => part !== null);
+        return `    ${role.label}: ${role.turns} turn(s)${trouble.length === 0 ? "" : `, ${trouble.join(", ")}`}: ${both(role)}, ${role.cachedPerTurn === null ? "—" : compactTokens(role.cachedPerTurn)}`;
+      }),
       "  By what became of the task (excluding cached, cached):",
       ...profile.byOutcome.map((entry) =>
-        `    ${outcomeLabel[entry.outcome]}${entry.outcome === "no-task" ? "" : ` (${entry.tasks} task${entry.tasks === 1 ? "" : "s"})`}: ${compact(entry.fresh)} (${share(entry.fresh, profile.fresh)}), ${compact(entry.cached)} (${share(entry.cached, profile.cached)})`),
-      `  Failed or interrupted turns: ${profile.failedTurns.turns}, with ${share(profile.failedTurns.fresh, profile.fresh)} of tokens excluding cached and ${share(profile.failedTurns.cached, profile.cached)} of cached.`,
+        `    ${TOKEN_OUTCOME_LABELS[entry.outcome].label}${entry.outcome === "no-task" ? "" : ` (${entry.tasks} task${entry.tasks === 1 ? "" : "s"})`}: ${both(entry)}`),
+      `  Failed or interrupted turns: ${profile.failedTurns.turns}, with ${sharePercent(profile.failedTurns.fresh, profile.fresh)} of tokens excluding cached and ${sharePercent(profile.failedTurns.cached, profile.cached)} of cached.`,
     ];
     if (profile.leadGrowth !== null) {
-      const { firstQuarter, lastQuarter } = profile.leadGrowth;
-      lines.push(`  Lead's cached tokens per turn: ${compact(firstQuarter)} in its first quarter of turns, ${compact(lastQuarter)} in its last (median of ${Math.floor(profile.leadGrowth.turns / 4)} each).`);
+      const { firstQuarter, lastQuarter, threads } = profile.leadGrowth;
+      lines.push(`  Lead's cached tokens per turn: ${compactTokens(firstQuarter)} in the first quarter of a Lead thread's turns, ${compactTokens(lastQuarter)} in the last (${threads} Lead thread${threads === 1 ? "" : "s"} with at least 8 turns).`);
     }
     lines.push("  Providers count cached input differently, so compare roles on the same provider.");
     return lines;

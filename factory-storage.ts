@@ -1,5 +1,6 @@
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import type { Factory } from "./server";
+import type { TokenTurn } from "./token-profile";
 
 /** One finished agent turn, with the tokens from the usage events reported while it was the latest turn. */
 export type RunRow = {
@@ -34,6 +35,14 @@ export type RunGroup = {
   tokensOutput: number;
 };
 export type Lesson = { id: number; rule: string; createdAt: string; notifiedAt: string | null; tasks: string[] };
+
+/**
+ * A turn's tokens, defined once for every report: cached input never counts below zero, and the
+ * rest (new input and output) is what's left of the total, never below zero either. Some providers
+ * report more cached input than the turn's total.
+ */
+const CACHED_SQL = "MAX(0, COALESCE(tokens_cached, 0))";
+const FRESH_SQL = `MAX(0, tokens_total - ${CACHED_SQL})`;
 
 export const FACTORY_MIGRATIONS = [
     `CREATE TABLE factory_metadata (prefix TEXT PRIMARY KEY, payload TEXT NOT NULL);
@@ -253,19 +262,23 @@ export function createFactoryStorage(storage: BbPluginApi["storage"], parse: (va
        ORDER BY ended_at DESC, end_seq DESC LIMIT @limit`,
     ).all({ prefix, taskKey, limit }) as RunRow[];
   }
-  /** Every turn that started in a window, either end open: from `from` (inclusive) to `until` (exclusive). */
-  function runsStartedBetween(prefix: string, from: number | null, until: number | null): RunRow[] {
+  /**
+   * The turns that started in a window, either end open (from inclusive, until exclusive), with only
+   * what the token profile reads. fresh and cached use the same definitions as tokensByTask.
+   */
+  function tokenTurns(prefix: string, from: number | null, until: number | null): TokenTurn[] {
     return db.prepare(
-      `SELECT thread_id AS threadId, end_seq AS endSeq, prefix, task_key AS taskKey, role, provider_id AS providerId, model, reasoning, outcome, error,
-         started_at AS startedAt, ended_at AS endedAt, tokens_total AS tokensTotal, tokens_cached AS tokensCached, tokens_output AS tokensOutput
+      `SELECT thread_id AS threadId, role, task_key AS taskKey, outcome, started_at AS startedAt,
+         CASE WHEN tokens_total IS NULL THEN NULL ELSE ${FRESH_SQL} END AS fresh,
+         CASE WHEN tokens_total IS NULL THEN NULL ELSE ${CACHED_SQL} END AS cached
        FROM factory_runs WHERE prefix = @prefix AND (@from IS NULL OR started_at >= @from) AND (@until IS NULL OR started_at < @until)
        ORDER BY started_at, end_seq`,
-    ).all({ prefix, from, until }) as RunRow[];
+    ).all({ prefix, from, until }) as TokenTurn[];
   }
   /** Tokens per task, excluding cached input, which providers count differently. */
   function tokensByTask(prefix: string): Map<string, number> {
     const rows = db.prepare(
-      `SELECT task_key AS taskKey, COALESCE(SUM(tokens_total - COALESCE(tokens_cached, 0)), 0) AS tokens
+      `SELECT task_key AS taskKey, COALESCE(SUM(${FRESH_SQL}), 0) AS tokens
        FROM factory_runs WHERE prefix = ? AND task_key IS NOT NULL GROUP BY task_key`,
     ).all(prefix) as { taskKey: string; tokens: number }[];
     return new Map(rows.map((row) => [row.taskKey, row.tokens]));
@@ -298,7 +311,7 @@ export function createFactoryStorage(storage: BbPluginApi["storage"], parse: (va
 
   return {
     read, write, remove, readTrial, writeTrial, retireTrial, prefixes,
-    runCursor, appendRuns, runGroups, recentRuns, runsStartedBetween, tokensByTask, threadModels,
+    runCursor, appendRuns, runGroups, recentRuns, tokenTurns, tokensByTask, threadModels,
     lessons, recordLesson, markLessonNotified,
   };
 }
