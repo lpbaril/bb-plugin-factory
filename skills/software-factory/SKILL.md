@@ -182,6 +182,7 @@ skip docs-only changes. PRs stay drafts until every reviewer approves, so
 | `bb factory lessons APP` | List the factory's recurring review findings and their tasks. |
 | `bb factory runs APP [--task APP-12] [--sync]` | Show finished agent turns by role and model. `--sync` first reads every agent thread, including older ones. |
 | `bb factory health APP [--since YYYY-MM-DD] [--before YYYY-MM-DD]` | Show review rounds, changes requested, time to ready and tokens per merged task, with sample sizes, optionally for PRs opened in a date window. Also where tokens go, for turns started in the window: by role, by what became of the task, in failed turns, and the Lead's growth per turn. |
+| `bb factory lead-context APP [--json]` | Show how full the Lead's context is, the size above which the factory compacts it while it's idle, and when it last did. |
 | `bb factory dismiss APP-12 --reason "..."` | Dismiss the shadow Security reviewer's REQUEST CHANGES. Only the task's Security reviewer can run this; the person can also dismiss from the task on the Factory page. |
 | `bb factory rafter check` | Check the Rafter API key and show the scan quota (never prints the key). |
 | `bb factory rafter scan APP-12` | Rescan the task's open PR with Rafter and hand the results to its Security reviewer. |
