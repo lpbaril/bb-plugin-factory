@@ -153,3 +153,17 @@ test('tokensByTask sums each task, leaves out cached input and other factories',
   store.appendRuns('e', [row('e', 'OTHER', 'P-1', 700, 0)], cursor);
   assert.deepEqual([...store.tokensByTask('P')].sort(), [['P-1', 70], ['P-2', 0]]);
 });
+
+test('runsStartedBetween keeps turns that started from one time up to another, in order', async t => {
+  const { bb, harness } = createFakePluginHost({ pluginId: 'factory' });
+  t.after(() => harness.lifecycle.dispose());
+  const store = createFactoryStorage(bb.storage, identity);
+  const run = (endSeq, startedAt, prefix = 'BIG') => ({ threadId: 'thr', endSeq, prefix, taskKey: null, role: 'lead', providerId: 'codex', model: null, reasoning: null, outcome: 'completed', error: null, startedAt, endedAt: startedAt + 10, tokensTotal: 1, tokensCached: 0, tokensOutput: 0 });
+  store.appendRuns('thr', [run(3, 3000), run(1, 1000), run(2, 2000)], { lastSeq: 3, usageSeq: 3, tokensTotal: 3, tokensCached: 0, tokensOutput: 0 });
+  store.appendRuns('other', [{ ...run(1, 1500, 'OTHER'), threadId: 'other' }], { lastSeq: 1, usageSeq: 1, tokensTotal: 1, tokensCached: 0, tokensOutput: 0 });
+  const seqs = (from, until) => store.runsStartedBetween('BIG', from, until).map(row => row.endSeq);
+  assert.deepEqual(seqs(null, null), [1, 2, 3], 'oldest first, one factory only');
+  assert.deepEqual(seqs(2000, null), [2, 3], 'from is inclusive');
+  assert.deepEqual(seqs(null, 2000), [1], 'until is exclusive');
+  assert.deepEqual(seqs(1001, 3000), [2]);
+});

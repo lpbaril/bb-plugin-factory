@@ -288,6 +288,18 @@ PRs opened in a window: on the Factory page, pick the days in **Health**, or run
 before it. Days are YYYY-MM-DD, from midnight on the machine bb runs on. A PR with no open date
 can't be placed in a window, so it's left out and counted.
 
+**Where tokens go**, below the PR numbers, reads the run ledger, for the turns that started in the window:
+
+- **By role:** tokens excluding cached, cached tokens, each role's share, failed turns, and the median cached tokens per turn.
+- **By what became of the task:** merged, closed without merging, PR still open, no PR (plans, explorations or work that never reached one), and turns not tied to a task, mostly the Lead's. A task's outcome counts every PR, whenever it opened.
+- **Failed or interrupted turns,** and their share.
+- **The Lead's cached tokens per turn,** in its first and last quarter of turns, once it has 8.
+
+Cached tokens per turn grow with both the context and the steps in a turn, so they're a
+sign of growth, not a measure of context size. Providers count cached input differently,
+so compare roles on the same provider. Turns from before the ledger counted tokens are
+counted but add none.
+
 ## Run ledger
 
 Factory records every finished turn of every factory agent: its task, role,

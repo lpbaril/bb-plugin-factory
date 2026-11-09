@@ -253,6 +253,15 @@ export function createFactoryStorage(storage: BbPluginApi["storage"], parse: (va
        ORDER BY ended_at DESC, end_seq DESC LIMIT @limit`,
     ).all({ prefix, taskKey, limit }) as RunRow[];
   }
+  /** Every turn that started in a window, either end open: from `from` (inclusive) to `until` (exclusive). */
+  function runsStartedBetween(prefix: string, from: number | null, until: number | null): RunRow[] {
+    return db.prepare(
+      `SELECT thread_id AS threadId, end_seq AS endSeq, prefix, task_key AS taskKey, role, provider_id AS providerId, model, reasoning, outcome, error,
+         started_at AS startedAt, ended_at AS endedAt, tokens_total AS tokensTotal, tokens_cached AS tokensCached, tokens_output AS tokensOutput
+       FROM factory_runs WHERE prefix = @prefix AND (@from IS NULL OR started_at >= @from) AND (@until IS NULL OR started_at < @until)
+       ORDER BY started_at, end_seq`,
+    ).all({ prefix, from, until }) as RunRow[];
+  }
   /** Tokens per task, excluding cached input, which providers count differently. */
   function tokensByTask(prefix: string): Map<string, number> {
     const rows = db.prepare(
@@ -289,7 +298,7 @@ export function createFactoryStorage(storage: BbPluginApi["storage"], parse: (va
 
   return {
     read, write, remove, readTrial, writeTrial, retireTrial, prefixes,
-    runCursor, appendRuns, runGroups, recentRuns, tokensByTask, threadModels,
+    runCursor, appendRuns, runGroups, recentRuns, runsStartedBetween, tokensByTask, threadModels,
     lessons, recordLesson, markLessonNotified,
   };
 }

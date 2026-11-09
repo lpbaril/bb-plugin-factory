@@ -823,6 +823,66 @@ export function computeHealth(prs: readonly Pr[], tokensByTask: ReadonlyMap<stri
     since: null,
     before: null,
     undated: 0,
+    tokenProfile: null,
+  };
+}
+
+export const TOKEN_OUTCOMES = ["merged", "closed", "open", "no-pr", "no-task"] as const;
+export type TokenOutcome = (typeof TOKEN_OUTCOMES)[number];
+
+/**
+ * Where tokens go, from the run ledger: by role, by what became of the task, in failed turns, and
+ * whether the Lead's cached tokens per turn grow. Cached tokens per turn grow with both the context
+ * and the number of steps in a turn, so they're a sign of context growth, not a measure of it.
+ * Providers count cached input differently, so compare roles on one provider.
+ */
+export function computeTokenProfile(runs: readonly RunRow[], prs: readonly Pick<Pr, "taskKey" | "state">[]): TokenProfile {
+  const measured = runs.filter((run) => run.tokensTotal !== null);
+  const cachedOf = (run: RunRow) => Math.max(0, run.tokensCached ?? 0);
+  const freshOf = (run: RunRow) => Math.max(0, (run.tokensTotal ?? 0) - cachedOf(run));
+  const split = (rows: readonly RunRow[]) => ({
+    turns: rows.length,
+    fresh: rows.reduce((sum, run) => sum + freshOf(run), 0),
+    cached: rows.reduce((sum, run) => sum + cachedOf(run), 0),
+  });
+  const failed = (run: RunRow) => run.outcome !== "completed";
+  const roles = [...new Set(runs.map((run) => run.role))];
+  const byRole = roles.map((role) => {
+    const rows = runs.filter((run) => run.role === role);
+    return {
+      role,
+      label: (AGENT_LABELS as Record<string, string>)[role] ?? role,
+      ...split(rows),
+      failed: rows.filter(failed).length,
+      cachedPerTurn: median(rows.filter((run) => run.tokensTotal !== null).map(cachedOf)),
+    };
+  }).sort((a, b) => b.fresh + b.cached - (a.fresh + a.cached));
+  const states = new Map<string, Set<Pr["state"]>>();
+  for (const pr of prs) states.set(pr.taskKey, new Set([...(states.get(pr.taskKey) ?? []), pr.state]));
+  const outcomeOf = (taskKey: string | null): TokenOutcome => {
+    if (taskKey === null) return "no-task";
+    const seen = states.get(taskKey);
+    if (seen === undefined) return "no-pr";
+    return seen.has("merged") ? "merged" : seen.has("open") ? "open" : "closed";
+  };
+  const byOutcome = TOKEN_OUTCOMES.map((outcome) => {
+    const rows = runs.filter((run) => outcomeOf(run.taskKey) === outcome);
+    return { outcome, tasks: new Set(rows.flatMap((run) => (run.taskKey === null ? [] : [run.taskKey]))).size, ...split(rows) };
+  }).filter((entry) => entry.turns > 0);
+  const leadTurns = measured.filter((run) => run.role === "lead").sort((a, b) => a.startedAt - b.startedAt);
+  const quarter = Math.floor(leadTurns.length / 4);
+  return {
+    turns: runs.length,
+    unmeasured: runs.length - measured.length,
+    ...(({ fresh, cached }) => ({ fresh, cached }))(split(runs)),
+    byRole,
+    byOutcome,
+    failedTurns: split(runs.filter(failed)),
+    leadGrowth: leadTurns.length < 8 ? null : {
+      turns: leadTurns.length,
+      firstQuarter: median(leadTurns.slice(0, quarter).map(cachedOf))!,
+      lastQuarter: median(leadTurns.slice(-quarter).map(cachedOf))!,
+    },
   };
 }
 
@@ -1006,6 +1066,23 @@ const factorySummarySchema = factorySchema.omit({ agents: true, prs: true }).ext
 export type FactorySummary = z.infer<typeof factorySummarySchema>;
 
 const healthMeasureSchema = z.object({ median: z.number().nullable(), sample: z.number() });
+const tokenSplitSchema = z.object({ turns: z.number(), fresh: z.number(), cached: z.number() });
+/** Where a factory's tokens go. fresh: new input and output; cached: input read again from the provider's cache. */
+const tokenProfileSchema = z.object({
+  /** Turns the profile covers, and those with no token counts (counted, but adding nothing). */
+  turns: z.number(),
+  unmeasured: z.number(),
+  fresh: z.number(),
+  cached: z.number(),
+  byRole: z.array(tokenSplitSchema.extend({ role: z.string(), label: z.string(), failed: z.number(), cachedPerTurn: z.number().nullable() })),
+  /** What became of each task the turns worked on. no-task: turns not tied to a task, mostly the Lead's. */
+  byOutcome: z.array(tokenSplitSchema.extend({ outcome: z.enum(TOKEN_OUTCOMES), tasks: z.number() })),
+  /** Turns that failed or were interrupted. */
+  failedTurns: tokenSplitSchema,
+  /** Median cached tokens per Lead turn in the first and last quarter of its turns, or null with fewer than 8. */
+  leadGrowth: z.object({ turns: z.number(), firstQuarter: z.number(), lastQuarter: z.number() }).nullable(),
+});
+export type TokenProfile = z.infer<typeof tokenProfileSchema>;
 const factoryHealthSchema = z.object({
   prs: z.number(),
   open: z.number(),
@@ -1020,6 +1097,8 @@ const factoryHealthSchema = z.object({
   before: z.string().nullable().default(null),
   /** PRs left out of a window because they have no open date. */
   undated: z.number().default(0),
+  /** Where the tokens of the turns that started in the window went. */
+  tokenProfile: tokenProfileSchema.nullable().default(null),
 });
 export type FactoryHealth = z.infer<typeof factoryHealthSchema>;
 
@@ -5462,7 +5541,14 @@ ${findings}`;
       throw new PluginCliError(`--since ${since} isn't before --before ${before}, so no PR could be in that window.`, { code: "invalid_date" });
     }
     const window = prsOpenedBetween(factory.prs, from, until);
-    return { ...computeHealth(window.prs, factoryStorage.tokensByTask(factory.prefix)), since: from === null ? null : since!.trim(), before: until === null ? null : before!.trim(), undated: window.undated };
+    return {
+      ...computeHealth(window.prs, factoryStorage.tokensByTask(factory.prefix)),
+      since: from === null ? null : since!.trim(),
+      before: until === null ? null : before!.trim(),
+      undated: window.undated,
+      // Every PR, not just the window's: a task's outcome is what became of it, whenever its PR opened.
+      tokenProfile: computeTokenProfile(factoryStorage.runsStartedBetween(factory.prefix, from, until), factory.prs),
+    };
   }
 
   function formatHealth(prefix: string, health: FactoryHealth): string {
@@ -5478,7 +5564,33 @@ ${findings}`;
       `  Time from open to ready: ${measure(health.timeToReadyMs, (ms) => `${Math.round(ms / 60_000)} min`)}`,
       `  Tokens per merged task, excluding cached: ${measure(health.tokensPerMergedTask, (value) => number(Math.round(value)))}`,
       ...(health.undated === 0 ? [] : [`  Left out: ${health.undated} PR(s) with no open date, which can't be placed in the window.`]),
+      ...(health.tokenProfile === null ? [] : ["", ...formatTokenProfile(health.tokenProfile, window)]),
     ].join("\n");
+  }
+
+  function formatTokenProfile(profile: TokenProfile, window: string): string[] {
+    const compact = (value: number) => new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 }).format(Math.round(value));
+    const share = (part: number, whole: number) => (whole === 0 ? "—" : `${Math.round((part / whole) * 100)}%`);
+    const head = `Where tokens go${window === "" ? "" : `, turns started ${window}`}: ${profile.turns} turn(s)${profile.unmeasured === 0 ? "" : `, ${profile.unmeasured} without token counts`}.`;
+    if (profile.turns === 0) return [head];
+    const outcomeLabel: Record<TokenOutcome, string> = { merged: "Merged", closed: "Closed without merging", open: "PR still open", "no-pr": "No PR", "no-task": "Not tied to a task" };
+    const lines = [
+      head,
+      `  Excluding cached: ${compact(profile.fresh)}. Cached: ${compact(profile.cached)}.`,
+      "  By role (excluding cached, cached, median cached per turn):",
+      ...profile.byRole.map((role) =>
+        `    ${role.label}: ${role.turns} turn(s)${role.failed === 0 ? "" : `, ${role.failed} failed`}: ${compact(role.fresh)} (${share(role.fresh, profile.fresh)}), ${compact(role.cached)} (${share(role.cached, profile.cached)}), ${role.cachedPerTurn === null ? "—" : compact(role.cachedPerTurn)}`),
+      "  By what became of the task (excluding cached, cached):",
+      ...profile.byOutcome.map((entry) =>
+        `    ${outcomeLabel[entry.outcome]}${entry.outcome === "no-task" ? "" : ` (${entry.tasks} task${entry.tasks === 1 ? "" : "s"})`}: ${compact(entry.fresh)} (${share(entry.fresh, profile.fresh)}), ${compact(entry.cached)} (${share(entry.cached, profile.cached)})`),
+      `  Failed or interrupted turns: ${profile.failedTurns.turns}, with ${share(profile.failedTurns.fresh, profile.fresh)} of tokens excluding cached and ${share(profile.failedTurns.cached, profile.cached)} of cached.`,
+    ];
+    if (profile.leadGrowth !== null) {
+      const { firstQuarter, lastQuarter } = profile.leadGrowth;
+      lines.push(`  Lead's cached tokens per turn: ${compact(firstQuarter)} in its first quarter of turns, ${compact(lastQuarter)} in its last (median of ${Math.floor(profile.leadGrowth.turns / 4)} each).`);
+    }
+    lines.push("  Providers count cached input differently, so compare roles on the same provider.");
+    return lines;
   }
 
   bb.events.on("thread.idle", async ({ thread }) => {
