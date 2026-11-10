@@ -244,6 +244,22 @@ still run `gh pr merge` directly, and a merge may happen overnight under `when-g
 The policy replaces conflicting instructions with one rule; it doesn't stop an agent
 determined to ignore it.
 
+**Actions on the Factory page can't tell you from an agent.** bb reports the page, the
+`bb` CLI and agents alike as the same kind of caller, so an agent could run
+`bb plugin rpc call factory …` to do what the page does. Five kinds of page action notify
+you on your phone and desktop, each with "If you didn't do this, an agent made the call",
+and say so in the plugin log:
+
+- merging from the card;
+- answering a plan's question or an escalated finding;
+- dismissing a shadow block;
+- changing the agent roster or applying a preset;
+- deleting a factory.
+
+Answers, decisions and dismissals made there are recorded as "from the Factory page", not
+as yours. Every agent is told never to use `bb plugin rpc` on the factory. That stops one
+following an instruction planted in a PR or an issue, not one determined to get round it.
+
 ## Evidence contract
 
 New factories run with a stricter contract for what counts as done. Existing factories
