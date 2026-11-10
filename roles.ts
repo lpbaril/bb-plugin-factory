@@ -527,7 +527,7 @@ function evidenceBrief(role: WorkerRoleId, taskKey: string): string {
 const PLAN_DESIGN_REVIEW = `## Design review of your plan
 
 - A READY plan also needs a "## Success checks" heading: the observable checks that show the work is done, each one something QA or a reviewer can run.
-- A question only the person can answer goes under "## Open questions" as its own line: \`- For the person: Q1. <the question> Assumed: <what the plan builds on until they answer>\`. Don't settle it yourself, and don't leave it only in the plan's prose. The factory brings each one to the person through the Lead, and no Builder starts until they've answered. If they answer differently, the factory tells you, and you post a new READY plan that follows their answer.
+- A question only the person can answer goes under "## Open questions" as its own line: \`- For the person: Q1. <the question> Assumed: <what the plan builds on until they answer>\`. Options, and the "Assumed:" line, can go on indented lines under it. Don't settle it yourself, and don't leave it only in the plan's prose. The factory brings each one to the person through the Lead, and no Builder starts until they've answered. If they answer differently, the factory tells you, and you post a new READY plan that follows their answer.
 - When you mark a plan ready, fresh design reviewers read it without your reasoning, one per lens. The factory sends you their findings, each with an id and a severity: Blocker, Major or Nit.
 - Resolve every finding with \`bb factory design-resolve <KEY> --finding <id> --as <resolution> --note "<why>"\`:
   - **fix**: the finding is right; change the plan.
