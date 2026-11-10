@@ -496,15 +496,31 @@ export function designRoundState(round: Pick<DesignRound, "lenses" | "findings">
   return "settled";
 }
 
-/** The longest question and assumption kept, so a runaway section can't swell the factory's record. */
-const PERSON_QUESTION_MAX = 1500;
-const PERSON_ASSUMPTION_MAX = 600;
+/**
+ * The longest question and assumption kept. Questions reach the Lead's context in full, so these
+ * stay small: room for a few options, not a runaway section.
+ */
+const PERSON_QUESTION_MAX = 1000;
+const PERSON_ASSUMPTION_MAX = 400;
+
+/** A question's first line, which says what it asks; the lines after it are its options. */
+export function questionHead(text: string): string {
+  const end = text.indexOf("\n");
+  return end < 0 ? text : text.slice(0, end);
+}
+/** Text whose later lines are indented by `prefix`, so a multi-line question stays under its label. */
+export function indentLater(text: string, prefix: string): string {
+  return text.replace(/\n/g, `\n${prefix}`);
+}
 
 /**
  * The questions a READY plan's "## Open questions" lists for the person: lines that start with
  * "For the person:", such as "- For the person: Q1. Round to what? Assumed: up to the next unit.".
- * A question goes on over the indented lines under it, such as options and an "Assumed:" line, until
- * an unindented line or the next question. Each gets an id, its own "Q<n>" if it gives one.
+ * A question goes on over the lines indented deeper than its own bullet, even after a blank line,
+ * until a line at its depth or shallower, or the next question. Among those lines, bullets are its
+ * options (nesting kept), a line starting with "Assumed:" is its assumption, and other lines are
+ * wrapped text that continues what came before. "Assumed:" on the question's own line is its
+ * assumption too; the first one found counts. Each gets an id, its own "Q<n>" if it gives one.
  */
 export function parsePersonQuestions(body: string): Pick<PersonQuestion, "id" | "text" | "assumed">[] {
   const start = body.indexOf("## Open questions");
@@ -514,27 +530,52 @@ export function parsePersonQuestions(body: string): Pick<PersonQuestion, "id" | 
   const section = end < 0 ? rest : rest.slice(0, end);
   const found: { id: string | null; text: string; assumed: string | null }[] = [];
   const opener = /^\s*(?:[-*]|\d+[.)])?\s*(?:\*\*)?for the person(?:\*\*)?\s*:\s*(?:\*\*)?\s*(.+?)\s*$/i;
+  const bullet = /^(?:[-*]|\d+[.)])\s+/;
+  const indentOf = (line: string) => /^[ \t]*/.exec(line)![0].replace(/\t/g, "    ").length;
+  const plain = (value: string) => value.replace(/\*\*/g, "").trim();
   const lines = section.split("\n");
   for (let index = 0; index < lines.length; index++) {
     const match = opener.exec(lines[index]!);
     if (match === null) continue;
-    const parts = [match[1]!.trim()];
-    // Indented lines under the question are part of it, even after a blank line; an unindented
-    // line or the next question ends it.
+    const depth = indentOf(lines[index]!);
+    let head = plain(match[1]!);
+    const prose = [head];
+    const items: { level: number; text: string }[] = [];
+    let assumption: string[] | null = null;
+    // Where wrapped text goes: the question, its last option, its assumption, or nowhere (a second "Assumed:").
+    let last: "question" | "item" | "assumed" | "ignored" = "question";
+    const inline = head.search(/\bAssumed:/);
+    if (inline >= 0) {
+      assumption = [head.slice(inline + "Assumed:".length).trim()];
+      prose[0] = head = head.slice(0, inline).trim();
+      last = "assumed";
+    }
+    let itemDepth: number | null = null;
     while (index + 1 < lines.length) {
       const next = lines[index + 1]!;
       if (next.trim() !== "") {
-        if (!/^\s/.test(next) || opener.test(next)) break;
-        parts.push(next.trim());
+        if (indentOf(next) <= depth || opener.test(next)) break;
+        const content = plain(next);
+        const item = bullet.exec(content);
+        if (item !== null) {
+          itemDepth ??= indentOf(next);
+          items.push({ level: Math.max(0, Math.min(3, Math.round((indentOf(next) - itemDepth) / 2))), text: content.slice(item[0].length).trim() });
+          last = "item";
+        } else if (/^assumed:/i.test(content)) {
+          if (assumption === null) {
+            assumption = [content.slice("Assumed:".length).trim()];
+            last = "assumed";
+          } else last = "ignored";
+        } else if (last === "item") items.at(-1)!.text += ` ${content}`;
+        else if (last === "assumed") assumption!.push(content);
+        else if (last === "question") prose.push(content);
       }
       index += 1;
     }
-    let text = parts.join("\n").replace(/\*\*/g, "").trim();
+    let text = [prose.join(" ").trim(), ...items.map((entry) => `${"  ".repeat(entry.level)}- ${entry.text}`)].join("\n").trim();
     const id = /^(Q\d+)[.:)]?\s*/i.exec(text);
     if (id !== null) text = text.slice(id[0].length);
-    const assumedAt = text.search(/\bAssumed:/i);
-    const assumed = assumedAt < 0 ? null : text.slice(assumedAt + "Assumed:".length).replace(/\s*\n\s*/g, " ").trim() || null;
-    if (assumedAt >= 0) text = text.slice(0, assumedAt).trim();
+    const assumed = assumption === null ? null : assumption.join(" ").trim() || null;
     if (text !== "") found.push({ id: id === null ? null : id[1]!.toUpperCase(), text: text.slice(0, PERSON_QUESTION_MAX), assumed: assumed?.slice(0, PERSON_ASSUMPTION_MAX) ?? null });
   }
   // A question keeps the id it gives, if no earlier one gave it too; the rest get the lowest id nobody
@@ -2836,10 +2877,12 @@ export default async function plugin(bb: BbPluginApi) {
         }
       }
       // Each READY plan asks its own questions. An answer that kept the earlier plan's assumption carries
-      // over to the same question, worded the same; anything else is asked again.
+      // over to the same question: the same first line and the same assumption, whatever its options
+      // say now. An answer recorded with no assumption (questions read before options and assumptions
+      // on later lines were) keeps the plan's assumption as it stood. Anything else is asked again.
       const earlier = plan.personQuestions;
       const questions = (factory.designReviewEnabled ? parsePersonQuestions(document.body) : []).map((question) => {
-        const same = earlier.find((entry) => entry.id === question.id && entry.text === question.text && entry.assumed === question.assumed && entry.answer?.choice === "keep");
+        const same = earlier.find((entry) => entry.id === question.id && questionHead(entry.text) === questionHead(question.text) && (entry.assumed === question.assumed || entry.assumed === null) && entry.answer?.choice === "keep");
         return { ...question, answer: same?.answer ?? null, notifiedAt: same?.notifiedAt ?? null };
       });
       await mutateFactory(factory.prefix, (current) => {
@@ -3113,7 +3156,7 @@ export default async function plugin(bb: BbPluginApi) {
     const plan = factory.plans.find((entry) => entry.taskKey === taskKey);
     const pending = plan?.personQuestions.filter((question) => question.notifiedAt === null && question.answer === null) ?? [];
     if (plan === undefined || pending.length === 0) return;
-    const text = `[factory] ${taskKey}'s READY plan has ${pending.length === 1 ? "a question" : `${pending.length} questions`} only the person can answer:\n${pending.map((question) => `${question.id}: ${question.text}${question.assumed === null ? "" : `\n  The plan assumes: ${question.assumed}`}`).join("\n")}\n\nAsk the person now; no Builder starts until each is answered. Record each answer with \`bb factory plan-answer ${taskKey} keep --question <id>\` when the plan's assumption holds, or \`bb factory plan-answer ${taskKey} change --question <id> --answer "<their answer>"\`. The person can also answer on the task on the Factory page.`;
+    const text = `[factory] ${taskKey}'s READY plan has ${pending.length === 1 ? "a question" : `${pending.length} questions`} only the person can answer:\n${pending.map((question) => `${question.id}: ${indentLater(question.text, "    ")}${question.assumed === null ? "" : `\n  The plan assumes: ${question.assumed}`}`).join("\n")}\n\nAsk the person now; no Builder starts until each is answered. Record each answer with \`bb factory plan-answer ${taskKey} keep --question <id>\` when the plan's assumption holds, or \`bb factory plan-answer ${taskKey} change --question <id> --answer "<their answer>"\`. The person can also answer on the task on the Factory page.`;
     if (!(await tellLead(factory, text))) return;
     const now = new Date().toISOString();
     await mutateFactory(prefix, (current) => {
@@ -7004,7 +7047,8 @@ ${findings}`;
                   lines.push(`      Explorer${entry.of > 1 ? ` ${entry.candidate}/${entry.of}` : ""} ${entry.threadId}${entry.approach === null ? "" : ` (${entry.approach})`}: ${entry.recommendation === null ? `exploring, ${entry.timeboxMinutes}-minute time box` : `recommends ${entry.recommendation} · comment ${entry.reportCommentId}`}`);
                 }
                 for (const question of task.personQuestions) {
-                  lines.push(`      ${question.id} for the person: ${question.text}${question.answer === null ? " (unanswered)" : question.answer.choice === "keep" ? " → keep the plan's assumption" : ` → ${question.answer.text}`}`);
+                  const answer = question.answer === null ? " (unanswered)" : question.answer.choice === "keep" ? " → keep the plan's assumption" : ` → ${question.answer.text}`;
+                  lines.push(`      ${question.id} for the person${answer}: ${indentLater(question.text, "          ")}`);
                 }
                 if (task.design !== null) {
                   const blocking = task.design.findings.filter((finding) => finding.severity !== "nit");
