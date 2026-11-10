@@ -1107,7 +1107,11 @@ function TokenProfileView({ profile, windowed }: { profile: TokenProfile; window
 
 // ---------- Per-factory settings ----------
 
-/** The per-factory settings that are otherwise CLI- and person-only, in one place on the Factory page. */
+/**
+ * A factory's own settings in one place on the Factory page. The page can turn a guard on, but taking
+ * one away (design review or the evidence contract off, the Lead merging) stays with the CLI: the
+ * server can't tell this page from an agent making the same call.
+ */
 function SettingsDialog({
   open,
   factory,
@@ -1142,7 +1146,8 @@ function SettingsDialog({
 
   // Each toggle reads as a positive ("on" means the feature runs); the Automatic PR actions
   // toggle is positive too, so a change sends paused = !checked.
-  const toggles: { id: string; label: string; note: string; checked: boolean; change: (next: boolean) => FactoryOptionChange }[] = [
+  // offCommand: a guard the page can turn on but not off, with the command that turns it off.
+  const toggles: { id: string; label: string; note: string; checked: boolean; offCommand?: string; change: (next: boolean) => FactoryOptionChange }[] = [
     {
       id: "tracks",
       label: "Tracks and the Explorer",
@@ -1155,6 +1160,7 @@ function SettingsDialog({
       label: "Design review",
       note: "Fresh reviewers read each READY plan before any Builder starts; the Planner resolves their findings.",
       checked: factory.designReviewEnabled,
+      offCommand: `bb factory design-review ${factory.prefix} off`,
       change: (next) => ({ kind: "designReview", enabled: next }),
     },
     {
@@ -1162,6 +1168,7 @@ function SettingsDialog({
       label: "Evidence and review contract",
       note: "Requires a blocking QA verdict, per-file review coverage and the set finding format.",
       checked: factory.evidenceContract,
+      offCommand: `bb factory evidence-contract ${factory.prefix} off`,
       change: (next) => ({ kind: "evidenceContract", enabled: next }),
     },
     {
@@ -1183,26 +1190,35 @@ function SettingsDialog({
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-1">
-          {toggles.map((toggle) => (
-            <label
-              key={toggle.id}
-              className={cn(
-                "flex cursor-pointer items-start gap-3 rounded-md px-2 py-2.5 hover:bg-state-hover",
-                pending === toggle.id && "opacity-60",
-              )}
-            >
-              <Checkbox
-                checked={toggle.checked}
-                disabled={pending !== null}
-                onCheckedChange={(next) => void apply(toggle.id, toggle.change(next === true))}
-                className="mt-0.5"
-              />
-              <span className="space-y-0.5">
-                <span className="block text-sm font-medium">{toggle.label}</span>
-                <span className="block text-xs text-muted-foreground">{toggle.note}</span>
-              </span>
-            </label>
-          ))}
+          {toggles.map((toggle) => {
+            const locked = toggle.checked && toggle.offCommand !== undefined;
+            return (
+              <label
+                key={toggle.id}
+                className={cn(
+                  "flex items-start gap-3 rounded-md px-2 py-2.5",
+                  locked ? null : "cursor-pointer hover:bg-state-hover",
+                  pending === toggle.id && "opacity-60",
+                )}
+              >
+                <Checkbox
+                  checked={toggle.checked}
+                  disabled={pending !== null || locked}
+                  onCheckedChange={(next) => void apply(toggle.id, toggle.change(next === true))}
+                  className="mt-0.5"
+                />
+                <span className="space-y-0.5">
+                  <span className="block text-sm font-medium">{toggle.label}</span>
+                  <span className="block text-xs text-muted-foreground">{toggle.note}</span>
+                  {locked ? (
+                    <span className="block text-xs text-muted-foreground">
+                      To turn it off, run <code className="font-mono">{toggle.offCommand}</code> in your own terminal.
+                    </span>
+                  ) : null}
+                </span>
+              </label>
+            );
+          })}
           <div className="flex items-start gap-3 rounded-md px-2 py-2.5">
             <div className="space-y-1.5">
               <span className="block text-sm font-medium">Who merges pull requests</span>
@@ -1216,7 +1232,7 @@ function SettingsDialog({
                     size="sm"
                     variant="outline"
                     aria-pressed={factory.mergePolicy === policy}
-                    disabled={pending !== null || factory.mergePolicy === policy}
+                    disabled={pending !== null || factory.mergePolicy === policy || policy !== "person"}
                     onClick={() => void apply("mergePolicy", { kind: "mergePolicy", policy })}
                     className={cn(factory.mergePolicy === policy && "border-foreground bg-foreground text-background")}
                   >
@@ -1224,6 +1240,11 @@ function SettingsDialog({
                   </Button>
                 ))}
               </div>
+              {factory.mergePolicy === "person" ? (
+                <span className="block text-xs text-muted-foreground">
+                  To let the Lead merge, run <code className="font-mono">bb factory merge-policy {factory.prefix} when-green</code> in your own terminal.
+                </span>
+              ) : null}
             </div>
           </div>
         </div>
