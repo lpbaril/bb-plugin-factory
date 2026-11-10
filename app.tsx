@@ -1107,6 +1107,45 @@ function TokenProfileView({ profile, windowed }: { profile: TokenProfile; window
 
 // ---------- Per-factory settings ----------
 
+/** A CLI command on its own line: tapping the text selects all of it, and the button copies it. */
+function CopyCommand({ command }: { command: string }) {
+  const [copied, setCopied] = useState<"yes" | "failed" | null>(null);
+  const copy = async () => {
+    let ok = false;
+    try {
+      await navigator.clipboard.writeText(command);
+      ok = true;
+    } catch {
+      // No clipboard permission here: copy through a selection instead.
+      const area = document.createElement("textarea");
+      area.value = command;
+      area.setAttribute("readonly", "");
+      area.style.position = "fixed";
+      area.style.opacity = "0";
+      document.body.appendChild(area);
+      area.select();
+      try {
+        ok = document.execCommand("copy");
+      } catch {
+        ok = false;
+      }
+      area.remove();
+    }
+    setCopied(ok ? "yes" : "failed");
+    setTimeout(() => setCopied(null), 2500);
+  };
+  return (
+    // Inside a label, a click would otherwise go to the label's checkbox.
+    <span className="mt-1 flex items-center gap-2 rounded-md border border-border bg-muted/40 py-1.5 pl-2.5 pr-1.5" onClick={(event) => event.preventDefault()}>
+      <code className="min-w-0 flex-1 select-all break-words font-mono text-xs text-foreground">{command}</code>
+      <Button type="button" size="sm" variant="outline" className="h-7 shrink-0 gap-1 px-2" aria-label={`Copy the command ${command}`} onClick={() => void copy()}>
+        <Icon name={copied === "yes" ? "Check" : "Copy"} className="size-3.5" />
+        {copied === "yes" ? "Copied" : copied === "failed" ? "Select the text" : "Copy"}
+      </Button>
+    </span>
+  );
+}
+
 /**
  * A factory's own settings in one place on the Factory page. The page can turn a guard on, but taking
  * one away (design review or the evidence contract off, the Lead merging) stays with the CLI: the
@@ -1211,8 +1250,9 @@ function SettingsDialog({
                   <span className="block text-sm font-medium">{toggle.label}</span>
                   <span className="block text-xs text-muted-foreground">{toggle.note}</span>
                   {locked ? (
-                    <span className="block text-xs text-muted-foreground">
-                      To turn it off, run <code className="font-mono">{toggle.offCommand}</code> in your own terminal.
+                    <span className="block pt-1 text-xs text-muted-foreground">
+                      To turn it off, run this in your own terminal:
+                      <CopyCommand command={toggle.offCommand!} />
                     </span>
                   ) : null}
                 </span>
@@ -1232,17 +1272,18 @@ function SettingsDialog({
                     size="sm"
                     variant="outline"
                     aria-pressed={factory.mergePolicy === policy}
-                    disabled={pending !== null || factory.mergePolicy === policy || policy !== "person"}
-                    onClick={() => void apply("mergePolicy", { kind: "mergePolicy", policy })}
-                    className={cn(factory.mergePolicy === policy && "border-foreground bg-foreground text-background")}
+                    disabled={factory.mergePolicy === policy ? false : pending !== null || policy !== "person"}
+                    onClick={() => { if (factory.mergePolicy !== policy) void apply("mergePolicy", { kind: "mergePolicy", policy }); }}
+                    className={cn(factory.mergePolicy === policy && "cursor-default border-foreground bg-foreground text-background hover:bg-foreground hover:text-background")}
                   >
                     {policy === "person" ? "Person" : "When green"}
                   </Button>
                 ))}
               </div>
               {factory.mergePolicy === "person" ? (
-                <span className="block text-xs text-muted-foreground">
-                  To let the Lead merge, run <code className="font-mono">bb factory merge-policy {factory.prefix} when-green</code> in your own terminal.
+                <span className="block pt-1 text-xs text-muted-foreground">
+                  Now: the person merges. To let the Lead merge, run this in your own terminal:
+                  <CopyCommand command={`bb factory merge-policy ${factory.prefix} when-green`} />
                 </span>
               ) : null}
             </div>
