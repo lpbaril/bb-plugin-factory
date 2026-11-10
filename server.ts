@@ -503,11 +503,6 @@ export function designRoundState(round: Pick<DesignRound, "lenses" | "findings">
 const PERSON_QUESTION_MAX = 1000;
 const PERSON_ASSUMPTION_MAX = 400;
 
-/** A question's first line, which says what it asks; the lines after it are its options. */
-export function questionHead(text: string): string {
-  const end = text.indexOf("\n");
-  return end < 0 ? text : text.slice(0, end);
-}
 /** Text whose later lines are indented by `prefix`, so a multi-line question stays under its label. */
 export function indentLater(text: string, prefix: string): string {
   return text.replace(/\n/g, `\n${prefix}`);
@@ -2877,12 +2872,12 @@ export default async function plugin(bb: BbPluginApi) {
         }
       }
       // Each READY plan asks its own questions. An answer that kept the earlier plan's assumption carries
-      // over to the same question: the same first line and the same assumption, whatever its options
-      // say now. An answer recorded with no assumption (questions read before options and assumptions
-      // on later lines were) keeps the plan's assumption as it stood. Anything else is asked again.
+      // over only to the same question, word for word, options included, with the same assumption: the
+      // person approved those exact choices, so a reworded option or a newly stated assumption is asked
+      // again rather than approved on their behalf.
       const earlier = plan.personQuestions;
       const questions = (factory.designReviewEnabled ? parsePersonQuestions(document.body) : []).map((question) => {
-        const same = earlier.find((entry) => entry.id === question.id && questionHead(entry.text) === questionHead(question.text) && (entry.assumed === question.assumed || entry.assumed === null) && entry.answer?.choice === "keep");
+        const same = earlier.find((entry) => entry.id === question.id && entry.text === question.text && entry.assumed === question.assumed && entry.answer?.choice === "keep");
         return { ...question, answer: same?.answer ?? null, notifiedAt: same?.notifiedAt ?? null };
       });
       await mutateFactory(factory.prefix, (current) => {
