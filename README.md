@@ -246,19 +246,22 @@ determined to ignore it.
 
 **Actions on the Factory page can't tell you from an agent.** bb reports the page, the
 `bb` CLI and agents alike as the same kind of caller, so an agent could run
-`bb plugin rpc call factory …` to do what the page does. Five kinds of page action notify
-you on your phone and desktop, each with "If you didn't do this, an agent made the call",
-and say so in the plugin log:
+`bb plugin rpc call factory …` to do what the page does. These page actions notify you on
+your phone and desktop, each with "If you didn't do this, an agent made the call", and say
+so in the plugin log:
 
 - merging from the card;
 - answering a plan's question or an escalated finding;
+- changing a task's track;
 - dismissing a shadow block;
 - changing the agent roster or applying a preset;
-- deleting a factory.
+- deleting a factory, including a delete that stops partway.
 
-Answers, decisions and dismissals made there are recorded as "from the Factory page", not
-as yours. Every agent is told never to use `bb plugin rpc` on the factory. That stops one
-following an instruction planted in a PR or an issue, not one determined to get round it.
+Changing a factory's settings on the page only tightens its guards, so it doesn't notify.
+Merges, answers, decisions, track changes and dismissals made there are recorded as "from
+the Factory page", not as yours, and that's how the Planner hears about them. Every agent
+is told never to use `bb plugin rpc` on the factory. That stops one following an
+instruction planted in a PR or an issue, not one determined to get round it.
 
 ## Evidence contract
 

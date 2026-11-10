@@ -10,7 +10,7 @@ registerHooks({ resolve(specifier, context, next) {
   }
   return next(specifier, context);
 } });
-const { default: plugin, computePreset, computeTokenProfile, leadCompactionDue, leadCompactBackoffMs, LEAD_COMPACT_COOLDOWN_MS, parsePersonQuestions, personQuestionsGate, parseDesignFindings, planSensitivePaths, designRoundState, designGate, trackGate, parseApproaches, exploreAssignment, readRecommendation, sectionText, supervisorAction, turnsFromEvents, creditUsage, mergeBlockers, sortChecks, latestRuns, mergeOverlapNote, migrateQaResults, qaCarryNote, leadMayMerge, rosterWarnings, computeHealth, parseDay, prsOpenedBetween, qaHold, qaNextStep, parseCoverage, changeRounds, fixLoopAdvice } = await import('./server.ts');
+const { default: plugin, computePreset, computeTokenProfile, asSentence, PAGE_NOTICE_TIMEOUT_MS, leadCompactionDue, leadCompactBackoffMs, LEAD_COMPACT_COOLDOWN_MS, parsePersonQuestions, personQuestionsGate, parseDesignFindings, planSensitivePaths, designRoundState, designGate, trackGate, parseApproaches, exploreAssignment, readRecommendation, sectionText, supervisorAction, turnsFromEvents, creditUsage, mergeBlockers, sortChecks, latestRuns, mergeOverlapNote, migrateQaResults, qaCarryNote, leadMayMerge, rosterWarnings, computeHealth, parseDay, prsOpenedBetween, qaHold, qaNextStep, parseCoverage, changeRounds, fixLoopAdvice } = await import('./server.ts');
 const { shareBarWidth, sharePercent } = await import('./token-profile.ts');
 const { leadCharter, leadPrompt, reReviewMessage, workerPrompt, workerReminder, designReviewPrompt } = await import('./roles.ts');
 const { createFactoryStorage } = await import('./factory-storage.ts');
@@ -3745,7 +3745,7 @@ test('Merge on the card runs the gated merge for that commit and records it', as
   assert.equal(merges().length, 1);
   assert.ok(merges()[0].includes('--match-head-commit') && merges()[0].includes(FULL_A));
   const stored = (await readPrs(bb))[0].merge;
-  assert.equal(stored.by, 'person');
+  assert.equal(stored.by, 'page', 'a card merge is a page action, not provably the person');
   assert.equal(stored.via, 'card');
   assert.ok(posted.some(body => /at `[0-9a-f]{7}` from the merge card\.$/.test(body)), posted.join('\n'));
   assert.ok(!posted.some(body => /run by the person/.test(body)), 'a card merge doesn\'t claim the person ran it');
@@ -4791,7 +4791,7 @@ test('the person\'s "fix" goes to the Planner, and the Factory page can answer f
   await harness.behavior.runCli(['design-resolve', 'TEST-1', '--finding', '1.zoom-out.1', '--as', 'escalate', '--note', 'The person chose this parser on purpose'], { threadId: 'thr_planner' });
   await assert.rejects(harness.behavior.callRpc('task_design_decide', { taskKey: 'TEST-1', findingId: '1.zoom-out.1', choice: 'fix' }, { experimental_caller: { kind: 'plugin', pluginId: 'other' } }), /Only the Factory page/);
   assert.deepEqual(await harness.behavior.callRpc('task_design_decide', { taskKey: 'TEST-1', findingId: '1.zoom-out.1', choice: 'fix' }), { ok: true });
-  assert.match(say('thr_planner', /The person wants design finding 1\.zoom-out\.1 on TEST-1 fixed/)[0], /post a new complete READY plan/);
+  assert.match(say('thr_planner', /A decision from the Factory page wants design finding 1\.zoom-out\.1 on TEST-1 fixed/)[0], /post a new complete READY plan/, 'the Planner isn\'t told it was the person');
   const factory = await read();
   assert.equal(factory.designRounds[0].findings[0].decision.by, 'page', 'the page can\'t tell the person from an agent');
   assert.equal(designRoundState(factory.designRounds[0]), 'needs-new-plan');
@@ -5861,7 +5861,7 @@ test('every agent is told never to use bb plugin rpc on the factory', async () =
   const { leadCharter, workerReminder, WORKER_ROLE_IDS, NO_PAGE_CALLS } = await import('./roles.ts');
   for (const mergePolicy of ['person', 'when-green']) {
     const charter = leadCharter({ factoryName: 'F', prefix: 'F', mergePolicy, evidenceContract: true, tracks: true, designReview: true });
-    assert.match(charter, /Never use `bb plugin rpc` on the factory\./);
+    assert.ok(charter.includes(NO_PAGE_CALLS), 'the same rule, word for word, as every worker');
     assert.ok(charter.length <= 4096, `${charter.length}`);
   }
   for (const role of [...WORKER_ROLE_IDS, 'designreview', 'shadow']) assert.ok(workerReminder({ role, factoryName: 'F', taskKey: 'F-1' }).includes(NO_PAGE_CALLS), role);
@@ -5882,4 +5882,69 @@ test('a shadow block dismissed from the page says so on the task and the PR, and
   const notice = notices.find(entry => entry.title === 'TEST-1: shadow Security block dismissed');
   assert.match(notice.body, /^Dismissed on the Factory page for PR #7: Not reachable here\. If you didn't do this, an agent made the call/);
   assert.equal(notice.threadId, 'thr_lead');
+});
+
+test('a track changed on the page says so, tells the person, and is quiet when nothing changed', async t => {
+  const notices = [];
+  const fx = await designFixture(t, {}, { tasksRpc: async ({ method, input }) => { if (method === 'notifications.send') { notices.push(input); return { ok: true }; } return undefined; } });
+  await assert.rejects(fx.harness.behavior.callRpc('task_set_track', { taskKey: 'TEST-1', track: 'direct' }, { experimental_caller: { kind: 'plugin', pluginId: 'other' } }), /Only the Factory page/);
+  assert.deepEqual(await fx.harness.behavior.callRpc('task_set_track', { taskKey: 'test-1', track: 'direct' }), { track: 'direct' });
+  assert.ok(fx.posted.includes('Track: **direct**, set on the Factory page.'), fx.posted.join('\n'));
+  assert.deepEqual(notices.map(entry => [entry.title, entry.threadId]), [['TEST-1: track set to direct', 'thr_lead']], 'the task key as the board shows it');
+  assert.match(notices[0].body, /^Set on the Factory page\. A direct task goes to a Builder without a plan\. If you didn't do this/);
+  await fx.harness.behavior.callRpc('task_set_track', { taskKey: 'TEST-1', track: 'direct' });
+  assert.equal(notices.length, 1, 'no change, no notice');
+  await fx.harness.behavior.runCli(['track', 'TEST-1', 'plan']);
+  assert.ok(fx.posted.includes('Track: **plan**, set by the person.'), 'from the person\'s terminal');
+});
+
+test('the Planner hears a page answer and a page decision as from the page, and status says so', async t => {
+  const notices = [];
+  const board = [{ id: 'task_1', key: 'TEST-1', projectId: 'tracker', title: 'Test', description: '', status: 'todo', priority: 'none', position: 0, labelIds: [], createdAt: '', updatedAt: '' }];
+  const fx = await designFixture(t, {}, { tasksRpc: async ({ method, input }) => { if (method === 'notifications.send') { notices.push(input); return { ok: true }; } if (method === 'listTasks') return { tasks: board }; return undefined; } });
+  await fx.markReady('plan_1', withQuestions('- For the person: Q1. Round to what amount? Assumed: the next whole unit.'));
+  await fx.record('thr_d1', 'Zoom Out', finding(1, 'Major', 'Reinvents the parser'));
+  await fx.record('thr_d2', 'Comprehension');
+  await fx.record('thr_d3', 'Codebase Details');
+  await fx.harness.behavior.callRpc('task_plan_answer', { taskKey: 'test-1', questionId: ' q1 ', choice: 'change', answer: 'Round up to the next 5' });
+  assert.match(fx.say('thr_planner', /answered Q1 on TEST-1 differently/)[0], /^\[factory\] An answer from the Factory page answered Q1 on TEST-1 differently from the plan: Round up to the next 5/);
+  assert.equal(notices.at(-1).title, 'TEST-1: Q1 answered', 'canonical, not the raw input');
+  await fx.harness.behavior.runCli(['design-resolve', 'TEST-1', '--finding', '1.zoom-out.1', '--as', 'escalate', '--note', 'The person chose this parser'], { threadId: 'thr_planner' });
+  await fx.harness.behavior.callRpc('task_design_decide', { taskKey: 'test-1', findingId: '1.zoom-out.1', choice: 'fix' });
+  assert.match(fx.say('thr_planner', /wants design finding 1\.zoom-out\.1 on TEST-1 fixed/)[0], /^\[factory\] A decision from the Factory page wants design finding/);
+  assert.equal(notices.at(-1).title, 'TEST-1: design finding 1.zoom-out.1 decided');
+  const status = (await fx.harness.behavior.runCli(['status', 'TEST'])).stdout;
+  assert.match(status, /1\.zoom-out\.1 major: Reinvents the parser → escalate, from the Factory page: fix/);
+  assert.doesNotMatch(status, /person: fix/);
+});
+
+test('a factory delete that stops partway still tells the person', async t => {
+  const notices = [];
+  const { harness } = await fixture(t, false, { agents: [{ threadId: 'thr_builder', role: 'build', taskKey: 'TEST-1', providerId: 'codex', createdAt: '', pr: null }] }, {
+    threads: { get: async ({ threadId }) => makeThreadResponse({ id: threadId, archivedAt: null, deletedAt: null }), archive: async () => ({}) },
+    tasksRpc: async ({ method, input }) => {
+      if (method === 'notifications.send') { notices.push(input); return { ok: true }; }
+      if (method === 'deleteProject') return { ok: false, error: { code: 'busy', message: 'the board is locked' } };
+      return undefined;
+    },
+  });
+  await assert.rejects(harness.behavior.callRpc('factory_delete', { prefix: 'test', deleteTasks: true, archiveThreads: true }), /the board is locked/);
+  assert.equal(notices.length, 1);
+  assert.equal(notices[0].title, 'Factory TEST delete stopped partway');
+  assert.match(notices[0].body, /^A delete from the Factory page failed: Could not delete the task board: the board is locked\. Some of its agent threads may already be archived\. If you didn't do this/);
+});
+
+test('a notifier that never answers doesn\'t hold up the page', async t => {
+  const fx = await designFixture(t, {}, { tasksRpc: async ({ method }) => (method === 'notifications.send' ? new Promise(() => {}) : undefined) });
+  const started = Date.now();
+  assert.deepEqual(await fx.harness.behavior.callRpc('task_set_track', { taskKey: 'TEST-1', track: 'direct' }), { track: 'direct' });
+  const waited = Date.now() - started;
+  assert.ok(waited >= PAGE_NOTICE_TIMEOUT_MS - 50 && waited < PAGE_NOTICE_TIMEOUT_MS + 3000, `${waited} ms`);
+});
+
+test('asSentence cuts text and ends it with one full stop', () => {
+  assert.equal(asSentence('  Not reachable here '), 'Not reachable here.');
+  assert.equal(asSentence('Done!'), 'Done!');
+  assert.equal(asSentence('Already.'), 'Already.');
+  assert.equal(asSentence('x'.repeat(300)).length, 201);
 });
