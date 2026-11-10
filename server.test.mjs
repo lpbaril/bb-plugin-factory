@@ -5741,19 +5741,22 @@ test('a multi-line question stays under its label in the Lead\'s message and in 
   assert.match(status, /\n      Q1 for the person \(unanswered\): Backfill past imports\? Choose one:\n          - \(A\) Yes, in this task\n          - \(B\) No\n/, 'the answer state on the first line, the options indented under it');
 });
 
-test('a kept answer carries over when the first line and the assumption are the same, whatever the options say', async t => {
+test('a kept answer carries over only to the same question, options and assumption included', async t => {
   const fx = await designFixture(t);
   const ask = (options, assumed = '(A).') => withQuestions(`- For the person: Q1. Backfill past imports? Choose one:\n${options}\n  Assumed: ${assumed}`);
   await fx.markReady('plan_1', ask('  - (A) Yes\n  - (B) No'));
   await fx.harness.behavior.runCli(['plan-answer', 'TEST-1', 'keep', '--question', 'Q1'], { threadId: 'thr_lead' });
   for (const [threadId, lens] of [['thr_d1', 'Zoom Out'], ['thr_d2', 'Comprehension'], ['thr_d3', 'Codebase Details']]) await fx.record(threadId, lens);
-  await fx.markReady('plan_2', ask('  - (A) Yes, in this task\n  - (B) No').replace('Change tip.py.', 'Change tip.py and README.md.'));
-  assert.equal((await fx.read()).plans[0].personQuestions[0].answer?.choice, 'keep', 'an option reworded: not asked again');
-  await fx.markReady('plan_3', ask('  - (A) Yes\n  - (B) No', '(B).').replace('Change tip.py.', 'Change tip.py and docs.'));
+  await fx.markReady('plan_2', ask('  - (A) Yes\n  - (B) No').replace('Change tip.py.', 'Change tip.py and README.md.'));
+  assert.equal((await fx.read()).plans[0].personQuestions[0].answer?.choice, 'keep', 'the same question and assumption, word for word');
+  await fx.markReady('plan_3', ask('  - (A) Delete past imports\n  - (B) No').replace('Change tip.py.', 'Change tip.py and docs.'));
+  assert.equal((await fx.read()).plans[0].personQuestions[0].answer, null, 'the option behind the assumption changed: the person is asked again, not approved for them');
+  await fx.harness.behavior.runCli(['plan-answer', 'TEST-1', 'keep', '--question', 'Q1'], { threadId: 'thr_lead' });
+  await fx.markReady('plan_4', ask('  - (A) Delete past imports\n  - (B) No', '(B).').replace('Change tip.py.', 'Change tip.py and tests.'));
   assert.equal((await fx.read()).plans[0].personQuestions[0].answer, null, 'a different assumption is asked again');
 });
 
-test('an answer recorded before options were read keeps the plan\'s assumption across the upgrade', async t => {
+test('an answer recorded with no assumption isn\'t stretched to cover one the next plan states', async t => {
   const fx = await designFixture(t);
   // As the earlier parser recorded a question with indented options: the first line only, and no assumption.
   await fx.markReady('plan_1', withQuestions('- For the person: Q1. Backfill past imports? Choose one:'));
@@ -5761,6 +5764,6 @@ test('an answer recorded before options were read keeps the plan\'s assumption a
   for (const [threadId, lens] of [['thr_d1', 'Zoom Out'], ['thr_d2', 'Comprehension'], ['thr_d3', 'Codebase Details']]) await fx.record(threadId, lens);
   await fx.markReady('plan_2', withQuestions('- For the person: Q1. Backfill past imports? Choose one:\n  - (A) Yes\n  - (B) No\n  Assumed: (A).').replace('Change tip.py.', 'Change tip.py and README.md.'));
   const [question] = (await fx.read()).plans[0].personQuestions;
-  assert.equal(question.answer?.choice, 'keep');
+  assert.equal(question.answer, null, 'the person sees the stated assumption and answers again');
   assert.equal(question.assumed, '(A).');
 });
