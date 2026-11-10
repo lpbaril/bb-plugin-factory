@@ -37,7 +37,7 @@ import type {
   rpcContract,
 } from "./server";
 import type { RepoInspection } from "./host-contract";
-import { DESIGN_LENS_LABELS, ROLES, TRACKS, WORKER_ROLE_IDS, type AssignableRoleId, type ProjectMode, type Track } from "./roles";
+import { DESIGN_LENS_LABELS, MERGE_POLICIES, ROLES, TRACKS, WORKER_ROLE_IDS, type AssignableRoleId, type ProjectMode, type Track } from "./roles";
 import { ROSTER_PRESETS, ROSTER_PRESET_LABELS, ROSTER_PRESET_NOTES, rosterWarnings, showExec, type RosterPreset } from "./roster";
 import { TOKEN_OUTCOME_LABELS, shareBarWidth, sharePercent } from "./token-profile";
 import { Button } from "@/components/ui/button";
@@ -793,6 +793,7 @@ function FactoryView({ prefix }: { prefix: string }) {
   const [showAlignment, setShowAlignment] = useState(false);
   const [showRuns, setShowRuns] = useState(false);
   const [showHealth, setShowHealth] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
 
   const move = useCallback(
     (taskId: string, column: Column) => {
@@ -830,6 +831,10 @@ function FactoryView({ prefix }: { prefix: string }) {
             <Button size="sm" variant="secondary" onClick={() => setShowRuns(true)}>
               Runs
             </Button>
+            <Button size="sm" variant="secondary" onClick={() => setShowSettings(true)}>
+              <Icon name="Settings" className="mr-1 size-3.5" />
+              Settings
+            </Button>
             {doctor === null ? null : (
               <AlignmentBar doctor={doctor} onOpen={() => setShowAlignment(true)} />
             )}
@@ -856,6 +861,12 @@ function FactoryView({ prefix }: { prefix: string }) {
       />
       <RunsDialog open={showRuns} prefix={prefix} onClose={() => setShowRuns(false)} />
       <HealthDialog open={showHealth} prefix={prefix} onClose={() => setShowHealth(false)} />
+      <SettingsDialog
+        open={showSettings}
+        factory={board.factory}
+        onClose={() => setShowSettings(false)}
+        onChanged={(summary) => setBoard((current) => (current === null ? current : { ...current, factory: summary }))}
+      />
       <AlignmentDialog
         open={showAlignment}
         doctor={doctor}
@@ -1091,6 +1102,137 @@ function TokenProfileView({ profile, windowed }: { profile: TokenProfile; window
         </>
       )}
     </section>
+  );
+}
+
+// ---------- Per-factory settings ----------
+
+/** The per-factory settings that are otherwise CLI- and person-only, in one place on the Factory page. */
+function SettingsDialog({
+  open,
+  factory,
+  onClose,
+  onChanged,
+}: {
+  open: boolean;
+  factory: FactorySummary;
+  onClose: () => void;
+  onChanged: (summary: FactorySummary) => void;
+}) {
+  const rpc = useRpc<typeof rpcContract>();
+  const [pending, setPending] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  // The discriminated change payload the factory_set_option RPC accepts.
+  type FactoryOptionChange = Parameters<typeof rpc.call<"factory_set_option">>[1]["change"];
+
+  const apply = useCallback(
+    async (id: string, change: FactoryOptionChange) => {
+      setPending(id);
+      setError(null);
+      try {
+        onChanged(await rpc.call("factory_set_option", { prefix: factory.prefix, change }));
+      } catch (cause) {
+        setError(errorText(cause));
+      } finally {
+        setPending(null);
+      }
+    },
+    [rpc, factory.prefix, onChanged],
+  );
+
+  // Each toggle reads as a positive ("on" means the feature runs); the Automatic PR actions
+  // toggle is positive too, so a change sends paused = !checked.
+  const toggles: { id: string; label: string; note: string; checked: boolean; change: (next: boolean) => FactoryOptionChange }[] = [
+    {
+      id: "tracks",
+      label: "Tracks and the Explorer",
+      note: "Lets the Lead route each task as direct, plan or explore, and adds the report-only Explorer for spikes.",
+      checked: factory.tracksEnabled,
+      change: (next) => ({ kind: "tracks", enabled: next }),
+    },
+    {
+      id: "designReview",
+      label: "Design review",
+      note: "Fresh reviewers read each READY plan before any Builder starts; the Planner resolves their findings.",
+      checked: factory.designReviewEnabled,
+      change: (next) => ({ kind: "designReview", enabled: next }),
+    },
+    {
+      id: "evidenceContract",
+      label: "Evidence and review contract",
+      note: "Requires a blocking QA verdict, per-file review coverage and the set finding format.",
+      checked: factory.evidenceContract,
+      change: (next) => ({ kind: "evidenceContract", enabled: next }),
+    },
+    {
+      id: "reviewsPaused",
+      label: "Automatic PR actions",
+      note: "When off, the factory stops starting reviewers and marking PRs ready; assignments and verdict recording still work.",
+      checked: !factory.reviewsPaused,
+      change: (next) => ({ kind: "reviewsPaused", paused: !next }),
+    },
+  ];
+
+  return (
+    <Dialog open={open} onOpenChange={(next) => { if (!next) onClose(); }}>
+      <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>{factory.prefix} settings</DialogTitle>
+          <DialogDescription>
+            Per-factory switches. Changes apply to work from now on; agents already running keep their first brief and pick up new standing rules on their next turn.
+          </DialogDescription>
+        </DialogHeader>
+        <div className="space-y-1">
+          {toggles.map((toggle) => (
+            <label
+              key={toggle.id}
+              className={cn(
+                "flex cursor-pointer items-start gap-3 rounded-md px-2 py-2.5 hover:bg-state-hover",
+                pending === toggle.id && "opacity-60",
+              )}
+            >
+              <Checkbox
+                checked={toggle.checked}
+                disabled={pending !== null}
+                onCheckedChange={(next) => void apply(toggle.id, toggle.change(next === true))}
+                className="mt-0.5"
+              />
+              <span className="space-y-0.5">
+                <span className="block text-sm font-medium">{toggle.label}</span>
+                <span className="block text-xs text-muted-foreground">{toggle.note}</span>
+              </span>
+            </label>
+          ))}
+          <div className="flex items-start gap-3 rounded-md px-2 py-2.5">
+            <div className="space-y-1.5">
+              <span className="block text-sm font-medium">Who merges pull requests</span>
+              <span className="block text-xs text-muted-foreground">
+                Person: the factory never merges; it tells you when a PR is ready. When green: the Lead merges once approvals, QA, CI and scans pass on the exact head.
+              </span>
+              <div className="flex gap-1.5 pt-0.5">
+                {MERGE_POLICIES.map((policy) => (
+                  <Button
+                    key={policy}
+                    size="sm"
+                    variant="outline"
+                    aria-pressed={factory.mergePolicy === policy}
+                    disabled={pending !== null || factory.mergePolicy === policy}
+                    onClick={() => void apply("mergePolicy", { kind: "mergePolicy", policy })}
+                    className={cn(factory.mergePolicy === policy && "border-foreground bg-foreground text-background")}
+                  >
+                    {policy === "person" ? "Person" : "When green"}
+                  </Button>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+        {error === null ? null : <Alert>{error}</Alert>}
+        <p className="text-xs text-muted-foreground">
+          The agent roster (provider, model and reasoning) is in the plugin&apos;s Agents settings, and Project mode is in the Alignment panel.
+        </p>
+      </DialogContent>
+    </Dialog>
   );
 }
 

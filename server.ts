@@ -1091,6 +1091,8 @@ export type BoardTask = z.infer<typeof boardTaskSchema>;
 
 const factorySummarySchema = factorySchema.omit({ agents: true, prs: true }).extend({
   bbProjectName: z.string(),
+  /** Automatic PR actions paused (the `pr-watch-paused:` KV), which lives outside the factory record. */
+  reviewsPaused: z.boolean(),
 });
 export type FactorySummary = z.infer<typeof factorySummarySchema>;
 
@@ -1464,6 +1466,20 @@ export const rpcContract = defineRpcContract({
       z.object({ kind: z.literal("shadowCustomModel"), model: z.string().trim().min(1).max(200).nullable() }),
     ]),
     output: agentsViewSchema,
+  },
+  /** The per-factory settings that are otherwise CLI- and person-only. Returns the fresh summary. */
+  factory_set_option: {
+    input: z.object({
+      prefix: z.string(),
+      change: z.discriminatedUnion("kind", [
+        z.object({ kind: z.literal("tracks"), enabled: z.boolean() }),
+        z.object({ kind: z.literal("designReview"), enabled: z.boolean() }),
+        z.object({ kind: z.literal("evidenceContract"), enabled: z.boolean() }),
+        z.object({ kind: z.literal("mergePolicy"), policy: z.enum(MERGE_POLICIES) }),
+        z.object({ kind: z.literal("reviewsPaused"), paused: z.boolean() }),
+      ]),
+    }),
+    output: factorySummarySchema,
   },
 });
 
@@ -2215,7 +2231,8 @@ export default async function plugin(bb: BbPluginApi) {
       // A deleted project keeps its id as the name.
     }
     const { agents: _agents, prs: _prs, ...rest } = factory;
-    return { ...rest, bbProjectName };
+    const reviewsPaused = (await bb.storage.kv.get(`pr-watch-paused:${factory.prefix}`)) === true;
+    return { ...rest, bbProjectName, reviewsPaused };
   }
 
   async function createFactory(args: {
@@ -5871,6 +5888,31 @@ ${findings}`;
         return factory;
       });
       return computeDoctorReport(updated);
+    },
+    factory_set_option: async ({ prefix, change }, ctx) => {
+      // Person-only, like the matching CLI commands: only bb's own Factory page may flip these.
+      if (ctx.experimental_caller?.kind !== "client") throw new Error("Only the Factory page can change a factory's settings this way.");
+      const factory = await findFactory(prefix);
+      switch (change.kind) {
+        case "tracks":
+          await mutateFactory(factory.prefix, (current) => { current.tracksEnabled = change.enabled; });
+          break;
+        case "designReview":
+          await mutateFactory(factory.prefix, (current) => { current.designReviewEnabled = change.enabled; });
+          break;
+        case "evidenceContract":
+          await mutateFactory(factory.prefix, (current) => { current.evidenceContract = change.enabled; });
+          break;
+        case "mergePolicy":
+          await mutateFactory(factory.prefix, (current) => { current.mergePolicy = change.policy; });
+          break;
+        case "reviewsPaused":
+          if (change.paused) await bb.storage.kv.set(`pr-watch-paused:${factory.prefix}`, true);
+          else { await bb.storage.kv.delete(`pr-watch-paused:${factory.prefix}`); wakePrWatch(); }
+          break;
+      }
+      bb.realtime.publish(BOARD_CHANGED, { prefix: factory.prefix });
+      return summarize(await findFactory(factory.prefix));
     },
     factory_init_specs: async ({ prefix, mode }) => {
       const factory = await findFactory(prefix);
