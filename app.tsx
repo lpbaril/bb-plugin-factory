@@ -191,7 +191,7 @@ function PersonQuestionsPanel({ task }: { task: BoardTask }) {
       <ul className="space-y-1.5 text-xs">
         {task.personQuestions.map((question) => (
           <li key={question.id} className="space-y-1 rounded-md border border-border p-2">
-            <div><span className="font-medium">{question.id}.</span> {question.text}</div>
+            <div className="whitespace-pre-line"><span className="font-medium">{question.id}.</span> {question.text}</div>
             {question.assumed === null ? null : <div className="text-muted-foreground">The plan assumes: {question.assumed}</div>}
             {question.answer !== null ? (
               <div>{question.answer.choice === "keep" ? "You kept the plan's assumption." : `You answered: ${question.answer.text}`}</div>

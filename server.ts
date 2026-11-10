@@ -496,10 +496,15 @@ export function designRoundState(round: Pick<DesignRound, "lenses" | "findings">
   return "settled";
 }
 
+/** The longest question and assumption kept, so a runaway section can't swell the factory's record. */
+const PERSON_QUESTION_MAX = 1500;
+const PERSON_ASSUMPTION_MAX = 600;
+
 /**
  * The questions a READY plan's "## Open questions" lists for the person: lines that start with
  * "For the person:", such as "- For the person: Q1. Round to what? Assumed: up to the next unit.".
- * Each gets an id, its own "Q<n>" if it gives one.
+ * A question goes on over the indented lines under it, such as options and an "Assumed:" line, until
+ * an unindented line or the next question. Each gets an id, its own "Q<n>" if it gives one.
  */
 export function parsePersonQuestions(body: string): Pick<PersonQuestion, "id" | "text" | "assumed">[] {
   const start = body.indexOf("## Open questions");
@@ -508,16 +513,29 @@ export function parsePersonQuestions(body: string): Pick<PersonQuestion, "id" | 
   const end = rest.search(/\n## /);
   const section = end < 0 ? rest : rest.slice(0, end);
   const found: { id: string | null; text: string; assumed: string | null }[] = [];
-  for (const line of section.split("\n")) {
-    const match = /^\s*(?:[-*]|\d+[.)])?\s*(?:\*\*)?for the person(?:\*\*)?\s*:\s*(?:\*\*)?\s*(.+?)\s*$/i.exec(line);
+  const opener = /^\s*(?:[-*]|\d+[.)])?\s*(?:\*\*)?for the person(?:\*\*)?\s*:\s*(?:\*\*)?\s*(.+?)\s*$/i;
+  const lines = section.split("\n");
+  for (let index = 0; index < lines.length; index++) {
+    const match = opener.exec(lines[index]!);
     if (match === null) continue;
-    let text = match[1]!.replace(/\*\*/g, "").trim();
+    const parts = [match[1]!.trim()];
+    // Indented lines under the question are part of it, even after a blank line; an unindented
+    // line or the next question ends it.
+    while (index + 1 < lines.length) {
+      const next = lines[index + 1]!;
+      if (next.trim() !== "") {
+        if (!/^\s/.test(next) || opener.test(next)) break;
+        parts.push(next.trim());
+      }
+      index += 1;
+    }
+    let text = parts.join("\n").replace(/\*\*/g, "").trim();
     const id = /^(Q\d+)[.:)]?\s*/i.exec(text);
     if (id !== null) text = text.slice(id[0].length);
     const assumedAt = text.search(/\bAssumed:/i);
-    const assumed = assumedAt < 0 ? null : text.slice(assumedAt + "Assumed:".length).trim() || null;
+    const assumed = assumedAt < 0 ? null : text.slice(assumedAt + "Assumed:".length).replace(/\s*\n\s*/g, " ").trim() || null;
     if (assumedAt >= 0) text = text.slice(0, assumedAt).trim();
-    if (text !== "") found.push({ id: id === null ? null : id[1]!.toUpperCase(), text: text.slice(0, 600), assumed: assumed?.slice(0, 400) ?? null });
+    if (text !== "") found.push({ id: id === null ? null : id[1]!.toUpperCase(), text: text.slice(0, PERSON_QUESTION_MAX), assumed: assumed?.slice(0, PERSON_ASSUMPTION_MAX) ?? null });
   }
   // A question keeps the id it gives, if no earlier one gave it too; the rest get the lowest id nobody
   // gave or took. No question is dropped.

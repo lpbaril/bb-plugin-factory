@@ -4890,6 +4890,53 @@ test('parsePersonQuestions reads "For the person" lines from Open questions only
   assert.deepEqual(parsePersonQuestions(`${readyPlan()}\n\nFor the person: a line outside Open questions`), []);
 });
 
+test('a question goes on over the indented lines under it: options and an Assumed line', () => {
+  // Shaped like a real plan's question: a lead-in, bolded options, a blank line, a two-line assumption.
+  const body = withQuestions([
+    '- For the person: Q1. Imports currently skip the `region` column. **Fixing this changes existing reports.** Choose one:',
+    '  - **(A)** Backfill the column for past imports, in this task.',
+    '  - **(B)** Fix new imports only and file the backfill separately.',
+    '  - **(C)** Hold the fix until the reports are updated.',
+    '',
+    '  Assumed: (A). The plan includes work unit 4 and AC6,',
+    '  and no import change merges without the backfill.',
+    '',
+    'No other blocking questions.',
+  ].join('\n'));
+  assert.deepEqual(parsePersonQuestions(body), [{
+    id: 'Q1',
+    text: 'Imports currently skip the `region` column. Fixing this changes existing reports. Choose one:\n- (A) Backfill the column for past imports, in this task.\n- (B) Fix new imports only and file the backfill separately.\n- (C) Hold the fix until the reports are updated.',
+    assumed: '(A). The plan includes work unit 4 and AC6, and no import change merges without the backfill.',
+  }], 'every option kept, the assumption found, and the closing line left out');
+
+  const two = withQuestions([
+    '- For the person: Q1. First? Pick one:',
+    '  - yes',
+    '  - no',
+    '- For the person: Q2. Second? Assumed: no.',
+    '  It only matters for imports.',
+    'Not a question.',
+    '  An indented line after an unindented one.',
+  ].join('\n'));
+  assert.deepEqual(parsePersonQuestions(two), [
+    { id: 'Q1', text: 'First? Pick one:\n- yes\n- no', assumed: null },
+    { id: 'Q2', text: 'Second?', assumed: 'no. It only matters for imports.' },
+  ], 'the next question and an unindented line each end a question');
+
+  const nested = withQuestions('- Questions only the person can answer:\n  - For the person: Q1. Fourth?\n    - maybe\n  - For the person: Q2. Fifth?');
+  assert.deepEqual(parsePersonQuestions(nested), [
+    { id: 'Q1', text: 'Fourth?\n- maybe', assumed: null },
+    { id: 'Q2', text: 'Fifth?', assumed: null },
+  ], 'questions indented under a parent bullet each stand alone');
+  const spaced = withQuestions('- For the person: Q1. Third?\n\nNot part of it.\n  Nor this.');
+  assert.deepEqual(parsePersonQuestions(spaced), [{ id: 'Q1', text: 'Third?', assumed: null }], 'a blank line before an unindented line ends it');
+
+  const long = withQuestions(`- For the person: Q1. ${'word '.repeat(400)}\n  Assumed: ${'yes '.repeat(300)}`);
+  const [capped] = parsePersonQuestions(long);
+  assert.equal(capped.text.length, 1500);
+  assert.equal(capped.assumed.length, 600);
+});
+
 test('personQuestionsGate holds a Builder until each question is answered, and after a changed answer', () => {
   const plan = questions => ({ designReviewEnabled: true, plans: [{ taskKey: 'T-1', threadId: 'thr_p', commentId: 'c1', designRequired: true, reviewedCommentId: 'c1', personQuestions: questions }] });
   const q = over => ({ id: 'Q1', text: 'Round to what?', assumed: 'up', answer: null, notifiedAt: null, ...over });

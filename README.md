@@ -183,7 +183,8 @@ Google's [Elephant & Goldfish Model](https://github.com/google/elephant-goldfish
 - Only escalations reach you, through the Lead or as Keep and Fix buttons on the task
   on the Factory page. So do the plan's own questions for you: the Planner lists each
   one under "## Open questions" as `- For the person: Q1. <question> Assumed: <what the
-  plan builds on>`. The Lead gets them as soon as the plan is READY, and no Builder
+  plan builds on>`. Options, and the "Assumed:" line, can go on indented lines under the
+  question. The Lead gets them as soon as the plan is READY, and no Builder
   starts until you've answered each (an answer that kept the plan's assumption carries
   over to the same question in the next plan), through the Lead (`bb factory plan-answer APP-12
   keep|change --question Q1`) or on the task. A different answer sends the plan back to
