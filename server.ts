@@ -212,7 +212,7 @@ const prSchema = z.object({
   /** The head whose completed review round was reported to the Lead (batched findings). */
   roundNotifiedSha: z.string().nullable().default(null),
   /** Set when `bb factory merge` merged this PR; a merge on GitHub leaves it null. */
-  merge: z.object({ by: z.enum(["lead", "person"]), threadId: z.string().nullable(), sha: z.string(), policy: z.enum(MERGE_POLICIES), at: z.string(), via: z.enum(["command", "card"]).default("command") }).nullable().default(null),
+  merge: z.object({ by: z.enum(["lead", "person", "page"]), threadId: z.string().nullable(), sha: z.string(), policy: z.enum(MERGE_POLICIES), at: z.string(), via: z.enum(["command", "card"]).default("command") }).nullable().default(null),
 });
 type Pr = z.infer<typeof prSchema>;
 
@@ -845,6 +845,12 @@ export function prsOpenedBetween<T extends Pick<Pr, "openedAt">>(prs: readonly T
 
 /** Every notification about a Factory page action ends with this. */
 export const PAGE_ACTION_WARNING = "If you didn't do this, an agent made the call: check the Lead's thread.";
+/** A page action's notice waits this long at most, so a slow notifier can't hold up the page. */
+export const PAGE_NOTICE_TIMEOUT_MS = 5_000;
+/** Text cut to a notification's length, ending with one full stop. */
+export function asSentence(text: string, max = 200): string {
+  return text.trim().slice(0, max).replace(/([^.!?])$/, "$1.");
+}
 
 /** After compacting a Lead, wait this long before compacting it again, so the compaction's own turn can't start another. */
 export const LEAD_COMPACT_COOLDOWN_MS = 30 * 60_000;
@@ -3140,8 +3146,8 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   /** The person's answer to an escalated finding, recorded by them or by the Lead on their word. */
-  async function decideDesignFinding(taskKey: string, findingId: string, choice: "keep" | "fix", threadId: string | null, viaPage = false): Promise<void> {
-    await withTaskLock(taskKey, async () => {
+  async function decideDesignFinding(taskKey: string, findingId: string, choice: "keep" | "fix", threadId: string | null, viaPage = false): Promise<{ taskKey: string; leadThreadId: string | null }> {
+    return withTaskLock(taskKey, async () => {
       const task = await getTaskByKey(taskKey);
       const factory = await factoryForTaskKey(task.key);
       if (threadId !== null && !isLeadThread(factory, threadId)) throw new PluginCliError("Only the factory's Lead or the person can record the person's answer.", { code: "design_decide_not_allowed" });
@@ -3158,10 +3164,11 @@ export default async function plugin(bb: BbPluginApi) {
       await comment(task.id, viaPage ? `**Design finding ${findingId}:** answered from the Factory page: ${what}.` : `**Design finding ${findingId}:** the person chose to ${what}.`);
       const plan = factory.plans.find((entry) => entry.taskKey === task.key);
       if (choice === "fix" && plan !== undefined) {
-        await tellThread(plan.threadId, `[factory] The person wants design finding ${findingId} on ${task.key} fixed: ${finding.title}. Update the plan, post a new complete READY plan and run \`bb factory plan-ready ${task.key} --comment <id>\` again.`);
+        await tellThread(plan.threadId, `[factory] ${viaPage ? "A decision from the Factory page" : "The person"} wants design finding ${findingId} on ${task.key} fixed: ${finding.title}. Update the plan, post a new complete READY plan and run \`bb factory plan-ready ${task.key} --comment <id>\` again.`);
       }
       bb.realtime.publish(BOARD_CHANGED, { prefix: factory.prefix });
       await advanceDesignRound(factory.prefix, task.key, round.round);
+      return { taskKey: task.key, leadThreadId: factory.leadThreadId };
     });
   }
 
@@ -3204,8 +3211,8 @@ export default async function plugin(bb: BbPluginApi) {
    * The person's answer to a question in the current READY plan, recorded by them or by the Lead on their
    * word. A different answer from the plan's assumption goes to the Planner, who owes a new READY plan.
    */
-  async function answerPersonQuestion(taskKey: string, questionId: string, choice: "keep" | "change", answer: string | null, threadId: string | null, viaPage = false): Promise<void> {
-    await withTaskLock(taskKey, async () => {
+  async function answerPersonQuestion(taskKey: string, questionId: string, choice: "keep" | "change", answer: string | null, threadId: string | null, viaPage = false): Promise<{ taskKey: string; questionId: string; leadThreadId: string | null }> {
+    return withTaskLock(taskKey, async () => {
       const task = await getTaskByKey(taskKey);
       const factory = await factoryForTaskKey(task.key);
       if (threadId !== null && !isLeadThread(factory, threadId)) throw new PluginCliError("Only the factory's Lead or the person can record the person's answer.", { code: "plan_answer_not_allowed" });
@@ -3224,9 +3231,10 @@ export default async function plugin(bb: BbPluginApi) {
         ? `**${question.id}, ${source}:** the plan's assumption holds${question.assumed === null ? "" : ` (${question.assumed})`}.`
         : `**${question.id}, ${source}:** ${answer!.trim()}`);
       if (choice === "change") {
-        await tellThread(plan.threadId, `[factory] The person answered ${question.id} on ${task.key} differently from the plan: ${answer!.trim()}\n\nUpdate the plan to follow it, post a new complete READY plan and run \`bb factory plan-ready ${task.key} --comment <id>\` again. Don't list ${question.id} for the person again.`);
+        await tellThread(plan.threadId, `[factory] ${viaPage ? "An answer from the Factory page" : "The person"} answered ${question.id} on ${task.key} differently from the plan: ${answer!.trim()}\n\nUpdate the plan to follow it, post a new complete READY plan and run \`bb factory plan-ready ${task.key} --comment <id>\` again. Don't list ${question.id} for the person again.`);
       }
       bb.realtime.publish(BOARD_CHANGED, { prefix: factory.prefix });
+      return { taskKey: task.key, questionId: question.id, leadThreadId: factory.leadThreadId };
     });
   }
 
@@ -3326,7 +3334,7 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   /** Lead or person. Agents in other roles can't move a task around the gates. */
-  async function setTrack(taskKey: string, track: Track, threadId: string | null): Promise<Track> {
+  async function setTrack(taskKey: string, track: Track, threadId: string | null, viaPage = false): Promise<{ track: Track; taskKey: string; leadThreadId: string | null; changed: boolean }> {
     const task = await getTaskByKey(taskKey);
     const factory = await factoryForTaskKey(task.key);
     if (!factory.tracksEnabled) {
@@ -3335,12 +3343,12 @@ export default async function plugin(bb: BbPluginApi) {
     if (threadId !== null && !isLeadThread(factory, threadId)) {
       throw new PluginCliError("Only the factory's Lead or the person can change a task's track.", { code: "track_not_allowed" });
     }
-    if (factory.tracks[task.key] === track) return track;
+    if (factory.tracks[task.key] === track) return { track, taskKey: task.key, leadThreadId: factory.leadThreadId, changed: false };
     // Choosing a track is the person's decision on any advice to close.
     await mutateFactory(factory.prefix, (current) => { current.tracks[task.key] = track; delete current.closeAdvice[task.key]; });
-    await comment(task.id, `Track: **${track}**, set by ${threadId === null ? "the person" : "the Lead"}.`);
+    await comment(task.id, `Track: **${track}**, set ${viaPage ? "on the Factory page" : `by ${threadId === null ? "the person" : "the Lead"}`}.`);
     bb.realtime.publish(BOARD_CHANGED, { prefix: factory.prefix });
-    return track;
+    return { track, taskKey: task.key, leadThreadId: factory.leadThreadId, changed: true };
   }
 
   async function recordExploreReport(taskKey: string, commentId: string, threadId: string | null): Promise<Exploration> {
@@ -4681,18 +4689,51 @@ ${sections.join("\n\n---\n\n")}`;
    * page. The page can't tell their tap from an agent's call (bb reports both as the same kind of
    * caller), so this is how one they didn't make gets seen. Also logged.
    */
-  async function notifyPageAction(title: string, body: string, threadId: string | null): Promise<void> {
+  async function notifyPageAction(notice: PageNotice): Promise<void> {
+    const { title, body, threadId } = notice;
     bb.log.info(`Factory page action: ${title}. ${body}`);
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      await bb.sdk.plugins.callRpc({
-        pluginId: "push-notifications",
-        method: "notifications.send",
-        input: { title, body: `${body} ${PAGE_ACTION_WARNING}`, ...(threadId === null ? {} : { threadId }) } as never,
-        outputSchema: z.unknown(),
-      });
+      await Promise.race([
+        bb.sdk.plugins.callRpc({
+          pluginId: "push-notifications",
+          method: "notifications.send",
+          input: { title, body: `${body} ${PAGE_ACTION_WARNING}`, ...(threadId === null ? {} : { threadId }) } as never,
+          outputSchema: z.unknown(),
+        }),
+        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`no answer in ${PAGE_NOTICE_TIMEOUT_MS / 1000}s`)), PAGE_NOTICE_TIMEOUT_MS); }),
+      ]);
     } catch (error) {
       bb.log.warn(`could not tell the person about a Factory page action (${title}): ${String(error)}`);
+    } finally {
+      clearTimeout(timer);
     }
+  }
+  type PageNotice = { title: string; body: string; threadId: string | null };
+  /**
+   * Every page-only action goes through here: other plugins are refused, and the person is told what was
+   * done (or, for one that can leave things half done, that it failed), since the page can't tell their
+   * tap from an agent's call. A new page action can't get the guard without the notice.
+   */
+  async function pageAction<T>(
+    ctx: { experimental_caller?: { kind: string } },
+    refusal: string,
+    run: () => Promise<T>,
+    notice: (result: T) => PageNotice | null,
+    onFailure?: (error: unknown) => PageNotice | null,
+  ): Promise<T> {
+    if (ctx.experimental_caller?.kind !== "client") throw new Error(refusal);
+    let result: T;
+    try {
+      result = await run();
+    } catch (error) {
+      const failed = onFailure?.(error) ?? null;
+      if (failed !== null) await notifyPageAction(failed);
+      throw error;
+    }
+    const done = notice(result);
+    if (done !== null) await notifyPageAction(done);
+    return result;
   }
 
   async function notifyMergeReady(factory: Factory, pr: Pr): Promise<void> {
@@ -5304,12 +5345,12 @@ ${sections.join("\n\n---\n\n")}`;
     }
     // Pinned, so a commit pushed after these checks makes GitHub refuse the merge.
     await gh(hostId, ["pr", "merge", String(pr.number), "--repo", repo, "--squash", "--match-head-commit", view.headRefOid]);
-    const by = isLead ? "lead" : "person";
+    // A card merge is a page action, which can't tell the person's tap from an agent's call.
+    const by = isLead ? "lead" : args.via === "card" ? "page" : "person";
     await mutateFactory(factory.prefix, (current) => {
       const target = current.prs.find((candidate) => candidate.number === pr.number);
       if (target !== undefined) target.merge = { by, threadId: args.threadId, sha: view.headRefOid, policy: factory.mergePolicy, at: new Date().toISOString(), via: args.via ?? "command" };
     });
-    // A merge from the card is a page action, which can't tell the person's tap from an agent's call.
     const runBy = args.via === "card" ? "from the merge card" : `with \`bb factory merge\`, run by ${isLead ? `the Lead under the ${factory.mergePolicy} policy` : "the person"}`;
     await comment(task.id, `Merged [PR #${pr.number}](${pr.url}) at \`${view.headRefOid.slice(0, 7)}\` ${runBy}.`);
     wakePrWatch();
@@ -5398,7 +5439,7 @@ ${findings}`;
     const { hostId, repo } = await projectHost(factory);
     if (repo !== null) await prComment(hostId, repo, pr.number, `**Factory:** the shadow Security reviewer's block was dismissed by ${who}: ${args.reason}`);
     wakePrWatch();
-    return pr;
+    return { ...pr, taskKey: task.key, leadThreadId: factory.leadThreadId };
   }
 
   /** Ends the wait between passes. A wake during a pass makes the next pass start as soon as it ends. */
@@ -5902,10 +5943,16 @@ ${findings}`;
     factory_archive: async ({ prefix }) => summarize(await setArchived(prefix, true)),
     factory_restore: async ({ prefix }) => summarize(await setArchived(prefix, false)),
     factory_delete: async (input, ctx) => {
-      if (ctx.experimental_caller?.kind !== "client") throw new Error("Only the Factory page can delete a factory.");
-      const result = await deleteFactory(input);
-      await notifyPageAction(`Factory ${result.prefix} deleted`, `Deleted on the Factory page${result.tasksDeleted ? ", with its task board" : ""}${result.threadsArchived > 0 ? `; ${result.threadsArchived} agent threads archived` : ""}.`, null);
-      return result;
+      return pageAction(ctx, "Only the Factory page can delete a factory.", () => deleteFactory(input), (result) => ({
+        title: `Factory ${result.prefix} deleted`,
+        body: `Deleted on the Factory page${result.tasksDeleted ? ", with its task board" : ""}${result.threadsArchived > 0 ? `; ${result.threadsArchived} agent threads archived` : ""}.`,
+        threadId: null,
+      }), (error) => ({
+        // Archiving threads and deleting the board come before the record goes, so a failure can leave some done.
+        title: `Factory ${input.prefix.trim().toUpperCase()} delete stopped partway`,
+        body: `A delete from the Factory page failed: ${asSentence(error instanceof Error ? error.message : String(error))} Some of its agent threads may already be archived.`,
+        threadId: null,
+      }));
     },
     factory_board: async ({ prefix }) => {
       const factory = await findFactory(prefix);
@@ -5918,13 +5965,15 @@ ${findings}`;
     },
     factory_nightly: async ({ prefix }) => readNightlyReport((await findFactory(prefix)).prefix),
     factory_nightly_dismiss: async ({ prefix }, ctx) => {
-      if (ctx.experimental_caller?.kind !== "client") throw new Error("Only the Factory page can dismiss a nightly report.");
-      const { prefix: key } = await findFactory(prefix);
-      const report = await readNightlyReport(key);
-      if (report === null) return null;
-      const dismissed = { ...report, dismissed: true };
-      await bb.storage.kv.set(nightlyKey(key), dismissed);
-      return dismissed;
+      // Hiding a report changes nothing an agent could use, so no notice.
+      return pageAction(ctx, "Only the Factory page can dismiss a nightly report.", async () => {
+        const { prefix: key } = await findFactory(prefix);
+        const report = await readNightlyReport(key);
+        if (report === null) return null;
+        const dismissed = { ...report, dismissed: true };
+        await bb.storage.kv.set(nightlyKey(key), dismissed);
+        return dismissed;
+      }, () => null);
     },
     factory_runs: async ({ prefix, taskKey }) => runReport(await findFactory(prefix), taskKey),
     factory_health: async ({ prefix, since, before }) => healthFor(await findFactory(prefix), since ?? null, before ?? null),
@@ -5937,32 +5986,34 @@ ${findings}`;
       return computeDoctorReport(updated);
     },
     factory_set_option: async ({ prefix, change }, ctx) => {
-      if (ctx.experimental_caller?.kind !== "client") throw new Error("Only the Factory page can change a factory's settings this way.");
-      const factory = await findFactory(prefix);
-      // A client call can't tell the person from an agent: agents make client calls too. So a call
-      // may only tighten a guard. Loosening one stays with the CLI, which refuses agent threads.
-      const loosens = factoryOptionLoosens(change);
-      if (loosens !== null) throw new Error(`${loosens.what} is set from your own terminal, outside an agent thread: bb factory ${loosens.command(factory.prefix)}`);
-      switch (change.kind) {
-        case "tracks":
-          await mutateFactory(factory.prefix, (current) => { current.tracksEnabled = change.enabled; });
-          break;
-        case "designReview":
-          await mutateFactory(factory.prefix, (current) => { current.designReviewEnabled = change.enabled; });
-          break;
-        case "evidenceContract":
-          await mutateFactory(factory.prefix, (current) => { current.evidenceContract = change.enabled; });
-          break;
-        case "mergePolicy":
-          await mutateFactory(factory.prefix, (current) => { current.mergePolicy = change.policy; });
-          break;
-        case "reviewsPaused":
-          if (change.paused) await bb.storage.kv.set(`pr-watch-paused:${factory.prefix}`, true);
-          else { await bb.storage.kv.delete(`pr-watch-paused:${factory.prefix}`); wakePrWatch(); }
-          break;
-      }
-      bb.realtime.publish(BOARD_CHANGED, { prefix: factory.prefix });
-      return summarize(await findFactory(factory.prefix));
+      // It only tightens a guard, or switches tracks or automatic PR actions, which remove no check: no notice.
+      return pageAction(ctx, "Only the Factory page can change a factory's settings this way.", async () => {
+        const factory = await findFactory(prefix);
+        // A client call can't tell the person from an agent: agents make client calls too. So a call
+        // may only tighten a guard. Loosening one stays with the CLI, which refuses agent threads.
+        const loosens = factoryOptionLoosens(change);
+        if (loosens !== null) throw new Error(`${loosens.what} is set from your own terminal, outside an agent thread: bb factory ${loosens.command(factory.prefix)}`);
+        switch (change.kind) {
+          case "tracks":
+            await mutateFactory(factory.prefix, (current) => { current.tracksEnabled = change.enabled; });
+            break;
+          case "designReview":
+            await mutateFactory(factory.prefix, (current) => { current.designReviewEnabled = change.enabled; });
+            break;
+          case "evidenceContract":
+            await mutateFactory(factory.prefix, (current) => { current.evidenceContract = change.enabled; });
+            break;
+          case "mergePolicy":
+            await mutateFactory(factory.prefix, (current) => { current.mergePolicy = change.policy; });
+            break;
+          case "reviewsPaused":
+            if (change.paused) await bb.storage.kv.set(`pr-watch-paused:${factory.prefix}`, true);
+            else { await bb.storage.kv.delete(`pr-watch-paused:${factory.prefix}`); wakePrWatch(); }
+            break;
+        }
+        bb.realtime.publish(BOARD_CHANGED, { prefix: factory.prefix });
+        return summarize(await findFactory(factory.prefix));
+      }, () => null);
     },
     factory_init_specs: async ({ prefix, mode }) => {
       const factory = await findFactory(prefix);
@@ -6018,7 +6069,7 @@ ${findings}`;
         const pr = factory.prs.find((candidate) => candidate.number === number);
         if (pr === undefined) return { ok: false, message: `PR #${number} isn't one this factory tracks.` };
         const { sha } = await withTaskLock(pr.taskKey, () => mergePr({ taskKey: pr.taskKey, pr: number, threadId: null, expectedHead: headSha, via: "card" }));
-        await notifyPageAction(`${pr.taskKey}: PR #${number} merged`, `Merged from the merge card in ${factory.name}, at ${sha.slice(0, 7)}.`, factory.leadThreadId);
+        await notifyPageAction({ title: `${pr.taskKey}: PR #${number} merged`, body: `Merged from the merge card in ${factory.name}, at ${sha.slice(0, 7)}.`, threadId: factory.leadThreadId });
         return { ok: true, message: `Merged PR #${number} at ${sha.slice(0, 7)}.` };
       } catch (error) {
         return { ok: false, message: error instanceof Error ? error.message : String(error) };
@@ -6026,54 +6077,68 @@ ${findings}`;
     },
     task_assign: async (input) => ({ threadId: await assign(input) }),
     task_plan_answer: async ({ taskKey, questionId, choice, answer }, ctx) => {
-      if (ctx.experimental_caller?.kind !== "client") throw new Error("Only the Factory page can answer a plan's question this way.");
-      await answerPersonQuestion(taskKey, questionId, choice, answer, null, true);
-      const factory = await factoryForTaskKey(taskKey);
-      await notifyPageAction(`${taskKey}: ${questionId.toUpperCase()} answered`, `Answered on the Factory page: ${choice === "keep" ? "kept the plan's assumption." : (answer ?? "").trim().slice(0, 200).replace(/([^.!?])$/, "$1.")}`, factory.leadThreadId);
+      await pageAction(ctx, "Only the Factory page can answer a plan's question this way.", () => answerPersonQuestion(taskKey, questionId, choice, answer, null, true), (done) => ({
+        title: `${done.taskKey}: ${done.questionId} answered`,
+        body: `Answered on the Factory page: ${choice === "keep" ? "kept the plan's assumption." : asSentence(answer ?? "")}`,
+        threadId: done.leadThreadId,
+      }));
       return { ok: true as const };
     },
     task_design_decide: async ({ taskKey, findingId, choice }, ctx) => {
-      if (ctx.experimental_caller?.kind !== "client") throw new Error("Only the Factory page can answer an escalated finding this way.");
-      await decideDesignFinding(taskKey, findingId, choice, null, true);
-      const factory = await factoryForTaskKey(taskKey);
-      await notifyPageAction(`${taskKey}: design finding ${findingId} decided`, `Decided on the Factory page: ${choice === "keep" ? "keep the plan as it is" : "fix it"}.`, factory.leadThreadId);
+      await pageAction(ctx, "Only the Factory page can answer an escalated finding this way.", () => decideDesignFinding(taskKey, findingId, choice, null, true), (done) => ({
+        title: `${done.taskKey}: design finding ${findingId} decided`,
+        body: `Decided on the Factory page: ${choice === "keep" ? "keep the plan as it is" : "fix it"}.`,
+        threadId: done.leadThreadId,
+      }));
       return { ok: true as const };
     },
     task_set_track: async ({ taskKey, track }, ctx) => {
-      if (ctx.experimental_caller?.kind !== "client") throw new Error("Only the Factory page can change a track this way.");
-      return { track: await setTrack(taskKey, track, null) };
+      const done = await pageAction(ctx, "Only the Factory page can change a track this way.", () => setTrack(taskKey, track, null, true), (result) => result.changed ? {
+        title: `${result.taskKey}: track set to ${result.track}`,
+        body: `Set on the Factory page.${result.track === "direct" ? " A direct task goes to a Builder without a plan." : ""}`,
+        threadId: result.leadThreadId,
+      } : null);
+      return { track: done.track };
     },
     shadow_dismiss: async ({ taskKey, reason }, ctx) => {
       // Allow-list: only a client call (the Factory page) may dismiss; other plugins and unknown callers may not.
-      if (ctx.experimental_caller?.kind !== "client") throw new Error("Only the Factory page can dismiss a shadow block.");
-      const pr = (await dismissShadow({ taskKey, reason, by: { kind: "page" } })).number;
-      const factory = await factoryForTaskKey(taskKey);
-      await notifyPageAction(`${taskKey}: shadow Security block dismissed`, `Dismissed on the Factory page for PR #${pr}: ${reason.trim().slice(0, 200).replace(/([^.!?])$/, "$1.")}`, factory.leadThreadId);
-      return { pr };
+      const pr = await pageAction(ctx, "Only the Factory page can dismiss a shadow block.", () => dismissShadow({ taskKey, reason, by: { kind: "page" } }), (done) => ({
+        title: `${done.taskKey}: shadow Security block dismissed`,
+        body: `Dismissed on the Factory page for PR #${done.number}: ${asSentence(reason)}`,
+        threadId: done.leadThreadId,
+      }));
+      return { pr: pr.number };
     },
     agents_get: async () => agentsView(),
     agents_preset_preview: async ({ preset }) => presetPreview(preset),
     agents_preset_apply: async ({ preset, seats }, ctx) => {
-      if (ctx.experimental_caller?.kind !== "client") throw new Error("Only the plugin settings page can apply a preset.");
-      const applied = await applyPreset(preset, seats);
-      if (applied.length > 0) await notifyPageAction("Factory agents changed", `The ${ROSTER_PRESET_LABELS[preset]} preset was applied on the settings page to ${applied.map((key) => roleName(key)).join(", ")}.`, null);
+      await pageAction(ctx, "Only the plugin settings page can apply a preset.", () => applyPreset(preset, seats), (applied) => applied.length === 0 ? null : {
+        title: "Factory agents changed",
+        body: `The ${ROSTER_PRESET_LABELS[preset]} preset was applied on the settings page to ${applied.map((key) => roleName(key)).join(", ")}.`,
+        threadId: null,
+      });
       return agentsView();
     },
     agent_set: async (input, ctx) => {
       // Only the settings page may change which model an agent runs on; other plugins may not.
-      if (ctx.experimental_caller?.kind !== "client") throw new Error("Only the plugin settings page can change agents.");
-      if (input.kind === "exec") {
-        await validateExec(input.key, input.exec);
-        await writeAgents((agents) => {
-          agents.roles[input.key] = input.exec;
-        });
-        await notifyPageAction("Factory agents changed", `${roleName(input.key)} now runs on ${showExec(input.exec)}, set on the settings page.`, null);
-      } else {
-        await writeAgents((agents) => {
-          agents.shadowCustomModel = input.model;
-        });
-        await notifyPageAction("Factory agents changed", `The shadow reviewer's custom model is now ${input.model ?? "none"}, set on the settings page.`, null);
-      }
+      await pageAction(ctx, "Only the plugin settings page can change agents.", async () => {
+        if (input.kind === "exec") {
+          await validateExec(input.key, input.exec);
+          await writeAgents((agents) => {
+            agents.roles[input.key] = input.exec;
+          });
+        } else {
+          await writeAgents((agents) => {
+            agents.shadowCustomModel = input.model;
+          });
+        }
+      }, () => ({
+        title: "Factory agents changed",
+        body: input.kind === "exec"
+          ? `${roleName(input.key)} now runs on ${showExec(input.exec)}, set on the settings page.`
+          : `The shadow reviewer's custom model is now ${input.model ?? "none"}, set on the settings page.`,
+        threadId: null,
+      }));
       return agentsView();
     },
   });
@@ -7152,7 +7217,7 @@ ${findings}`;
                   const blocking = task.design.findings.filter((finding) => finding.severity !== "nit");
                   lines.push(`      Design review round ${task.design.round} (${task.design.depth}): ${task.design.passed ? "passed" : task.design.state}${blocking.length > 0 ? ` · ${blocking.length} Blocker or Major` : ""}`);
                   for (const finding of task.design.findings.filter((entry) => entry.severity !== "nit")) {
-                    lines.push(`        ${finding.id} ${finding.severity}: ${finding.title}${finding.resolution === null ? " (unresolved)" : ` → ${finding.resolution.as}${finding.decision === null ? "" : `, person: ${finding.decision.choice}`}`}`);
+                    lines.push(`        ${finding.id} ${finding.severity}: ${finding.title}${finding.resolution === null ? " (unresolved)" : ` → ${finding.resolution.as}${finding.decision === null ? "" : `, ${finding.decision.by === "page" ? "from the Factory page" : finding.decision.by}: ${finding.decision.choice}`}`}`);
                   }
                 }
                 const plan = factory.plans.find((entry) => entry.taskKey === task.key);
