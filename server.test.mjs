@@ -4626,7 +4626,7 @@ async function designFixture(t, initial = {}, overrides = {}) {
       stop: async ({ threadId }) => { stopped.push(threadId); return {}; },
       ...overrides.threads,
     },
-    tasksRpc: async ({ method, input }) => { if (method === 'createComment') posted.push(input.body); return undefined; },
+    tasksRpc: async ({ method, input }) => { if (method === 'createComment') posted.push(input.body); return overrides.tasksRpc?.({ method, input }); },
     environments: overrides.environments,
     hostRpc: overrides.hostRpc,
     projectPath: overrides.projectPath,
@@ -4933,8 +4933,40 @@ test('a question goes on over the indented lines under it: options and an Assume
 
   const long = withQuestions(`- For the person: Q1. ${'word '.repeat(400)}\n  Assumed: ${'yes '.repeat(300)}`);
   const [capped] = parsePersonQuestions(long);
-  assert.equal(capped.text.length, 1500);
-  assert.equal(capped.assumed.length, 600);
+  assert.equal(capped.text.length, 1000, 'questions reach the Lead in full, so they stay small');
+  assert.equal(capped.assumed.length, 400);
+});
+
+test('a question takes only lines deeper than its own bullet, and finds its assumption only where one starts', () => {
+  const sibling = withQuestions('- Blocking:\n  - For the person: Q1. Backfill?\n    - yes\n  - Planner decides: cache TTL is 5 min. Assumed: 5.');
+  assert.deepEqual(parsePersonQuestions(sibling), [{ id: 'Q1', text: 'Backfill?\n- yes', assumed: null }], 'a sibling bullet at its depth isn\'t part of it');
+
+  const firstLine = withQuestions('- For the person: Q1. Which color? Assumed: blue.\n  - blue\n  - red\n  - green');
+  assert.deepEqual(parsePersonQuestions(firstLine), [{ id: 'Q1', text: 'Which color?\n- blue\n- red\n- green', assumed: 'blue.' }], 'options after an assumption on the first line stay options');
+
+  const inOption = withQuestions("- For the person: Q1. Keep it?\n  - (A) Keep today's behaviour (nothing assumed: see AC3)\n  - (B) Change it\n  Assumed: (B).");
+  assert.deepEqual(parsePersonQuestions(inOption), [{ id: 'Q1', text: "Keep it?\n- (A) Keep today's behaviour (nothing assumed: see AC3)\n- (B) Change it", assumed: '(B).' }], 'an option that says assumed: is still an option');
+
+  const midLine = withQuestions('- For the person: Q1. Change the default,\n  which nothing assumed: so far?');
+  assert.deepEqual(parsePersonQuestions(midLine), [{ id: 'Q1', text: 'Change the default, which nothing assumed: so far?', assumed: null }], 'only a line that starts with Assumed: is the assumption');
+  const twice = withQuestions('- For the person: Q1. Pick? Assumed: one.\n  Assumed: two.\n  more about two');
+  assert.equal(parsePersonQuestions(twice)[0].assumed, 'one.', 'the first assumption found counts');
+});
+
+test('wrapped text rejoins its sentence, and notes under an option stay under it', () => {
+  const wrapped = withQuestions([
+    '- For the person: Q1. Should imports',
+    '  backfill the region column?',
+    '  - (A) Yes, for every past import',
+    '    that has a region.',
+    '    - this takes about an hour',
+    '  - (B) No',
+  ].join('\n'));
+  assert.deepEqual(parsePersonQuestions(wrapped), [{
+    id: 'Q1',
+    text: 'Should imports backfill the region column?\n- (A) Yes, for every past import that has a region.\n  - this takes about an hour\n- (B) No',
+    assumed: null,
+  }]);
 });
 
 test('personQuestionsGate holds a Builder until each question is answered, and after a changed answer', () => {
@@ -5697,4 +5729,38 @@ test('a Lead idle for a factory that can no longer be read is logged, not thrown
   const { errors } = await idle('thr_lead');
   assert.deepEqual(errors, [], 'caught and logged in the handler, not escaped to the event bus');
   assert.deepEqual(calls.compact, []);
+});
+
+test('a multi-line question stays under its label in the Lead\'s message and in status', async t => {
+  const board = [{ id: 'task_1', key: 'TEST-1', projectId: 'tracker', title: 'Test', description: '', status: 'todo', priority: 'none', position: 0, labelIds: [], createdAt: '', updatedAt: '' }];
+  const { harness, markReady, say } = await designFixture(t, {}, { tasksRpc: async ({ method }) => (method === 'listTasks' ? { tasks: board } : undefined) });
+  await markReady('plan_1', withQuestions('- For the person: Q1. Backfill past imports? Choose one:\n  - (A) Yes, in this task\n  - (B) No\n\n  Assumed: (A).\n- For the person: Q2. Show the region?'));
+  const told = say('thr_lead', /only the person can answer/)[0];
+  assert.match(told, /\nQ1: Backfill past imports\? Choose one:\n    - \(A\) Yes, in this task\n    - \(B\) No\n  The plan assumes: \(A\)\.\nQ2: Show the region\?\n/, 'each question\'s options are indented under it');
+  const status = (await harness.behavior.runCli(['status', 'TEST'])).stdout;
+  assert.match(status, /\n      Q1 for the person \(unanswered\): Backfill past imports\? Choose one:\n          - \(A\) Yes, in this task\n          - \(B\) No\n/, 'the answer state on the first line, the options indented under it');
+});
+
+test('a kept answer carries over when the first line and the assumption are the same, whatever the options say', async t => {
+  const fx = await designFixture(t);
+  const ask = (options, assumed = '(A).') => withQuestions(`- For the person: Q1. Backfill past imports? Choose one:\n${options}\n  Assumed: ${assumed}`);
+  await fx.markReady('plan_1', ask('  - (A) Yes\n  - (B) No'));
+  await fx.harness.behavior.runCli(['plan-answer', 'TEST-1', 'keep', '--question', 'Q1'], { threadId: 'thr_lead' });
+  for (const [threadId, lens] of [['thr_d1', 'Zoom Out'], ['thr_d2', 'Comprehension'], ['thr_d3', 'Codebase Details']]) await fx.record(threadId, lens);
+  await fx.markReady('plan_2', ask('  - (A) Yes, in this task\n  - (B) No').replace('Change tip.py.', 'Change tip.py and README.md.'));
+  assert.equal((await fx.read()).plans[0].personQuestions[0].answer?.choice, 'keep', 'an option reworded: not asked again');
+  await fx.markReady('plan_3', ask('  - (A) Yes\n  - (B) No', '(B).').replace('Change tip.py.', 'Change tip.py and docs.'));
+  assert.equal((await fx.read()).plans[0].personQuestions[0].answer, null, 'a different assumption is asked again');
+});
+
+test('an answer recorded before options were read keeps the plan\'s assumption across the upgrade', async t => {
+  const fx = await designFixture(t);
+  // As the earlier parser recorded a question with indented options: the first line only, and no assumption.
+  await fx.markReady('plan_1', withQuestions('- For the person: Q1. Backfill past imports? Choose one:'));
+  await fx.harness.behavior.runCli(['plan-answer', 'TEST-1', 'keep', '--question', 'Q1'], { threadId: 'thr_lead' });
+  for (const [threadId, lens] of [['thr_d1', 'Zoom Out'], ['thr_d2', 'Comprehension'], ['thr_d3', 'Codebase Details']]) await fx.record(threadId, lens);
+  await fx.markReady('plan_2', withQuestions('- For the person: Q1. Backfill past imports? Choose one:\n  - (A) Yes\n  - (B) No\n  Assumed: (A).').replace('Change tip.py.', 'Change tip.py and README.md.'));
+  const [question] = (await fx.read()).plans[0].personQuestions;
+  assert.equal(question.answer?.choice, 'keep');
+  assert.equal(question.assumed, '(A).');
 });
