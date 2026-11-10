@@ -3737,7 +3737,7 @@ test('a new commit takes the card back', async t => {
 });
 
 test('Merge on the card runs the gated merge for that commit and records it', async t => {
-  const { harness, merge, merges, bb, posted, cards } = await cardFixture(t);
+  const { harness, merge, merges, bb, posted, cards, sent } = await cardFixture(t);
   await runPasses(harness);
   assert.equal(cards().length, 1);
   const result = await merge();
@@ -3747,7 +3747,12 @@ test('Merge on the card runs the gated merge for that commit and records it', as
   const stored = (await readPrs(bb))[0].merge;
   assert.equal(stored.by, 'person');
   assert.equal(stored.via, 'card');
-  assert.ok(posted.some(body => /from the merge card, run by the person/.test(body)), posted.join('\n'));
+  assert.ok(posted.some(body => /at `[0-9a-f]{7}` from the merge card\.$/.test(body)), posted.join('\n'));
+  assert.ok(!posted.some(body => /run by the person/.test(body)), 'a card merge doesn\'t claim the person ran it');
+  const notice = sent.find(entry => entry.title === 'TEST-1: PR #7 merged');
+  assert.ok(notice, 'the person is told a card merge happened');
+  assert.match(notice.body, /If you didn't do this, an agent made the call/);
+  assert.equal(notice.threadId, 'thr_lead');
 });
 
 test('Merge on the card refuses a moved head, a failed gate and another plugin', async t => {
@@ -4788,7 +4793,7 @@ test('the person\'s "fix" goes to the Planner, and the Factory page can answer f
   assert.deepEqual(await harness.behavior.callRpc('task_design_decide', { taskKey: 'TEST-1', findingId: '1.zoom-out.1', choice: 'fix' }), { ok: true });
   assert.match(say('thr_planner', /The person wants design finding 1\.zoom-out\.1 on TEST-1 fixed/)[0], /post a new complete READY plan/);
   const factory = await read();
-  assert.equal(factory.designRounds[0].findings[0].decision.by, 'person');
+  assert.equal(factory.designRounds[0].findings[0].decision.by, 'page', 'the page can\'t tell the person from an agent');
   assert.equal(designRoundState(factory.designRounds[0]), 'needs-new-plan');
 });
 
@@ -5030,7 +5035,7 @@ test('a different answer goes to the Planner, and the next READY plan starts wit
   await assert.rejects(harness.behavior.callRpc('task_plan_answer', { taskKey: 'TEST-1', questionId: 'Q1', choice: 'change', answer: 'to 5' }, { experimental_caller: { kind: 'plugin', pluginId: 'other' } }), /Only the Factory page/);
   assert.deepEqual(await harness.behavior.callRpc('task_plan_answer', { taskKey: 'TEST-1', questionId: 'Q1', choice: 'change', answer: 'Round up to the next 5' }), { ok: true });
   assert.match(say('thr_planner', /answered Q1 on TEST-1 differently/)[0], /Round up to the next 5[\s\S]*post a new complete READY plan/);
-  assert.equal((await read()).plans[0].personQuestions[0].answer.by, 'person');
+  assert.equal((await read()).plans[0].personQuestions[0].answer.by, 'page', 'the page can\'t tell the person from an agent');
   assert.match((await harness.behavior.runCli(['assign', 'TEST-1', '--role', 'build'])).stderr, /answered Q1 differently from TEST-1's plan/);
   await markReady('plan_2');
   assert.deepEqual((await read()).plans[0].personQuestions, [], 'the new plan took the answer in and asks nothing');
@@ -5793,4 +5798,88 @@ test('an answer recorded with no assumption isn\'t stretched to cover one the ne
   const [question] = (await fx.read()).plans[0].personQuestions;
   assert.equal(question.answer, null, 'the person sees the stated assumption and answers again');
   assert.equal(question.assumed, '(A).');
+});
+// ----- Page actions: recorded as from the page, and the person is told -----
+
+test('an answer from the Factory page is recorded as from the page and the person is told; one from their terminal stays theirs', async t => {
+  const notices = [];
+  const fx = await designFixture(t, {}, { tasksRpc: async ({ method, input }) => { if (method === 'notifications.send') { notices.push(input); return { ok: true }; } return undefined; } });
+  await fx.markReady('plan_1', withQuestions('- For the person: Q1. Round to what amount? Assumed: the next whole unit.\n- For the person: Q2. Show the rounding? Assumed: yes.'));
+  await fx.harness.behavior.callRpc('task_plan_answer', { taskKey: 'TEST-1', questionId: 'q1', choice: 'keep', answer: null });
+  assert.ok(fx.posted.includes("**Q1, answered from the Factory page:** the plan's assumption holds (the next whole unit.)."), fx.posted.join('\n'));
+  const notice = notices.find(entry => entry.title === 'TEST-1: Q1 answered');
+  assert.ok(notice);
+  assert.equal(notice.body, "Answered on the Factory page: kept the plan's assumption. If you didn't do this, an agent made the call: check the Lead's thread.");
+  assert.equal(notice.threadId, 'thr_lead');
+  await fx.harness.behavior.runCli(['plan-answer', 'TEST-1', 'keep', '--question', 'Q2']);
+  const [, q2] = (await fx.read()).plans[0].personQuestions;
+  assert.equal(q2.answer.by, 'person', 'from the person\'s own terminal, outside an agent thread');
+  assert.ok(fx.posted.some(body => body.startsWith('**Q2, answered by the person:**')));
+  assert.equal(notices.filter(entry => /answered/.test(entry.title)).length, 1, 'only the page action is notified');
+  await fx.harness.behavior.callRpc('task_plan_answer', { taskKey: 'TEST-1', questionId: 'Q1', choice: 'change', answer: 'Round up to the next 5' });
+  assert.match(notices.at(-1).body, /^Answered on the Factory page: Round up to the next 5\. If you didn't do this/, 'one full stop, however the answer ends');
+});
+
+test('a design decision from the page says so and tells the person', async t => {
+  const notices = [];
+  const fx = await designFixture(t, {}, { tasksRpc: async ({ method, input }) => { if (method === 'notifications.send') { notices.push(input); return { ok: true }; } return undefined; } });
+  await fx.markReady();
+  await fx.record('thr_d1', 'Zoom Out', finding(1, 'Major', 'Reinvents the parser'));
+  await fx.record('thr_d2', 'Comprehension');
+  await fx.record('thr_d3', 'Codebase Details');
+  await fx.harness.behavior.runCli(['design-resolve', 'TEST-1', '--finding', '1.zoom-out.1', '--as', 'escalate', '--note', 'The person chose this parser'], { threadId: 'thr_planner' });
+  await fx.harness.behavior.callRpc('task_design_decide', { taskKey: 'TEST-1', findingId: '1.zoom-out.1', choice: 'keep' });
+  assert.ok(fx.posted.includes('**Design finding 1.zoom-out.1:** answered from the Factory page: keep the plan as it is.'), fx.posted.join('\n'));
+  const notice = notices.find(entry => entry.title === 'TEST-1: design finding 1.zoom-out.1 decided');
+  assert.match(notice.body, /^Decided on the Factory page: keep the plan as it is\. If you didn't do this, an agent made the call/);
+});
+
+test('roster changes and a factory deleted from the page tell the person', async t => {
+  const notices = [];
+  const { harness } = await presetFixture(t);
+  const fx2 = await fixture(t, false, {}, { providers: presetProviders(), tasksRpc: async ({ method, input }) => { if (method === 'notifications.send') { notices.push(input); return { ok: true }; } return undefined; } });
+  await fx2.bb.storage.kv.set('agents', { roles: liveRoster(), shadowCustomModel: null });
+  await fx2.harness.behavior.callRpc('agent_set', { kind: 'exec', key: 'security', exec: exec('codex', 'gpt-6.1-sol', 'high') });
+  assert.equal(notices.at(-1).title, 'Factory agents changed');
+  assert.match(notices.at(-1).body, /^Security now runs on codex · gpt-6\.1-sol · high, set on the settings page\. If you didn't do this, an agent made the call/);
+  await fx2.harness.behavior.callRpc('agent_set', { kind: 'shadowCustomModel', model: 'gpt-daybreak' });
+  assert.match(notices.at(-1).body, /^The shadow reviewer's custom model is now gpt-daybreak, set on the settings page\./);
+  const preview = await fx2.harness.behavior.callRpc('agents_preset_preview', { preset: 'lower-cost' });
+  const seats = preview.seats.filter(entry => entry.ticked).map(entry => ({ key: entry.key, proposed: entry.proposed }));
+  await fx2.harness.behavior.callRpc('agents_preset_apply', { preset: 'lower-cost', seats });
+  assert.match(notices.at(-1).body, /^The Lower cost preset was applied on the settings page to Lead, Explorer, QA, Design reviewer\./);
+  const before = notices.length;
+  await fx2.harness.behavior.callRpc('factory_delete', { prefix: 'TEST', deleteTasks: false, archiveThreads: false });
+  assert.equal(notices.length, before + 1);
+  assert.equal(notices.at(-1).title, 'Factory TEST deleted');
+  assert.match(notices.at(-1).body, /^Deleted on the Factory page\. If you didn't do this/);
+  assert.equal(notices.at(-1).threadId, undefined, 'its Lead may be gone');
+  void harness;
+});
+
+test('every agent is told never to use bb plugin rpc on the factory', async () => {
+  const { leadCharter, workerReminder, WORKER_ROLE_IDS, NO_PAGE_CALLS } = await import('./roles.ts');
+  for (const mergePolicy of ['person', 'when-green']) {
+    const charter = leadCharter({ factoryName: 'F', prefix: 'F', mergePolicy, evidenceContract: true, tracks: true, designReview: true });
+    assert.match(charter, /Never use `bb plugin rpc` on the factory\./);
+    assert.ok(charter.length <= 4096, `${charter.length}`);
+  }
+  for (const role of [...WORKER_ROLE_IDS, 'designreview', 'shadow']) assert.ok(workerReminder({ role, factoryName: 'F', taskKey: 'F-1' }).includes(NO_PAGE_CALLS), role);
+});
+
+test('a shadow block dismissed from the page says so on the task and the PR, and tells the person', async t => {
+  const notices = [];
+  const ghComments = [];
+  const prs = [prRecord({ shadow: true, reviews: [approved('review1', SHA_A), approved('security', SHA_A), { ...approved('shadow', SHA_A, 'changes'), threadId: 'thr_shadow' }] })];
+  const { harness, comments } = await fixture(t, false, { prs }, {
+    hostRpc: async ({ input }) => { if (input?.args?.[1] === 'comment') ghComments.push(input.args.join(' ')); return { code: 0, stdout: '', stderr: '' }; },
+    tasksRpc: async ({ method, input }) => { if (method === 'notifications.send') { notices.push(input); return { ok: true }; } if (method === 'createComment') comments.push(input.body); return undefined; },
+  });
+  await assert.rejects(harness.behavior.callRpc('shadow_dismiss', { taskKey: 'TEST-1', reason: 'Not reachable here' }, { experimental_caller: { kind: 'plugin', pluginId: 'other' } }), /Only the Factory page/);
+  assert.deepEqual(await harness.behavior.callRpc('shadow_dismiss', { taskKey: 'TEST-1', reason: 'Not reachable here' }), { pr: 7 });
+  assert.ok(comments.some(body => body.startsWith('**Shadow security block dismissed** by a call from the Factory page')), comments.join('\n'));
+  assert.ok(!comments.some(body => /by the owner/.test(body)));
+  const notice = notices.find(entry => entry.title === 'TEST-1: shadow Security block dismissed');
+  assert.match(notice.body, /^Dismissed on the Factory page for PR #7: Not reachable here\. If you didn't do this, an agent made the call/);
+  assert.equal(notice.threadId, 'thr_lead');
 });
