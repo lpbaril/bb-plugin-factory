@@ -1467,7 +1467,10 @@ export const rpcContract = defineRpcContract({
     ]),
     output: agentsViewSchema,
   },
-  /** The per-factory settings that are otherwise CLI- and person-only. Returns the fresh summary. */
+  /**
+   * A factory's own settings, for the Factory page. Agents can make this call too, so it refuses to
+   * loosen a guard (see factoryOptionLoosens); that stays with the CLI. Returns the fresh summary.
+   */
   factory_set_option: {
     input: z.object({
       prefix: z.string(),
@@ -1482,6 +1485,21 @@ export const rpcContract = defineRpcContract({
     output: factorySummarySchema,
   },
 });
+
+export type FactoryOptionChange =
+  | { kind: "tracks" | "designReview" | "evidenceContract"; enabled: boolean }
+  | { kind: "mergePolicy"; policy: (typeof MERGE_POLICIES)[number] }
+  | { kind: "reviewsPaused"; paused: boolean };
+/**
+ * A change that takes a guard away: the Lead merging, or the evidence contract or design review
+ * off. With the CLI command that makes it, or null for a change that's safe from any client.
+ */
+export function factoryOptionLoosens(change: FactoryOptionChange): { what: string; command: (prefix: string) => string } | null {
+  if (change.kind === "mergePolicy" && change.policy !== "person") return { what: "Letting the Lead merge", command: (prefix) => `merge-policy ${prefix} ${change.policy}` };
+  if (change.kind === "evidenceContract" && !change.enabled) return { what: "Turning the evidence contract off", command: (prefix) => `evidence-contract ${prefix} off` };
+  if (change.kind === "designReview" && !change.enabled) return { what: "Turning design review off", command: (prefix) => `design-review ${prefix} off` };
+  return null;
+}
 
 /** Published whenever a factory's board or roster may have changed. */
 const BOARD_CHANGED = "board-changed";
@@ -5890,9 +5908,12 @@ ${findings}`;
       return computeDoctorReport(updated);
     },
     factory_set_option: async ({ prefix, change }, ctx) => {
-      // Person-only, like the matching CLI commands: only bb's own Factory page may flip these.
       if (ctx.experimental_caller?.kind !== "client") throw new Error("Only the Factory page can change a factory's settings this way.");
       const factory = await findFactory(prefix);
+      // A client call can't tell the person from an agent: agents make client calls too. So a call
+      // may only tighten a guard. Loosening one stays with the CLI, which refuses agent threads.
+      const loosens = factoryOptionLoosens(change);
+      if (loosens !== null) throw new Error(`${loosens.what} is set from your own terminal, outside an agent thread: bb factory ${loosens.command(factory.prefix)}`);
       switch (change.kind) {
         case "tracks":
           await mutateFactory(factory.prefix, (current) => { current.tracksEnabled = change.enabled; });

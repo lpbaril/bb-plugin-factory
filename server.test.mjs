@@ -4376,6 +4376,33 @@ test('the Factory page can set a track, and nothing else can call it', async t =
   assert.equal((await createFactoryStorage(bb.storage, value => value).read('TEST')).tracks['TEST-1'], 'plan');
 });
 
+test('the Factory page can tighten a factory\'s guards, and only the CLI can loosen them', async t => {
+  const { harness, bb } = await tracksFixture(t);
+  const read = () => createFactoryStorage(bb.storage, value => value).read('TEST');
+  const set = change => harness.behavior.callRpc('factory_set_option', { prefix: 'TEST', change });
+  await assert.rejects(harness.behavior.callRpc('factory_set_option', { prefix: 'TEST', change: { kind: 'tracks', enabled: false } }, { experimental_caller: { kind: 'plugin', pluginId: 'other' } }), /Only the Factory page/);
+
+  assert.equal((await set({ kind: 'designReview', enabled: true })).designReviewEnabled, true);
+  assert.equal((await set({ kind: 'evidenceContract', enabled: true })).evidenceContract, true);
+  // An agent can make this call too, so it never takes a guard away.
+  await assert.rejects(set({ kind: 'designReview', enabled: false }), /bb factory design-review TEST off/);
+  await assert.rejects(set({ kind: 'evidenceContract', enabled: false }), /bb factory evidence-contract TEST off/);
+  await assert.rejects(set({ kind: 'mergePolicy', policy: 'when-green' }), /bb factory merge-policy TEST when-green/);
+  let factory = await read();
+  assert.deepEqual([factory.designReviewEnabled, factory.evidenceContract, factory.mergePolicy], [true, true, 'person']);
+
+  assert.equal((await set({ kind: 'tracks', enabled: false })).tracksEnabled, false);
+  assert.equal((await set({ kind: 'tracks', enabled: true })).tracksEnabled, true);
+  assert.equal((await set({ kind: 'reviewsPaused', paused: true })).reviewsPaused, true);
+  assert.equal((await set({ kind: 'reviewsPaused', paused: false })).reviewsPaused, false);
+
+  // The person hands merging to the Lead from the CLI; the page can take it back.
+  assert.equal((await harness.behavior.runCli(['merge-policy', 'TEST', 'when-green'])).exitCode, 0);
+  assert.equal((await set({ kind: 'mergePolicy', policy: 'person' })).mergePolicy, 'person');
+  factory = await read();
+  assert.equal(factory.mergePolicy, 'person');
+});
+
 test('tracks reach the prompts and standing rules, within bb\'s limit', () => {
   const on = leadCharter({ factoryName: 'BusinessOS', prefix: 'BOS', mergePolicy: 'person', evidenceContract: true, tracks: true });
   assert.ok(on.length < 4096, `${on.length}`);
