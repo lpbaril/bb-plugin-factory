@@ -5953,24 +5953,41 @@ test('asSentence cuts text and ends it with one full stop', () => {
 
 const CORE = ['zoom-out', 'comprehension', 'codebase-details'];
 const FULL = ['zoom-out', 'comprehension', 'codebase-details', 'design-critic', 'implementation-readiness'];
-const ranRound = (lenses, findings, recorded = true) => ({
-  lenses: lenses.map(lens => ({ lens, threadId: `thr_${lens}`, recordedAt: recorded ? 'now' : null })),
+const ranRound = (lenses, findings, { recorded = true, outcome = 'superseded' } = {}) => ({
+  outcome,
+  lenses: lenses.map(lens => ({ lens, threadId: `thr_${lens}`, findingsCommentId: recorded ? `c_${lens}` : null, recordedAt: recorded ? 'now' : null })),
   findings: findings.map(([lens, severity]) => ({ lens, severity })),
 });
+const pick = result => [result.lenses, result.focused, result.rechecking, result.firstRead];
 
-test('designRoundLenses re-checks only the lenses that found a Blocker or Major', () => {
-  assert.deepEqual(designRoundLenses(FULL, undefined), { lenses: FULL, focused: false }, 'the first round runs every lens of its depth');
-  assert.deepEqual(designRoundLenses(FULL, ranRound(FULL, [['codebase-details', 'blocker'], ['implementation-readiness', 'major'], ['zoom-out', 'nit']])),
-    { lenses: ['codebase-details', 'implementation-readiness'], focused: true }, 'a lens with only a Nit, or nothing, isn\'t run again');
-  assert.deepEqual(designRoundLenses(FULL, ranRound(FULL, [['zoom-out', 'nit']])), { lenses: FULL, focused: false }, 'after a clean pass, a new plan gets every lens');
-  assert.deepEqual(designRoundLenses(FULL, ranRound(FULL, [])), { lenses: FULL, focused: false });
-  const cutShort = ranRound(FULL, [['zoom-out', 'major']]);
-  cutShort.lenses[3].recordedAt = null;
-  assert.deepEqual(designRoundLenses(FULL, cutShort), { lenses: FULL, focused: false }, 'a lens that didn\'t report might have found something');
-  assert.deepEqual(designRoundLenses(FULL, ranRound(CORE, [['comprehension', 'major']])),
-    { lenses: ['comprehension', 'design-critic', 'implementation-readiness'], focused: true }, 'lenses the depth now adds have never read this plan');
-  assert.deepEqual(designRoundLenses(CORE, ranRound(FULL, [['design-critic', 'blocker']])),
-    { lenses: ['design-critic'], focused: true }, 'a lens that found a Blocker checks the fix even if the depth dropped');
+test('designRoundLenses re-checks only the lenses that found a Blocker or Major, while the review goes on', () => {
+  assert.deepEqual(pick(designRoundLenses(FULL, [])), [FULL, false, [], []], 'the first round runs every lens of its depth');
+  assert.deepEqual(pick(designRoundLenses(FULL, [ranRound(FULL, [['codebase-details', 'blocker'], ['implementation-readiness', 'major'], ['zoom-out', 'nit']])])),
+    [['codebase-details', 'implementation-readiness'], true, ['codebase-details', 'implementation-readiness'], []], 'a lens with only a Nit, or nothing, isn\'t run again');
+  assert.deepEqual(pick(designRoundLenses(FULL, [ranRound(FULL, [['zoom-out', 'nit']])])), [FULL, false, [], []]);
+  assert.deepEqual(pick(designRoundLenses(FULL, [ranRound(FULL, [['zoom-out', 'major']], { recorded: false })])), [FULL, false, [], []], 'a lens that didn\'t report might have found something');
+  assert.deepEqual(pick(designRoundLenses(CORE, [ranRound(FULL, [['design-critic', 'blocker']])])), [['design-critic'], true, ['design-critic'], []], 'a lens that found a Blocker checks the fix even if the depth dropped');
+});
+
+test('a re-check carries through any number of rounds and adds only lenses that never read the plan', () => {
+  const round1 = ranRound(CORE, [['zoom-out', 'major']]);
+  const round2 = ranRound(['zoom-out'], [['zoom-out', 'major']]);
+  assert.deepEqual(pick(designRoundLenses(CORE, [round1, round2])), [['zoom-out'], true, ['zoom-out'], []], 'round 3 doesn\'t bring back the lenses round 2 skipped');
+  assert.deepEqual(pick(designRoundLenses(FULL, [round1, round2])),
+    [['zoom-out', 'design-critic', 'implementation-readiness'], true, ['zoom-out'], ['design-critic', 'implementation-readiness']], 'the depth went up: the new lenses read it for the first time');
+  const round3 = ranRound(['zoom-out', 'design-critic', 'implementation-readiness'], [['design-critic', 'major']]);
+  assert.deepEqual(pick(designRoundLenses(FULL, [round1, round2, round3])), [['design-critic'], true, ['design-critic'], []]);
+});
+
+test('a new plan after a review that ended gets every lens, however it ended', () => {
+  for (const outcome of ['clean', 'resolved', 'accepted']) {
+    assert.deepEqual(pick(designRoundLenses(CORE, [ranRound(CORE, [['codebase-details', 'major']], { outcome })])), [CORE, false, [], []], outcome);
+  }
+  // An earlier review that ended doesn't count as having read this plan.
+  const ended = ranRound(FULL, [['design-critic', 'major']], { outcome: 'resolved' });
+  const current = ranRound(CORE, [['comprehension', 'major']], { outcome: null });
+  assert.deepEqual(pick(designRoundLenses(FULL, [ended, current])),
+    [['comprehension', 'design-critic', 'implementation-readiness'], true, ['comprehension'], ['design-critic', 'implementation-readiness']]);
 });
 
 test('after a fix, round 2 starts only the reviewers whose lens found a Blocker or Major', async t => {
@@ -5984,10 +6001,29 @@ test('after a fix, round 2 starts only the reviewers whose lens found a Blocker 
   assert.equal((await markReady('plan_2', readyPlan('\nReuse parse_args.'))).exitCode, 0);
   assert.equal(spawns.length, 4, 'one reviewer, not three');
   assert.match(spawns[3].title, /Design review: Zoom Out · round 2/);
-  assert.ok(posted.some(body => /^\*\*Design review, round 2\*\* of plan comment `plan_2`: re-checking only the lenses that found a Blocker or Major in round 1\. Zoom Out `thr_d4`\.$/.test(body)), posted.join('\n'));
+  assert.ok(posted.some(body => /^\*\*Design review, round 2\*\* of plan comment `plan_2`: re-checking Zoom Out, which found a Blocker or Major in round 1\. Zoom Out `thr_d4`\.$/.test(body)), posted.join('\n'));
   await record('thr_d4', 'Zoom Out');
   const factory = await read();
   assert.deepEqual(factory.designRounds[1].lenses.map(entry => entry.lens), ['zoom-out']);
+  assert.equal(factory.designRounds[1].focused, true, 'recorded as a re-check');
+  assert.equal(factory.designRounds[0].focused, false);
   assert.equal(factory.plans[0].reviewedCommentId, 'plan_2', 'a clean focused round passes the plan');
   assert.equal(say('thr_lead', /passed design review in round 2/).length, 1);
+});
+
+test('a re-check that brings in new lenses says which read the plan for the first time and why, and status shows a re-check', async t => {
+  const board = [{ id: 'task_1', key: 'TEST-1', projectId: 'tracker', title: 'Test', description: '', status: 'todo', priority: 'none', position: 0, labelIds: [], createdAt: '', updatedAt: '' }];
+  const { harness, markReady, record, posted } = await designFixture(t, {}, { tasksRpc: async ({ method }) => (method === 'listTasks' ? { tasks: board } : undefined) });
+  await markReady();
+  await record('thr_d1', 'Zoom Out');
+  await record('thr_d2', 'Comprehension', finding(1, 'Major', 'Undefined term'));
+  await record('thr_d3', 'Codebase Details');
+  await harness.behavior.runCli(['design-resolve', 'TEST-1', '--finding', '1.comprehension.1', '--as', 'fix', '--note', 'Defined it'], { threadId: 'thr_planner' });
+  // The fixed plan names a sensitive path, which raises the depth to full.
+  await markReady('plan_2', readyPlan('\nDefine the term. Touches `src/auth/login.ts`.'));
+  assert.ok(posted.some(body => /^\*\*Design review, round 2\*\* of plan comment `plan_2`: re-checking Comprehension, which found a Blocker or Major in round 1, with Design Critic, Implementation Readiness reading the plan for the first time at full depth \(it names `src\/auth\/login\.ts`\)\./.test(body)), posted.join('\n'));
+  const status = (await harness.behavior.runCli(['status', 'TEST'])).stdout;
+  assert.match(status, /Design review round 2 \(full, re-check\): reviewing/);
+  const detail = await harness.behavior.callRpc('factory_board', { prefix: 'TEST' });
+  assert.equal(detail.tasks.find(task => task.key === 'TEST-1').design.focused, true);
 });
