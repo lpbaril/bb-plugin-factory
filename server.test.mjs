@@ -10,7 +10,7 @@ registerHooks({ resolve(specifier, context, next) {
   }
   return next(specifier, context);
 } });
-const { default: plugin, computePreset, computeTokenProfile, asSentence, PAGE_NOTICE_TIMEOUT_MS, leadCompactionDue, leadCompactBackoffMs, LEAD_COMPACT_COOLDOWN_MS, parsePersonQuestions, personQuestionsGate, parseDesignFindings, planSensitivePaths, designRoundState, designGate, trackGate, parseApproaches, exploreAssignment, readRecommendation, sectionText, supervisorAction, turnsFromEvents, creditUsage, mergeBlockers, sortChecks, latestRuns, mergeOverlapNote, migrateQaResults, qaCarryNote, leadMayMerge, rosterWarnings, computeHealth, parseDay, prsOpenedBetween, qaHold, qaNextStep, parseCoverage, changeRounds, fixLoopAdvice } = await import('./server.ts');
+const { default: plugin, computePreset, computeTokenProfile, designRoundLenses, asSentence, PAGE_NOTICE_TIMEOUT_MS, leadCompactionDue, leadCompactBackoffMs, LEAD_COMPACT_COOLDOWN_MS, parsePersonQuestions, personQuestionsGate, parseDesignFindings, planSensitivePaths, designRoundState, designGate, trackGate, parseApproaches, exploreAssignment, readRecommendation, sectionText, supervisorAction, turnsFromEvents, creditUsage, mergeBlockers, sortChecks, latestRuns, mergeOverlapNote, migrateQaResults, qaCarryNote, leadMayMerge, rosterWarnings, computeHealth, parseDay, prsOpenedBetween, qaHold, qaNextStep, parseCoverage, changeRounds, fixLoopAdvice } = await import('./server.ts');
 const { shareBarWidth, sharePercent } = await import('./token-profile.ts');
 const { leadCharter, leadPrompt, reReviewMessage, workerPrompt, workerReminder, designReviewPrompt } = await import('./roles.ts');
 const { createFactoryStorage } = await import('./factory-storage.ts');
@@ -4772,11 +4772,11 @@ test('a fix needs a new READY plan, which starts round 2 and supersedes round 1'
   await harness.behavior.runCli(['design-resolve', 'TEST-1', '--finding', '1.zoom-out.1', '--as', 'fix', '--note', 'Use the existing parser'], { threadId: 'thr_planner' });
   assert.match((await harness.behavior.runCli(['assign', 'TEST-1', '--role', 'build'])).stderr, /the Planner owes a new READY plan/);
   assert.equal((await markReady('plan_2', readyPlan('\nReuse parse_args.'))).exitCode, 0);
-  assert.equal(spawns.length, 6);
+  assert.equal(spawns.length, 4, 'round 2 re-checks Zoom Out, the one lens with a Major');
   assert.match(spawns[3].prompt, /round 2/);
   let factory = await read();
   assert.deepEqual(factory.designRounds.map(round => [round.round, round.planCommentId, round.outcome]), [[1, 'plan_1', 'superseded'], [2, 'plan_2', null]]);
-  for (const [threadId, lens] of [['thr_d4', 'Zoom Out'], ['thr_d5', 'Comprehension'], ['thr_d6', 'Codebase Details']]) await record(threadId, lens);
+  await record('thr_d4', 'Zoom Out');
   factory = await read();
   assert.equal(factory.plans[0].reviewedCommentId, 'plan_2');
   assert.equal(say('thr_lead', /passed design review in round 2/).length, 1);
@@ -5947,4 +5947,47 @@ test('asSentence cuts text and ends it with one full stop', () => {
   assert.equal(asSentence('Done!'), 'Done!');
   assert.equal(asSentence('Already.'), 'Already.');
   assert.equal(asSentence('x'.repeat(300)).length, 201);
+});
+
+// ----- Focused design rounds -----
+
+const CORE = ['zoom-out', 'comprehension', 'codebase-details'];
+const FULL = ['zoom-out', 'comprehension', 'codebase-details', 'design-critic', 'implementation-readiness'];
+const ranRound = (lenses, findings, recorded = true) => ({
+  lenses: lenses.map(lens => ({ lens, threadId: `thr_${lens}`, recordedAt: recorded ? 'now' : null })),
+  findings: findings.map(([lens, severity]) => ({ lens, severity })),
+});
+
+test('designRoundLenses re-checks only the lenses that found a Blocker or Major', () => {
+  assert.deepEqual(designRoundLenses(FULL, undefined), { lenses: FULL, focused: false }, 'the first round runs every lens of its depth');
+  assert.deepEqual(designRoundLenses(FULL, ranRound(FULL, [['codebase-details', 'blocker'], ['implementation-readiness', 'major'], ['zoom-out', 'nit']])),
+    { lenses: ['codebase-details', 'implementation-readiness'], focused: true }, 'a lens with only a Nit, or nothing, isn\'t run again');
+  assert.deepEqual(designRoundLenses(FULL, ranRound(FULL, [['zoom-out', 'nit']])), { lenses: FULL, focused: false }, 'after a clean pass, a new plan gets every lens');
+  assert.deepEqual(designRoundLenses(FULL, ranRound(FULL, [])), { lenses: FULL, focused: false });
+  const cutShort = ranRound(FULL, [['zoom-out', 'major']]);
+  cutShort.lenses[3].recordedAt = null;
+  assert.deepEqual(designRoundLenses(FULL, cutShort), { lenses: FULL, focused: false }, 'a lens that didn\'t report might have found something');
+  assert.deepEqual(designRoundLenses(FULL, ranRound(CORE, [['comprehension', 'major']])),
+    { lenses: ['comprehension', 'design-critic', 'implementation-readiness'], focused: true }, 'lenses the depth now adds have never read this plan');
+  assert.deepEqual(designRoundLenses(CORE, ranRound(FULL, [['design-critic', 'blocker']])),
+    { lenses: ['design-critic'], focused: true }, 'a lens that found a Blocker checks the fix even if the depth dropped');
+});
+
+test('after a fix, round 2 starts only the reviewers whose lens found a Blocker or Major', async t => {
+  const { harness, markReady, record, read, say, spawns, posted } = await designFixture(t);
+  await markReady();
+  await record('thr_d1', 'Zoom Out', finding(1, 'Major', 'Reinvents the parser'));
+  await record('thr_d2', 'Comprehension', finding(1, 'Nit', 'A typo'));
+  await record('thr_d3', 'Codebase Details');
+  await harness.behavior.runCli(['design-resolve', 'TEST-1', '--finding', '1.zoom-out.1', '--as', 'fix', '--note', 'Use the existing parser'], { threadId: 'thr_planner' });
+  await harness.behavior.runCli(['design-resolve', 'TEST-1', '--finding', '1.comprehension.1', '--as', 'decline', '--note', 'Cosmetic'], { threadId: 'thr_planner' });
+  assert.equal((await markReady('plan_2', readyPlan('\nReuse parse_args.'))).exitCode, 0);
+  assert.equal(spawns.length, 4, 'one reviewer, not three');
+  assert.match(spawns[3].title, /Design review: Zoom Out · round 2/);
+  assert.ok(posted.some(body => /^\*\*Design review, round 2\*\* of plan comment `plan_2`: re-checking only the lenses that found a Blocker or Major in round 1\. Zoom Out `thr_d4`\.$/.test(body)), posted.join('\n'));
+  await record('thr_d4', 'Zoom Out');
+  const factory = await read();
+  assert.deepEqual(factory.designRounds[1].lenses.map(entry => entry.lens), ['zoom-out']);
+  assert.equal(factory.plans[0].reviewedCommentId, 'plan_2', 'a clean focused round passes the plan');
+  assert.equal(say('thr_lead', /passed design review in round 2/).length, 1);
 });
