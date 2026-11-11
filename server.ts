@@ -853,19 +853,34 @@ export function asSentence(text: string, max = 200): string {
 }
 
 /**
- * The lenses a design review round runs. After a round in which every lens reported back and at least one
- * Blocker or Major was found, the next round re-checks only the lenses that found one, plus any lens
- * its depth now adds that the earlier round didn't run. Each is still a fresh reader. Anything else gets
- * every lens of its depth: the first round, a new plan after a clean pass, or a round cut short.
+ * The lenses a design review round runs. While a review is going on (its last round was overtaken by a
+ * new plan, not ended), and every lens of that last round reported back with at least one Blocker or
+ * Major, the next round re-checks only the lenses that found one, plus any lens of its depth that
+ * hasn't read any version of the plan in this review. Each is still a fresh reader. Anything else gets
+ * every lens of its depth: the first round, a new plan after a review that ended (clean, settled or
+ * accepted), or a round after one where a lens didn't report.
  */
-export function designRoundLenses(depthLenses: readonly DesignLens[], previous: Pick<DesignRound, "lenses" | "findings"> | undefined): { lenses: DesignLens[]; focused: boolean } {
-  const all = { lenses: [...depthLenses], focused: false };
-  if (previous === undefined || previous.lenses.length === 0 || previous.lenses.some((entry) => entry.recordedAt === null)) return all;
-  const found = new Set(previous.findings.filter((finding) => finding.severity !== "nit").map((finding) => finding.lens));
+export function designRoundLenses(
+  depthLenses: readonly DesignLens[],
+  rounds: readonly Pick<DesignRound, "lenses" | "findings" | "outcome">[],
+): { lenses: DesignLens[]; focused: boolean; rechecking: DesignLens[]; firstRead: DesignLens[] } {
+  const all = { lenses: [...depthLenses], focused: false, rechecking: [], firstRead: [] };
+  const last = rounds.at(-1);
+  if (last === undefined || (last.outcome !== null && last.outcome !== "superseded")) return all;
+  if (last.lenses.length === 0 || last.lenses.some((entry) => entry.findingsCommentId === null)) return all;
+  const found = new Set(last.findings.filter((finding) => finding.severity !== "nit").map((finding) => finding.lens));
   if (found.size === 0) return all;
-  const ran = new Set(previous.lenses.map((entry) => entry.lens));
-  const lenses = DESIGN_LENSES.filter((lens) => found.has(lens) || (depthLenses.includes(lens) && !ran.has(lens)));
-  return { lenses, focused: true };
+  // This review's rounds, back to the last one that ended: a lens that read any of them has read the plan.
+  const review: (typeof rounds)[number][] = [];
+  for (let index = rounds.length - 1; index >= 0; index--) {
+    const round = rounds[index]!;
+    if (round.outcome !== null && round.outcome !== "superseded") break;
+    review.push(round);
+  }
+  const read = new Set(review.flatMap((round) => round.lenses.map((entry) => entry.lens)));
+  const rechecking = DESIGN_LENSES.filter((lens) => found.has(lens));
+  const firstRead = DESIGN_LENSES.filter((lens) => depthLenses.includes(lens) && !read.has(lens));
+  return { lenses: DESIGN_LENSES.filter((lens) => found.has(lens) || firstRead.includes(lens)), focused: true, rechecking, firstRead };
 }
 
 /** After compacting a Lead, wait this long before compacting it again, so the compaction's own turn can't start another. */
@@ -973,6 +988,8 @@ const designRoundSchema = z.object({
   /** A fingerprint of the plan's text, so the same plan can't be reviewed again to shake off findings. */
   planDigest: z.string().nullable().default(null),
   depth: z.enum(["core", "full"]),
+  /** A re-check: only the lenses that found a Blocker or Major last round, plus any reading the plan for the first time. */
+  focused: z.boolean().default(false),
   startedAt: z.string(),
   lenses: z.array(z.object({
     lens: z.enum(DESIGN_LENSES),
@@ -1105,6 +1122,7 @@ const boardTaskSchema = z.object({
   design: z.object({
     round: z.number(),
     depth: z.enum(["core", "full"]),
+    focused: z.boolean(),
     state: z.enum(["reviewing", "clean", "resolving", "escalated", "needs-new-plan", "settled", "accepted", "superseded"]),
     passed: z.boolean(),
     lenses: z.array(z.object({ lens: z.enum(DESIGN_LENSES), threadId: z.string(), recorded: z.boolean() })),
@@ -2151,6 +2169,7 @@ export default async function plugin(bb: BbPluginApi) {
     return {
       round: round.round,
       depth: round.depth,
+      focused: round.focused,
       state,
       passed: plan !== undefined && plan.commentId !== null && plan.reviewedCommentId === plan.commentId,
       lenses: round.lenses.map((entry) => ({ lens: entry.lens, threadId: entry.threadId, recorded: entry.findingsCommentId !== null })),
@@ -2986,7 +3005,7 @@ export default async function plugin(bb: BbPluginApi) {
     }
     const sensitive = planSensitivePaths(body);
     const depth = factory.designDepth[taskKey] === "full" || sensitive.length > 0 ? "full" : "core";
-    const { lenses, focused } = designRoundLenses(depth === "full" ? DESIGN_LENSES : CORE_DESIGN_LENSES, previous.at(-1));
+    const { lenses, focused, rechecking, firstRead } = designRoundLenses(depth === "full" ? DESIGN_LENSES : CORE_DESIGN_LENSES, previous);
     // A seat on a provider this machine doesn't have would leave every plan waiting. Fall back to the
     // Planner's, and say so: it loses the second provider, not the review.
     let execution = await executionFor("designreview");
@@ -3021,14 +3040,16 @@ export default async function plugin(bb: BbPluginApi) {
     await mutateFactory(prefix, (current) => {
       for (const entry of started) current.agents.push({ threadId: entry.threadId, role: "designreview", taskKey, providerId: execution.providerId, createdAt: now, pr: null });
       current.designRounds.push({
-        taskKey, round: number, planCommentId, planDigest: planDigest(body), depth, startedAt: now,
+        taskKey, round: number, planCommentId, planDigest: planDigest(body), depth, focused, startedAt: now,
         lenses: started.map((entry) => ({ lens: entry.lens, threadId: entry.threadId, findingsCommentId: null, recordedAt: null, quietNotifiedAt: null, worktreeDeletedAt: null, cleanedAt: null })),
         findings: [], outcome: null, sentToPlannerAt: null, escalationsNotifiedAt: null, outcomeNotifiedAt: null,
       });
     });
+    const names = (list: readonly DesignLens[]) => list.map((lens) => DESIGN_LENS_LABELS[lens]).join(", ");
+    const depthReason = sensitive.length > 0 ? ` (it names ${sensitive.slice(0, 3).map((path) => `\`${path}\``).join(", ")})` : "";
     const scope = focused
-      ? `re-checking only the lenses that found a Blocker or Major in round ${number - 1}`
-      : depth === "full" ? `full depth${sensitive.length > 0 ? ` (it names ${sensitive.slice(0, 3).map((path) => `\`${path}\``).join(", ")})` : ""}` : "core lenses";
+      ? `re-checking ${names(rechecking)}, which found a Blocker or Major in round ${number - 1}${firstRead.length === 0 ? "" : `, with ${names(firstRead)} reading the plan for the first time at ${depth} depth${depthReason}`}`
+      : depth === "full" ? `full depth${depthReason}` : "core lenses";
     await comment(task.id, `**Design review, round ${number}** of plan comment \`${planCommentId}\`: ${scope}. ${started.map((entry) => `${DESIGN_LENS_LABELS[entry.lens]} \`${entry.threadId}\``).join(", ")}.${fellBack ? ` The design reviewer seat's provider isn't available here, so they run on the Planner's (${execution.providerId}).` : ""}`);
     bb.realtime.publish(BOARD_CHANGED, { prefix });
   }
@@ -7234,7 +7255,7 @@ ${findings}`;
                 }
                 if (task.design !== null) {
                   const blocking = task.design.findings.filter((finding) => finding.severity !== "nit");
-                  lines.push(`      Design review round ${task.design.round} (${task.design.depth}): ${task.design.passed ? "passed" : task.design.state}${blocking.length > 0 ? ` · ${blocking.length} Blocker or Major` : ""}`);
+                  lines.push(`      Design review round ${task.design.round} (${task.design.depth}${task.design.focused ? ", re-check" : ""}): ${task.design.passed ? "passed" : task.design.state}${blocking.length > 0 ? ` · ${blocking.length} Blocker or Major` : ""}`);
                   for (const finding of task.design.findings.filter((entry) => entry.severity !== "nit")) {
                     lines.push(`        ${finding.id} ${finding.severity}: ${finding.title}${finding.resolution === null ? " (unresolved)" : ` → ${finding.resolution.as}${finding.decision === null ? "" : `, ${finding.decision.by === "page" ? "from the Factory page" : finding.decision.by}: ${finding.decision.choice}`}`}`);
                   }

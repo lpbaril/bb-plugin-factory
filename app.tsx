@@ -161,7 +161,7 @@ function DesignChip({ task }: { task: BoardTask }) {
   const label = task.design.passed ? "Design passed" : DESIGN_STATE_LABEL[task.design.state];
   const warn = !task.design.passed && task.design.state === "escalated";
   return (
-    <span className={cn("rounded border px-1.5 py-0.5", warn ? "border-amber-500/50 text-amber-600 dark:text-amber-400" : "border-border")} title={`Round ${task.design.round}, ${task.design.depth} depth`}>
+    <span className={cn("rounded border px-1.5 py-0.5", warn ? "border-amber-500/50 text-amber-600 dark:text-amber-400" : "border-border")} title={`Round ${task.design.round}, ${task.design.focused ? "re-check" : `${task.design.depth} depth`}`}>
       {label}
     </span>
   );
@@ -243,7 +243,7 @@ function DesignReviewPanel({ task }: { task: BoardTask }) {
   return (
     <div className="space-y-1">
       <div className="text-xs font-medium text-muted-foreground">
-        Design review · round {design.round} · {design.depth === "full" ? "full depth" : "core lenses"} · {design.passed ? "passed" : DESIGN_STATE_LABEL[design.state].replace(/^Design:? ?/, "").toLowerCase() || "in progress"}
+        Design review · round {design.round} · {design.focused ? "re-check" : design.depth === "full" ? "full depth" : "core lenses"} · {design.passed ? "passed" : DESIGN_STATE_LABEL[design.state].replace(/^Design:? ?/, "").toLowerCase() || "in progress"}
       </div>
       <div className="flex flex-wrap gap-1 text-[10px]">
         {design.lenses.map((entry) => (

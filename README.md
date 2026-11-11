@@ -178,9 +178,11 @@ Google's [Elephant & Goldfish Model](https://github.com/google/elephant-goldfish
 - A Builder can't start until no Blocker or Major is unsettled. The Planner resolves
   every Blocker and Major first, then posts a new READY plan after a fix, which starts
   the next round and stops the old round's reviewers still reading. That round re-checks
-  only the lenses that found a Blocker or Major, each with a fresh reviewer; a lens that
-  found nothing isn't run again. Every lens runs for the first round, for a new plan after
-  a clean pass, and after a round where a lens didn't report. The same plan
+  only the lenses that found a Blocker or Major, each with a fresh reviewer, plus any lens
+  that hasn't read the plan yet (when its depth went up); a lens that found nothing isn't
+  run again. Every lens runs for the first round, for a new plan once a review has ended
+  (passed or accepted), and after a round where a lens didn't report. Status and the
+  Factory page show a re-check as such. The same plan
   can't be marked ready again to shake off its findings. A round with no unsettled
   Blocker or Major ends the review, and its findings can't change after that.
 - Only escalations reach you, through the Lead or as Keep and Fix buttons on the task
