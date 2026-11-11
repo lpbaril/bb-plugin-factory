@@ -541,7 +541,7 @@ const PLAN_DESIGN_REVIEW = `## Design review of your plan
   - **escalate**: the finding is wrong, but only knowledge outside the plan and the code settles it, or fixing it would undo an earlier fix. The person decides, through the Lead. Don't add context to the plan just to satisfy a reviewer without project knowledge.
   - **decline**: Nits only; recorded, not fixed.
 - Resolve every Blocker and Major before you post a new plan. After any fix, post a new complete READY plan with the fixes as a new task comment and run \`bb factory plan-ready <KEY> --comment <id>\` again. That starts the next round; the factory refuses the same plan unchanged.
-- Each round's reviewers start fresh, so one may raise a finding you contested before. Contest it again, citing the same evidence. Answers the person gave to keep an assumption carry over when the question stays word for word the same.`;
+- After a fix, the next round re-checks only the lenses that found a Blocker or Major. Each round's reviewers start fresh, so one may raise a finding you contested before. Contest it again, citing the same evidence. Answers the person gave to keep an assumption carry over when the question stays word for word the same.`;
 
 /** The Planner's other endings, for factories with tracks on. */
 const PLAN_OUTCOMES = `## When there's no plan to write

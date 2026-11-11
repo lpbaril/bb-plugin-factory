@@ -852,6 +852,22 @@ export function asSentence(text: string, max = 200): string {
   return text.trim().slice(0, max).replace(/([^.!?])$/, "$1.");
 }
 
+/**
+ * The lenses a design review round runs. After a round in which every lens reported back and at least one
+ * Blocker or Major was found, the next round re-checks only the lenses that found one, plus any lens
+ * its depth now adds that the earlier round didn't run. Each is still a fresh reader. Anything else gets
+ * every lens of its depth: the first round, a new plan after a clean pass, or a round cut short.
+ */
+export function designRoundLenses(depthLenses: readonly DesignLens[], previous: Pick<DesignRound, "lenses" | "findings"> | undefined): { lenses: DesignLens[]; focused: boolean } {
+  const all = { lenses: [...depthLenses], focused: false };
+  if (previous === undefined || previous.lenses.length === 0 || previous.lenses.some((entry) => entry.recordedAt === null)) return all;
+  const found = new Set(previous.findings.filter((finding) => finding.severity !== "nit").map((finding) => finding.lens));
+  if (found.size === 0) return all;
+  const ran = new Set(previous.lenses.map((entry) => entry.lens));
+  const lenses = DESIGN_LENSES.filter((lens) => found.has(lens) || (depthLenses.includes(lens) && !ran.has(lens)));
+  return { lenses, focused: true };
+}
+
 /** After compacting a Lead, wait this long before compacting it again, so the compaction's own turn can't start another. */
 export const LEAD_COMPACT_COOLDOWN_MS = 30 * 60_000;
 
@@ -2970,7 +2986,7 @@ export default async function plugin(bb: BbPluginApi) {
     }
     const sensitive = planSensitivePaths(body);
     const depth = factory.designDepth[taskKey] === "full" || sensitive.length > 0 ? "full" : "core";
-    const lenses = depth === "full" ? [...DESIGN_LENSES] : [...CORE_DESIGN_LENSES];
+    const { lenses, focused } = designRoundLenses(depth === "full" ? DESIGN_LENSES : CORE_DESIGN_LENSES, previous.at(-1));
     // A seat on a provider this machine doesn't have would leave every plan waiting. Fall back to the
     // Planner's, and say so: it loses the second provider, not the review.
     let execution = await executionFor("designreview");
@@ -3010,7 +3026,10 @@ export default async function plugin(bb: BbPluginApi) {
         findings: [], outcome: null, sentToPlannerAt: null, escalationsNotifiedAt: null, outcomeNotifiedAt: null,
       });
     });
-    await comment(task.id, `**Design review, round ${number}** of plan comment \`${planCommentId}\`: ${depth === "full" ? `full depth${sensitive.length > 0 ? ` (it names ${sensitive.slice(0, 3).map((path) => `\`${path}\``).join(", ")})` : ""}` : "core lenses"}. ${started.map((entry) => `${DESIGN_LENS_LABELS[entry.lens]} \`${entry.threadId}\``).join(", ")}.${fellBack ? ` The design reviewer seat's provider isn't available here, so they run on the Planner's (${execution.providerId}).` : ""}`);
+    const scope = focused
+      ? `re-checking only the lenses that found a Blocker or Major in round ${number - 1}`
+      : depth === "full" ? `full depth${sensitive.length > 0 ? ` (it names ${sensitive.slice(0, 3).map((path) => `\`${path}\``).join(", ")})` : ""}` : "core lenses";
+    await comment(task.id, `**Design review, round ${number}** of plan comment \`${planCommentId}\`: ${scope}. ${started.map((entry) => `${DESIGN_LENS_LABELS[entry.lens]} \`${entry.threadId}\``).join(", ")}.${fellBack ? ` The design reviewer seat's provider isn't available here, so they run on the Planner's (${execution.providerId}).` : ""}`);
     bb.realtime.publish(BOARD_CHANGED, { prefix });
   }
 
