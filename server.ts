@@ -860,6 +860,21 @@ export function asSentence(text: string, max = 200): string {
  * every lens of its depth: the first round, a new plan after a review that ended (clean, settled or
  * accepted), or a round after one where a lens didn't report.
  */
+/**
+ * The rounds of the review a task's plan is in now: back to, not including, the last round that ended it
+ * (clean, resolved or accepted). A plan changed after its review ended, such as one the person's answers
+ * sent back, starts a new review, so the round cap counts only these.
+ */
+export function currentDesignReview<T extends Pick<DesignRound, "outcome">>(rounds: readonly T[]): T[] {
+  const review: T[] = [];
+  for (let index = rounds.length - 1; index >= 0; index--) {
+    const round = rounds[index]!;
+    if (round.outcome !== null && round.outcome !== "superseded") break;
+    review.unshift(round);
+  }
+  return review;
+}
+
 export function designRoundLenses(
   depthLenses: readonly DesignLens[],
   rounds: readonly Pick<DesignRound, "lenses" | "findings" | "outcome">[],
@@ -871,13 +886,7 @@ export function designRoundLenses(
   const found = new Set(last.findings.filter((finding) => finding.severity !== "nit").map((finding) => finding.lens));
   if (found.size === 0) return all;
   // This review's rounds, back to the last one that ended: a lens that read any of them has read the plan.
-  const review: (typeof rounds)[number][] = [];
-  for (let index = rounds.length - 1; index >= 0; index--) {
-    const round = rounds[index]!;
-    if (round.outcome !== null && round.outcome !== "superseded") break;
-    review.push(round);
-  }
-  const read = new Set(review.flatMap((round) => round.lenses.map((entry) => entry.lens)));
+  const read = new Set(currentDesignReview(rounds).flatMap((round) => round.lenses.map((entry) => entry.lens)));
   const rechecking = DESIGN_LENSES.filter((lens) => found.has(lens));
   const firstRead = DESIGN_LENSES.filter((lens) => depthLenses.includes(lens) && !read.has(lens));
   return { lenses: DESIGN_LENSES.filter((lens) => found.has(lens) || firstRead.includes(lens)), focused: true, rechecking, firstRead };
@@ -2919,8 +2928,9 @@ export default async function plugin(bb: BbPluginApi) {
       return threads;
     });
   }
-  async function markPlanReady(taskKey: string, commentId: string, threadId: string | null): Promise<void> {
-    await withTaskLock(taskKey, async () => {
+  /** What happened to design review, in a sentence for the Planner, or null with design review off. */
+  async function markPlanReady(taskKey: string, commentId: string, threadId: string | null): Promise<string | null> {
+    return withTaskLock(taskKey, async () => {
       const task = await getTaskByKey(taskKey);
       const factory = await factoryForTaskKey(task.key);
       assertActive(factory);
@@ -2968,7 +2978,7 @@ export default async function plugin(bb: BbPluginApi) {
         delete current.closeAdvice[task.key];
       });
       if (questions.some((question) => question.answer === null)) await announcePersonQuestions(factory.prefix, task.key);
-      if (factory.designReviewEnabled) await startDesignRound(factory.prefix, task.key, document.id, document.body);
+      return factory.designReviewEnabled ? startDesignRound(factory.prefix, task.key, document.id, document.body) : null;
     });
   }
 
@@ -2987,21 +2997,25 @@ export default async function plugin(bb: BbPluginApi) {
 
   /**
    * A READY plan in a factory with design review on gets a round: one fresh reviewer per lens, reading
-   * that comment. An earlier round that never settled is superseded. Past the last round, the Lead is
-   * asked to bring the plan to the person instead.
+   * that comment. An earlier round that never settled is superseded. Past the last round of one review,
+   * the Lead is asked to bring the plan to the person instead. Says what happened, for the Planner.
    */
-  async function startDesignRound(prefix: string, taskKey: string, planCommentId: string, body: string): Promise<void> {
+  async function startDesignRound(prefix: string, taskKey: string, planCommentId: string, body: string): Promise<string> {
     const factory = await findFactory(prefix);
     const task = await getTaskByKey(taskKey);
     const previous = factory.designRounds.filter((entry) => entry.taskKey === taskKey);
+    // Rounds are numbered across the task, so finding ids stay unique; the cap counts only this review's.
     const number = previous.length + 1;
+    const inReview = currentDesignReview(previous).length + 1;
+    const lastEnded = previous.length > inReview - 1 ? previous[previous.length - inReview] : undefined;
     await mutateFactory(prefix, (current) => {
       for (const entry of current.designRounds) if (entry.taskKey === taskKey && entry.outcome === null) entry.outcome = "superseded";
     });
     await stopUnfinishedReviewers(previous.filter((entry) => entry.outcome === null));
-    if (number > MAX_DESIGN_ROUNDS) {
-      await tellLead(factory, `[factory] ${taskKey}'s plan has had ${MAX_DESIGN_ROUNDS} design review rounds, so no more start on their own. Bring it to the person: they can accept the plan as it is (\`bb factory design-accept ${taskKey} --reason "<why>"\`), or ask the Planner to rethink it.`);
-      return;
+    if (inReview > MAX_DESIGN_ROUNDS) {
+      await tellLead(factory, `[factory] ${taskKey}'s plan has had ${MAX_DESIGN_ROUNDS} design review rounds in this review, so no more start on their own. Bring it to the person: they can accept the plan as it is (\`bb factory design-accept ${taskKey} --reason "<why>"\`), or ask the Planner to rethink it.`);
+      await comment(task.id, `**Design review:** no round started for plan comment \`${planCommentId}\`. This review has had ${MAX_DESIGN_ROUNDS} rounds, so the person decides: accept the plan as it is, or send it back. A Builder waits until then.`);
+      return `No design review round started: this review has had ${MAX_DESIGN_ROUNDS} rounds, so the Lead brings the plan to the person. A Builder waits until they accept it.`;
     }
     const sensitive = planSensitivePaths(body);
     const depth = factory.designDepth[taskKey] === "full" || sensitive.length > 0 ? "full" : "core";
@@ -3034,7 +3048,7 @@ export default async function plugin(bb: BbPluginApi) {
     } catch (error) {
       for (const entry of started) await bb.sdk.threads.stop({ threadId: entry.threadId }).catch(() => undefined);
       await tellLead(factory, `[factory] Design review of ${taskKey}'s plan couldn't start: ${String(error).slice(0, 300)}. A Builder waits until the plan passes. Ask the Planner to mark it ready again, or the person can accept it as it is with \`bb factory design-accept ${taskKey} --reason "<why>"\`.`);
-      return;
+      return "No design review round started: its reviewers couldn't start, and the Lead has been told. A Builder waits until the plan passes.";
     }
     const now = new Date().toISOString();
     await mutateFactory(prefix, (current) => {
@@ -3050,8 +3064,11 @@ export default async function plugin(bb: BbPluginApi) {
     const scope = focused
       ? `re-checking ${names(rechecking)}, which found a Blocker or Major in round ${number - 1}${firstRead.length === 0 ? "" : `, with ${names(firstRead)} reading the plan for the first time at ${depth} depth${depthReason}`}`
       : depth === "full" ? `full depth${depthReason}` : "core lenses";
-    await comment(task.id, `**Design review, round ${number}** of plan comment \`${planCommentId}\`: ${scope}. ${started.map((entry) => `${DESIGN_LENS_LABELS[entry.lens]} \`${entry.threadId}\``).join(", ")}.${fellBack ? ` The design reviewer seat's provider isn't available here, so they run on the Planner's (${execution.providerId}).` : ""}`);
+    // A plan changed after its review ended gets a new review, with its own rounds.
+    const fresh = lastEnded === undefined ? "" : ` A new review: the last one ended in round ${lastEnded.round}, on an earlier plan.`;
+    await comment(task.id, `**Design review, round ${number}** of plan comment \`${planCommentId}\`: ${scope}. ${started.map((entry) => `${DESIGN_LENS_LABELS[entry.lens]} \`${entry.threadId}\``).join(", ")}.${fresh}${fellBack ? ` The design reviewer seat's provider isn't available here, so they run on the Planner's (${execution.providerId}).` : ""}`);
     bb.realtime.publish(BOARD_CHANGED, { prefix });
+    return `Design review round ${number} started (${focused ? "a re-check" : depth === "full" ? "full depth" : "core lenses"}). A Builder waits until the plan passes.`;
   }
 
   async function recordDesignFindings(taskKey: string, commentId: string, threadId: string | null): Promise<{ lens: DesignLens; count: number }> {
@@ -6570,8 +6587,8 @@ ${findings}`;
           positionals: [{ name: "task", description: "Task key", required: true }],
           options: { comment: { type: "string", required: true, description: "ID of the Planner's READY task comment" } },
           async run(input, ctx) {
-            await markPlanReady(input.positionals.task, input.options.comment, ctx.threadId ?? null);
-            return { exitCode: 0, stdout: `Plan ready for ${input.positionals.task.toUpperCase()}; builders will receive comment ${input.options.comment}.` };
+            const review = await markPlanReady(input.positionals.task, input.options.comment, ctx.threadId ?? null);
+            return { exitCode: 0, stdout: `Plan ready for ${input.positionals.task.toUpperCase()}; builders will receive comment ${input.options.comment}.${review === null ? "" : ` ${review}`}` };
           },
         }),
         qa: cliCommand({
