@@ -6034,7 +6034,11 @@ test('a re-check that brings in new lenses says which read the plan for the firs
 test('the current review is the rounds since the last one that ended', () => {
   const round = (outcome) => ({ outcome });
   assert.deepEqual(currentDesignReview([]), []);
-  assert.deepEqual(currentDesignReview([round('superseded'), round(null)]).length, 2);
+  assert.equal(currentDesignReview([round('superseded'), round(null)]).length, 2);
+  // A review the person ended by accepting, with no round open to mark: the recorded start.
+  const numbered = [1, 2, 3, 4, 5, 6].map(n => ({ round: n, outcome: n === 6 ? null : 'superseded' }));
+  assert.deepEqual(currentDesignReview(numbered, 6), numbered.slice(5));
+  assert.deepEqual(currentDesignReview(numbered.slice(0, 5), 6), [], 'nothing of the new review yet');
   for (const ended of ['clean', 'resolved', 'accepted']) {
     const rounds = [round('superseded'), round(ended), round('superseded'), round(null)];
     assert.deepEqual(currentDesignReview(rounds), rounds.slice(2), ended);
@@ -6054,7 +6058,7 @@ test('a plan changed after its review passed gets a new review, even after five 
   assert.deepEqual(factory.designRounds.at(-1).round, 6);
   assert.equal(factory.designRounds.at(-1).planCommentId, 'plan_6');
   assert.equal(factory.designRounds.at(-1).focused, false);
-  assert.ok(posted.some(body => /^\*\*Design review, round 6\*\* of plan comment `plan_6`: core lenses\. .* A new review: the last one ended in round 5, on an earlier plan\./.test(body)), posted.join('\n'));
+  assert.ok(posted.some(body => /^\*\*Design review, round 6\*\* of plan comment `plan_6`: core lenses\. .* A new review: the last one ended after round 5, on an earlier plan\./.test(body)), posted.join('\n'));
   assert.equal(say('thr_lead', /design review rounds/).length, 0);
 });
 
@@ -6075,4 +6079,55 @@ test('plan-ready says when design review is off', async t => {
   const { markReady } = await designFixture(t, { designReviewEnabled: false });
   const ready = await markReady('plan_1', readyPlan().replace(/\n## Success checks[\s\S]*$/, ''));
   assert.equal(ready.stdout, 'Plan ready for TEST-1; builders will receive comment plan_1.');
+});
+
+const fullFinding = (round, lens, severity) => ({ id: `${round}.${lens}.1`, lens, severity, title: 'A gap', detail: 'd', resolution: { as: 'fix', note: 'n', at: '' }, decision: null });
+
+test('accepting a plan at the round cap ends the review: the next changed plan gets a full new review', async t => {
+  // Round 5's Zoom Out found a Major, so a review still going on would only re-check that lens.
+  const rounds = [1, 2, 3, 4, 5].map(round => ({ taskKey: 'TEST-1', round, planCommentId: `old_${round}`, depth: 'core', startedAt: '', lenses: designLenses(), findings: round === 5 ? [fullFinding(5, 'zoom-out', 'major')] : [], outcome: 'superseded' }));
+  const { harness, markReady, spawns, read, posted, say } = await designFixture(t, { designRounds: rounds });
+  assert.match((await markReady('plan_6')).stdout, /No design review round started/);
+  const gate = await harness.behavior.runCli(['assign', 'TEST-1', '--role', 'build']);
+  assert.match(gate.stderr, /this review has had 5 rounds, so no more start, and the person decides/);
+  assert.match(gate.stderr, /bb factory design-accept TEST-1/);
+  assert.equal((await harness.behavior.runCli(['design-accept', 'TEST-1', '--reason', 'The person read v6 and accepts it'], { threadId: 'thr_lead' })).exitCode, 0);
+  assert.deepEqual((await read()).designReviews['TEST-1'], { startRound: 6, capNotifiedAt: null });
+  // The person's answer sends the plan back, and the Planner posts v7.
+  const ready = await markReady('plan_7');
+  assert.match(ready.stdout, /Design review round 6 started \(core lenses\)/);
+  assert.equal(spawns.length, 3, 'every lens, not a re-check from round 5');
+  const round6 = (await read()).designRounds.at(-1);
+  assert.equal(round6.round, 6);
+  assert.equal(round6.focused, false);
+  assert.ok(posted.some(body => /^\*\*Design review, round 6\*\* of plan comment `plan_7`: core lenses\. .* A new review: the last one ended after round 5, on an earlier plan\./.test(body)), posted.join('\n'));
+  assert.equal(say('thr_lead', /design review rounds in this review/).length, 1, 'only the cap that was reached');
+});
+
+test('only the first round of a new review says it is new', async t => {
+  const rounds = [1, 2, 3, 4, 5, 6].map(round => ({ taskKey: 'TEST-1', round, planCommentId: `old_${round}`, depth: 'core', startedAt: '', lenses: designLenses(), findings: [], outcome: round === 5 ? 'clean' : 'superseded' }));
+  const { markReady, posted } = await designFixture(t, { designRounds: rounds });
+  assert.match((await markReady('plan_7')).stdout, /Design review round 7 started/);
+  const round7 = posted.find(body => body.startsWith('**Design review, round 7**'));
+  assert.ok(round7 !== undefined, posted.join('\n'));
+  assert.ok(!round7.includes('A new review'), round7);
+});
+
+test('a review at the round cap tells the Lead and the task once, however many plans follow', async t => {
+  const rounds = [1, 2, 3, 4, 5].map(round => ({ taskKey: 'TEST-1', round, planCommentId: `old_${round}`, depth: 'core', startedAt: '', lenses: designLenses(), findings: [], outcome: 'superseded' }));
+  const { markReady, posted, say, read } = await designFixture(t, { designRounds: rounds });
+  assert.match((await markReady('plan_6')).stdout, /so the Lead brings the plan to the person/);
+  const again = await markReady('plan_7', readyPlan('\nAnother change.'));
+  assert.match(again.stdout, /No design review round started: this review has had 5 rounds, so the person decides, as the Lead was told when the review reached the cap\./);
+  assert.equal(say('thr_lead', /design review rounds in this review/).length, 1);
+  assert.equal(posted.filter(body => body.startsWith('**Design review:** no round started')).length, 1);
+  assert.equal((await read()).designReviews['TEST-1'].startRound, 1);
+});
+
+test('the Builder gate names the round cap, and after an accept a new plan waits for its review', () => {
+  const rounds = [1, 2, 3, 4, 5].map(round => ({ taskKey: 'TEST-1', round, planCommentId: `old_${round}`, depth: 'core', startedAt: '', lenses: designLenses(), findings: [], outcome: 'superseded' }));
+  const factory = { designReviewEnabled: true, designRounds: rounds, plans: [{ taskKey: 'TEST-1', threadId: 'p', commentId: 'plan_6', designRequired: true, reviewedCommentId: null, personQuestions: [] }] };
+  assert.throws(() => designGate(factory, 'TEST-1'), error => /this review has had 5 rounds/.test(error.message) && /design-accept TEST-1/.test(error.hint));
+  assert.throws(() => designGate({ ...factory, designReviews: { 'TEST-1': { startRound: 6, capNotifiedAt: null } } }, 'TEST-1'), /its design review hasn't started/);
+  assert.throws(() => designGate({ ...factory, designRounds: rounds.slice(0, 4) }, 'TEST-1'), /its design review hasn't started/, 'below the cap');
 });
