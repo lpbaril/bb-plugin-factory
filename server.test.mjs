@@ -10,7 +10,7 @@ registerHooks({ resolve(specifier, context, next) {
   }
   return next(specifier, context);
 } });
-const { default: plugin, computePreset, computeTokenProfile, designRoundLenses, asSentence, PAGE_NOTICE_TIMEOUT_MS, leadCompactionDue, leadCompactBackoffMs, LEAD_COMPACT_COOLDOWN_MS, parsePersonQuestions, personQuestionsGate, parseDesignFindings, planSensitivePaths, designRoundState, designGate, trackGate, parseApproaches, exploreAssignment, readRecommendation, sectionText, supervisorAction, turnsFromEvents, creditUsage, mergeBlockers, sortChecks, latestRuns, mergeOverlapNote, migrateQaResults, qaCarryNote, leadMayMerge, rosterWarnings, computeHealth, parseDay, prsOpenedBetween, qaHold, qaNextStep, parseCoverage, changeRounds, fixLoopAdvice } = await import('./server.ts');
+const { default: plugin, computePreset, computeTokenProfile, designRoundLenses, currentDesignReview, asSentence, PAGE_NOTICE_TIMEOUT_MS, leadCompactionDue, leadCompactBackoffMs, LEAD_COMPACT_COOLDOWN_MS, parsePersonQuestions, personQuestionsGate, parseDesignFindings, planSensitivePaths, designRoundState, designGate, trackGate, parseApproaches, exploreAssignment, readRecommendation, sectionText, supervisorAction, turnsFromEvents, creditUsage, mergeBlockers, sortChecks, latestRuns, mergeOverlapNote, migrateQaResults, qaCarryNote, leadMayMerge, rosterWarnings, computeHealth, parseDay, prsOpenedBetween, qaHold, qaNextStep, parseCoverage, changeRounds, fixLoopAdvice } = await import('./server.ts');
 const { shareBarWidth, sharePercent } = await import('./token-profile.ts');
 const { leadCharter, leadPrompt, reReviewMessage, workerPrompt, workerReminder, designReviewPrompt } = await import('./roles.ts');
 const { createFactoryStorage } = await import('./factory-storage.ts');
@@ -4799,10 +4799,13 @@ test('the person\'s "fix" goes to the Planner, and the Factory page can answer f
 
 test('after five rounds, no sixth starts: the Lead brings it to the person, who can accept the plan', async t => {
   const rounds = [1, 2, 3, 4, 5].map(round => ({ taskKey: 'TEST-1', round, planCommentId: `old_${round}`, depth: 'core', startedAt: '', lenses: designLenses(), findings: [], outcome: 'superseded' }));
-  const { harness, markReady, spawns, say, read } = await designFixture(t, { designRounds: rounds });
-  assert.equal((await markReady('plan_6')).exitCode, 0);
+  const { harness, markReady, spawns, say, read, posted } = await designFixture(t, { designRounds: rounds });
+  const ready = await markReady('plan_6');
+  assert.equal(ready.exitCode, 0);
+  assert.match(ready.stdout, /No design review round started: this review has had 5 rounds, so the Lead brings the plan to the person\. A Builder waits until they accept it\./, 'the Planner is told, not left to find out');
   assert.equal(spawns.length, 0);
-  assert.match(say('thr_lead', /has had 5 design review rounds/)[0], /bb factory design-accept TEST-1 --reason/);
+  assert.match(say('thr_lead', /has had 5 design review rounds in this review/)[0], /bb factory design-accept TEST-1 --reason/);
+  assert.ok(posted.some(body => /^\*\*Design review:\*\* no round started for plan comment `plan_6`\. This review has had 5 rounds/.test(body)), posted.join('\n'));
   assert.match((await harness.behavior.runCli(['design-accept', 'TEST-1', '--reason', 'Good enough'], { threadId: 'thr_planner' })).stderr, /Only the factory's Lead or the person/);
   assert.match((await harness.behavior.runCli(['design-accept', 'TEST-1', '--reason', 'ok'], { threadId: 'thr_lead' })).stderr, /Give the person's reason/);
   assert.equal((await harness.behavior.runCli(['design-accept', 'TEST-1', '--reason', 'The person read it and is happy'], { threadId: 'thr_lead' })).exitCode, 0);
@@ -6026,4 +6029,50 @@ test('a re-check that brings in new lenses says which read the plan for the firs
   assert.match(status, /Design review round 2 \(full, re-check\): reviewing/);
   const detail = await harness.behavior.callRpc('factory_board', { prefix: 'TEST' });
   assert.equal(detail.tasks.find(task => task.key === 'TEST-1').design.focused, true);
+});
+
+test('the current review is the rounds since the last one that ended', () => {
+  const round = (outcome) => ({ outcome });
+  assert.deepEqual(currentDesignReview([]), []);
+  assert.deepEqual(currentDesignReview([round('superseded'), round(null)]).length, 2);
+  for (const ended of ['clean', 'resolved', 'accepted']) {
+    const rounds = [round('superseded'), round(ended), round('superseded'), round(null)];
+    assert.deepEqual(currentDesignReview(rounds), rounds.slice(2), ended);
+    assert.deepEqual(currentDesignReview([round('superseded'), round(ended)]), [], `${ended} ends the review`);
+  }
+});
+
+test('a plan changed after its review passed gets a new review, even after five rounds', async t => {
+  // BUSY-6: round 5 passed v5, then the person's answers sent the plan back for v6.
+  const rounds = [1, 2, 3, 4, 5].map(round => ({ taskKey: 'TEST-1', round, planCommentId: `old_${round}`, depth: 'core', startedAt: '', lenses: designLenses(), findings: [], outcome: round === 5 ? 'clean' : 'superseded' }));
+  const { markReady, spawns, read, posted, say } = await designFixture(t, { designRounds: rounds, plans: [{ taskKey: 'TEST-1', threadId: 'thr_planner', commentId: 'old_5', designRequired: true, reviewedCommentId: 'old_5' }] });
+  const ready = await markReady('plan_6');
+  assert.equal(ready.exitCode, 0, ready.stderr);
+  assert.match(ready.stdout, /Design review round 6 started \(core lenses\)\. A Builder waits until the plan passes\./);
+  assert.equal(spawns.length, 3, 'every core lens reads the new plan');
+  const factory = await read();
+  assert.deepEqual(factory.designRounds.at(-1).round, 6);
+  assert.equal(factory.designRounds.at(-1).planCommentId, 'plan_6');
+  assert.equal(factory.designRounds.at(-1).focused, false);
+  assert.ok(posted.some(body => /^\*\*Design review, round 6\*\* of plan comment `plan_6`: core lenses\. .* A new review: the last one ended in round 5, on an earlier plan\./.test(body)), posted.join('\n'));
+  assert.equal(say('thr_lead', /design review rounds/).length, 0);
+});
+
+test('the cap applies to each review: five rounds after one ended, the next is refused', async t => {
+  const rounds = Array.from({ length: 9 }, (_, i) => ({ taskKey: 'TEST-1', round: i + 1, planCommentId: `old_${i + 1}`, depth: 'core', startedAt: '', lenses: designLenses(), findings: [], outcome: i + 1 === 3 ? 'accepted' : 'superseded' }));
+  // Rounds 4 to 8 are five rounds of the review after round 3's ended: the cap.
+  const capped = await designFixture(t, { designRounds: rounds.slice(0, 8) });
+  assert.match((await capped.markReady('plan_9')).stdout, /No design review round started/);
+  assert.equal(capped.spawns.length, 0);
+  // Rounds 6 to 9 are four rounds of the review after round 5's ended, so a fifth starts.
+  const four = Array.from({ length: 9 }, (_, i) => ({ ...rounds[i], outcome: i + 1 === 5 ? 'resolved' : 'superseded' }));
+  const open = await designFixture(t, { designRounds: four });
+  assert.match((await open.markReady('plan_10')).stdout, /Design review round 10 started/);
+  assert.equal(open.spawns.length, 3);
+});
+
+test('plan-ready says when design review is off', async t => {
+  const { markReady } = await designFixture(t, { designReviewEnabled: false });
+  const ready = await markReady('plan_1', readyPlan().replace(/\n## Success checks[\s\S]*$/, ''));
+  assert.equal(ready.stdout, 'Plan ready for TEST-1; builders will receive comment plan_1.');
 });

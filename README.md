@@ -193,8 +193,10 @@ Google's [Elephant & Goldfish Model](https://github.com/google/elephant-goldfish
   starts until you've answered each (an answer that kept the plan's assumption carries
   over to the same question in the next plan), through the Lead (`bb factory plan-answer APP-12
   keep|change --question Q1`) or on the task. A different answer sends the plan back to
-  the Planner for a new READY plan. After 5 rounds, the Lead brings the plan to you: you can accept it
-  as it is (`bb factory design-accept APP-12 --reason "..."`) or send it back.
+  the Planner for a new READY plan. After 5 rounds of one review, the Lead brings the plan to you: you can accept it
+  as it is (`bb factory design-accept APP-12 --reason "..."`) or send it back. A plan changed after its
+  review ended, such as one your answers sent back, starts a new review with all its lenses,
+  so the cap counts again from there. `plan-ready` tells the Planner whether a round started.
 - READY plans also need a "## Success checks" heading. Every review, with findings or
   without, ends with "## Checked" (the plan sections and files read) and "## Not
   checked", so a clean review shows what it looked at.
