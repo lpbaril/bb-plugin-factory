@@ -183,7 +183,8 @@ Google's [Elephant & Goldfish Model](https://github.com/google/elephant-goldfish
   run again. Every lens runs for the first round, for a new plan once a review has ended
   (passed or accepted), and after a round where a lens didn't report. Status and the
   Factory page show a re-check as such. The same plan
-  can't be marked ready again to shake off its findings. A round with no unsettled
+  can't be marked ready again to shake off its findings. A READY plan no round has read, such as one whose
+  reviewers couldn't start, can be marked ready again as it is to get its round; its answered questions stay answered. A round with no unsettled
   Blocker or Major ends the review, and its findings can't change after that.
 - Only escalations reach you, through the Lead or as Keep and Fix buttons on the task
   on the Factory page. So do the plan's own questions for you: the Planner lists each

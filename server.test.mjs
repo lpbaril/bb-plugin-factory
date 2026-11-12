@@ -6131,3 +6131,60 @@ test('the Builder gate names the round cap, and after an accept a new plan waits
   assert.throws(() => designGate({ ...factory, designReviews: { 'TEST-1': { startRound: 6, capNotifiedAt: null } } }, 'TEST-1'), /its design review hasn't started/);
   assert.throws(() => designGate({ ...factory, designRounds: rounds.slice(0, 4) }, 'TEST-1'), /its design review hasn't started/, 'below the cap');
 });
+
+// ----- Marking an unreviewed READY plan again -----
+
+const remark = (fx, id) => fx.harness.behavior.runCli(['plan-ready', 'TEST-1', '--comment', id], { threadId: 'thr_planner' });
+
+test('a READY plan no round has read can be marked again, and gets its round', async t => {
+  // What 0.4.5 left behind: round 5 passed an earlier plan, and plan_6 was marked ready with no round.
+  const rounds = [1, 2, 3, 4, 5].map(round => ({ taskKey: 'TEST-1', round, planCommentId: `old_${round}`, depth: 'core', startedAt: '', lenses: designLenses(), findings: [], outcome: round === 5 ? 'clean' : 'superseded' }));
+  const fx = await designFixture(t, { designRounds: rounds, plans: [{ taskKey: 'TEST-1', threadId: 'thr_planner', commentId: 'plan_6', designRequired: true, reviewedCommentId: 'old_5' }] });
+  fx.comments.push({ id: 'plan_6', kind: 'agent', authorName: 'Planner', threadId: 'thr_planner', body: readyPlan(), createdAt: '' });
+  const again = await remark(fx, 'plan_6');
+  assert.equal(again.exitCode, 0, again.stderr);
+  assert.match(again.stdout, /Design review round 6 started/);
+  assert.equal(fx.spawns.length, 3);
+  assert.equal((await fx.read()).designRounds.at(-1).planCommentId, 'plan_6');
+  // Now a round has read it, so marking it again is refused.
+  const third = await remark(fx, 'plan_6');
+  assert.notEqual(third.exitCode, 0);
+  assert.match(third.stderr, /already the READY plan, and design review has read it/);
+});
+
+test('a plan whose reviewers couldn\'t start can be marked again, as the Lead is told', async t => {
+  const fx = await designFixture(t, {}, { spawnFailsAt: 1 });
+  assert.match((await fx.markReady()).stdout, /No design review round started: its reviewers couldn't start/);
+  assert.equal((await fx.read()).designRounds.length, 0);
+  const again = await remark(fx, 'plan_1');
+  assert.equal(again.exitCode, 0, again.stderr);
+  assert.match(again.stdout, /Design review round 1 started/);
+});
+
+test('marking the same plan again keeps the person\'s answers, and is refused when an answer changed the plan', async t => {
+  const body = withQuestions('- For the person: Q1. Round to what amount? Assumed: up to the next whole unit.\n- For the person: Q2. Show cents? Assumed: yes.');
+  const kept = { choice: 'keep', text: null, by: 'person', at: 'then' };
+  const question = (id, text, assumed, answer) => ({ id, text, assumed, answer, notifiedAt: 'then' });
+  const keep = await designFixture(t, { plans: [{ taskKey: 'TEST-1', threadId: 'thr_planner', commentId: 'plan_1', designRequired: true, reviewedCommentId: null,
+    personQuestions: [question('Q1', 'Round to what amount?', 'up to the next whole unit.', kept), question('Q2', 'Show cents?', 'yes.', null)] }] });
+  keep.comments.push({ id: 'plan_1', kind: 'agent', authorName: 'Planner', threadId: 'thr_planner', body, createdAt: '' });
+  assert.equal((await remark(keep, 'plan_1')).exitCode, 0);
+  const questions = (await keep.read()).plans[0].personQuestions;
+  assert.deepEqual(questions.map(entry => [entry.id, entry.answer?.choice ?? null, entry.notifiedAt]), [['Q1', 'keep', 'then'], ['Q2', null, 'then']]);
+  assert.equal(keep.say('thr_lead', /only the person can answer/).length, 0, 'the Lead isn\'t asked again');
+
+  const changed = await designFixture(t, { plans: [{ taskKey: 'TEST-1', threadId: 'thr_planner', commentId: 'plan_1', designRequired: true, reviewedCommentId: null,
+    personQuestions: [question('Q1', 'Round to what amount?', 'up to the next whole unit.', { choice: 'change', text: 'To the nearest cent', by: 'person', at: '' })] }] });
+  changed.comments.push({ id: 'plan_1', kind: 'agent', authorName: 'Planner', threadId: 'thr_planner', body, createdAt: '' });
+  const refused = await remark(changed, 'plan_1');
+  assert.notEqual(refused.exitCode, 0);
+  assert.match(refused.stderr, /The person answered Q1 differently from this plan's assumption\. Post a new READY plan/);
+  assert.equal(changed.spawns.length, 0);
+});
+
+test('a plan the person accepted can\'t be marked again', async t => {
+  const fx = await designFixture(t, { plans: [{ taskKey: 'TEST-1', threadId: 'thr_planner', commentId: 'plan_1', designRequired: true, reviewedCommentId: 'plan_1' }] });
+  fx.comments.push({ id: 'plan_1', kind: 'agent', authorName: 'Planner', threadId: 'thr_planner', body: readyPlan(), createdAt: '' });
+  assert.match((await remark(fx, 'plan_1')).stderr, /already the READY plan, and design review has read it/);
+  assert.equal(fx.spawns.length, 0);
+});
