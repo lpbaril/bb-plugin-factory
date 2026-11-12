@@ -2961,9 +2961,16 @@ export default async function plugin(bb: BbPluginApi) {
         throw new PluginCliError(`Post a complete READY planning comment from this Planner first (scope, acceptance criteria, implementation plan, dependencies, open questions${factory.designReviewEnabled ? " and success checks" : ""}).`, { code: "plan_incomplete" });
       }
       if (factory.designReviewEnabled) {
-        // A round's findings can't be shaken off by reviewing the same plan again.
+        // A round's findings can't be shaken off by reviewing the same plan again. A READY plan no round has
+        // read, and the person hasn't accepted, can be marked again: its round never started (the round cap,
+        // reviewers that couldn't start, or a version without the review), and that's how it gets one.
         if (plan.commentId === document.id) {
-          throw new PluginCliError("This comment is already the READY plan. Post the changed plan as a new task comment, then mark that one ready.", { code: "plan_already_ready" });
+          const read = plan.reviewedCommentId === document.id || factory.designRounds.some((round) => round.taskKey === task.key && round.planCommentId === document.id);
+          if (read) throw new PluginCliError("This comment is already the READY plan, and design review has read it. Post the changed plan as a new task comment, then mark that one ready.", { code: "plan_already_ready" });
+          const changed = plan.personQuestions.filter((question) => question.answer?.choice === "change").map((question) => question.id);
+          if (changed.length > 0) {
+            throw new PluginCliError(`The person answered ${changed.join(", ")} differently from this plan's assumption. Post a new READY plan that follows their answer, then mark that one ready.`, { code: "plan_answer_changed" });
+          }
         }
         const open = latestDesignRound(factory, task.key);
         if (open !== null && open.outcome === null) {
@@ -2981,9 +2988,11 @@ export default async function plugin(bb: BbPluginApi) {
       // over only to the same question, word for word, options included, with the same assumption: the
       // person approved those exact choices, so a reworded option or a newly stated assumption is asked
       // again rather than approved on their behalf.
+      // The same comment marked again keeps its answers: it's the plan the person answered.
       const earlier = plan.personQuestions;
+      const again = plan.commentId === document.id;
       const questions = (factory.designReviewEnabled ? parsePersonQuestions(document.body) : []).map((question) => {
-        const same = earlier.find((entry) => entry.id === question.id && entry.text === question.text && entry.assumed === question.assumed && entry.answer?.choice === "keep");
+        const same = earlier.find((entry) => entry.id === question.id && entry.text === question.text && entry.assumed === question.assumed && (again || entry.answer?.choice === "keep"));
         return { ...question, answer: same?.answer ?? null, notifiedAt: same?.notifiedAt ?? null };
       });
       await mutateFactory(factory.prefix, (current) => {
