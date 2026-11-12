@@ -610,13 +610,21 @@ export function personQuestionsGate(factory: Pick<Factory, "plans" | "designRevi
 }
 
 /** With design review on, a Builder waits until the current READY plan has passed or been accepted. */
-export function designGate(factory: Pick<Factory, "plans" | "designRounds" | "designReviewEnabled">, taskKey: string): void {
+export function designGate(factory: Pick<Factory, "plans" | "designRounds" | "designReviewEnabled"> & Partial<Pick<Factory, "designReviews">>, taskKey: string): void {
   const plan = factory.plans.find((entry) => entry.taskKey === taskKey);
   if (!factory.designReviewEnabled || plan === undefined || !plan.designRequired || plan.commentId === null || plan.reviewedCommentId === plan.commentId) return;
   const round = factory.designRounds.filter((entry) => entry.taskKey === taskKey && entry.planCommentId === plan.commentId).at(-1);
   const state = round === undefined ? null : designRoundState(round);
   // Passed, and the factory is still recording it.
   if (state === "clean" || state === "settled") return;
+  const tasksRounds = factory.designRounds.filter((entry) => entry.taskKey === taskKey);
+  const capped = state === null && currentDesignReview(tasksRounds, factory.designReviews?.[taskKey]?.startRound).length >= MAX_DESIGN_ROUNDS;
+  if (capped) {
+    throw new PluginCliError(`${taskKey}'s plan hasn't passed design review: this review has had ${MAX_DESIGN_ROUNDS} rounds, so no more start, and the person decides.`, {
+      code: "design_review_pending",
+      hint: `Bring the plan to the person: they can accept it as it is with \`bb factory design-accept ${taskKey} --reason "<why>"\`, or send it back to the Planner.`,
+    });
+  }
   const why = state === null ? "its design review hasn't started"
     : state === "reviewing" ? `design reviewers are still reading it (round ${round!.round})`
     : state === "resolving" ? "the Planner is resolving design findings"
@@ -853,6 +861,21 @@ export function asSentence(text: string, max = 200): string {
 }
 
 /**
+ * The rounds of the review a task's plan is in now. A review ends when a round ends it (clean, resolved
+ * or accepted), or when the person accepts a plan, which the factory records as the round the next review
+ * starts at (`startRound`): a plan accepted at the round cap has no round to mark. A plan changed after
+ * its review ended, such as one the person's answers sent back, starts a new review, and the round cap
+ * counts only its rounds.
+ */
+export function currentDesignReview<T extends Pick<DesignRound, "outcome"> & { round?: number }>(rounds: readonly T[], startRound = 1): T[] {
+  let from = 0;
+  rounds.forEach((round, index) => {
+    if ((round.outcome !== null && round.outcome !== "superseded") || (round.round !== undefined && round.round < startRound)) from = index + 1;
+  });
+  return rounds.slice(from);
+}
+
+/**
  * The lenses a design review round runs. While a review is going on (its last round was overtaken by a
  * new plan, not ended), and every lens of that last round reported back with at least one Blocker or
  * Major, the next round re-checks only the lenses that found one, plus any lens of its depth that
@@ -860,33 +883,20 @@ export function asSentence(text: string, max = 200): string {
  * every lens of its depth: the first round, a new plan after a review that ended (clean, settled or
  * accepted), or a round after one where a lens didn't report.
  */
-/**
- * The rounds of the review a task's plan is in now: back to, not including, the last round that ended it
- * (clean, resolved or accepted). A plan changed after its review ended, such as one the person's answers
- * sent back, starts a new review, so the round cap counts only these.
- */
-export function currentDesignReview<T extends Pick<DesignRound, "outcome">>(rounds: readonly T[]): T[] {
-  const review: T[] = [];
-  for (let index = rounds.length - 1; index >= 0; index--) {
-    const round = rounds[index]!;
-    if (round.outcome !== null && round.outcome !== "superseded") break;
-    review.unshift(round);
-  }
-  return review;
-}
-
 export function designRoundLenses(
   depthLenses: readonly DesignLens[],
-  rounds: readonly Pick<DesignRound, "lenses" | "findings" | "outcome">[],
+  rounds: readonly (Pick<DesignRound, "lenses" | "findings" | "outcome"> & { round?: number })[],
+  startRound = 1,
 ): { lenses: DesignLens[]; focused: boolean; rechecking: DesignLens[]; firstRead: DesignLens[] } {
   const all = { lenses: [...depthLenses], focused: false, rechecking: [], firstRead: [] };
-  const last = rounds.at(-1);
-  if (last === undefined || (last.outcome !== null && last.outcome !== "superseded")) return all;
+  // This review's rounds: a lens that read any of them has read the plan.
+  const review = currentDesignReview(rounds, startRound);
+  const last = review.at(-1);
+  if (last === undefined) return all;
   if (last.lenses.length === 0 || last.lenses.some((entry) => entry.findingsCommentId === null)) return all;
   const found = new Set(last.findings.filter((finding) => finding.severity !== "nit").map((finding) => finding.lens));
   if (found.size === 0) return all;
-  // This review's rounds, back to the last one that ended: a lens that read any of them has read the plan.
-  const read = new Set(currentDesignReview(rounds).flatMap((round) => round.lenses.map((entry) => entry.lens)));
+  const read = new Set(review.flatMap((round) => round.lenses.map((entry) => entry.lens)));
   const rechecking = DESIGN_LENSES.filter((lens) => found.has(lens));
   const firstRead = DESIGN_LENSES.filter((lens) => depthLenses.includes(lens) && !read.has(lens));
   return { lenses: DESIGN_LENSES.filter((lens) => found.has(lens) || firstRead.includes(lens)), focused: true, rechecking, firstRead };
@@ -1094,6 +1104,11 @@ const factorySchema = z.object({
   /** Fresh design review of READY plans: on for new factories, and a person's choice for existing ones. */
   designReviewEnabled: z.boolean().default(false),
   designRounds: z.array(designRoundSchema).default([]),
+  /**
+   * Where each task's current design review starts, when a review ended without a round to mark (the
+   * person accepted the plan), and whether the Lead has heard that this review reached the round cap.
+   */
+  designReviews: z.record(z.string(), z.object({ startRound: z.number(), capNotifiedAt: z.string().nullable().default(null) })).default({}),
   /** Tasks the Lead or the person asked to review at full depth. */
   designDepth: z.record(z.string(), z.enum(["core", "full"])).default({}),
   /** A Planner's or Explorer's advice to close a task, which only the person can act on. */
@@ -2363,6 +2378,7 @@ export default async function plugin(bb: BbPluginApi) {
       closeAdvice: {},
       designReviewEnabled: true,
       designRounds: [],
+      designReviews: {},
       designDepth: {},
       leadThreadId: null,
       agents: [],
@@ -3006,20 +3022,29 @@ export default async function plugin(bb: BbPluginApi) {
     const previous = factory.designRounds.filter((entry) => entry.taskKey === taskKey);
     // Rounds are numbered across the task, so finding ids stay unique; the cap counts only this review's.
     const number = previous.length + 1;
-    const inReview = currentDesignReview(previous).length + 1;
-    const lastEnded = previous.length > inReview - 1 ? previous[previous.length - inReview] : undefined;
+    const mark = factory.designReviews[taskKey];
+    const review = currentDesignReview(previous, mark?.startRound);
+    const inReview = review.length + 1;
+    // The round before a new review, when there is one: the review it belonged to has ended.
+    const endedBefore = review.length === 0 ? previous.at(-1) : undefined;
     await mutateFactory(prefix, (current) => {
       for (const entry of current.designRounds) if (entry.taskKey === taskKey && entry.outcome === null) entry.outcome = "superseded";
     });
     await stopUnfinishedReviewers(previous.filter((entry) => entry.outcome === null));
     if (inReview > MAX_DESIGN_ROUNDS) {
-      await tellLead(factory, `[factory] ${taskKey}'s plan has had ${MAX_DESIGN_ROUNDS} design review rounds in this review, so no more start on their own. Bring it to the person: they can accept the plan as it is (\`bb factory design-accept ${taskKey} --reason "<why>"\`), or ask the Planner to rethink it.`);
-      await comment(task.id, `**Design review:** no round started for plan comment \`${planCommentId}\`. This review has had ${MAX_DESIGN_ROUNDS} rounds, so the person decides: accept the plan as it is, or send it back. A Builder waits until then.`);
-      return `No design review round started: this review has had ${MAX_DESIGN_ROUNDS} rounds, so the Lead brings the plan to the person. A Builder waits until they accept it.`;
+      // Once per review: later plans in the same review reach the same decision, which the Lead already has.
+      const startRound = review[0]!.round;
+      const told = mark !== undefined && mark.startRound === startRound && mark.capNotifiedAt !== null;
+      if (!told) {
+        await tellLead(factory, `[factory] ${taskKey}'s plan has had ${MAX_DESIGN_ROUNDS} design review rounds in this review, so no more start on their own. Bring it to the person: they can accept the plan as it is (\`bb factory design-accept ${taskKey} --reason "<why>"\`), or ask the Planner to rethink it.`);
+        await comment(task.id, `**Design review:** no round started for plan comment \`${planCommentId}\`. This review has had ${MAX_DESIGN_ROUNDS} rounds, so the person decides: accept the plan as it is, or send it back. A Builder waits until then.`);
+        await mutateFactory(prefix, (current) => { current.designReviews[taskKey] = { startRound, capNotifiedAt: new Date().toISOString() }; });
+      }
+      return `No design review round started: this review has had ${MAX_DESIGN_ROUNDS} rounds, so ${told ? "the person decides, as the Lead was told when the review reached the cap" : "the Lead brings the plan to the person"}. A Builder waits until they accept it.`;
     }
     const sensitive = planSensitivePaths(body);
     const depth = factory.designDepth[taskKey] === "full" || sensitive.length > 0 ? "full" : "core";
-    const { lenses, focused, rechecking, firstRead } = designRoundLenses(depth === "full" ? DESIGN_LENSES : CORE_DESIGN_LENSES, previous);
+    const { lenses, focused, rechecking, firstRead } = designRoundLenses(depth === "full" ? DESIGN_LENSES : CORE_DESIGN_LENSES, previous, mark?.startRound);
     // A seat on a provider this machine doesn't have would leave every plan waiting. Fall back to the
     // Planner's, and say so: it loses the second provider, not the review.
     let execution = await executionFor("designreview");
@@ -3065,7 +3090,7 @@ export default async function plugin(bb: BbPluginApi) {
       ? `re-checking ${names(rechecking)}, which found a Blocker or Major in round ${number - 1}${firstRead.length === 0 ? "" : `, with ${names(firstRead)} reading the plan for the first time at ${depth} depth${depthReason}`}`
       : depth === "full" ? `full depth${depthReason}` : "core lenses";
     // A plan changed after its review ended gets a new review, with its own rounds.
-    const fresh = lastEnded === undefined ? "" : ` A new review: the last one ended in round ${lastEnded.round}, on an earlier plan.`;
+    const fresh = endedBefore === undefined ? "" : ` A new review: the last one ended after round ${endedBefore.round}, on an earlier plan.`;
     await comment(task.id, `**Design review, round ${number}** of plan comment \`${planCommentId}\`: ${scope}. ${started.map((entry) => `${DESIGN_LENS_LABELS[entry.lens]} \`${entry.threadId}\``).join(", ")}.${fresh}${fellBack ? ` The design reviewer seat's provider isn't available here, so they run on the Planner's (${execution.providerId}).` : ""}`);
     bb.realtime.publish(BOARD_CHANGED, { prefix });
     return `Design review round ${number} started (${focused ? "a re-check" : depth === "full" ? "full depth" : "core lenses"}). A Builder waits until the plan passes.`;
@@ -3242,6 +3267,9 @@ export default async function plugin(bb: BbPluginApi) {
         const entry = current.plans.find((candidate) => candidate.taskKey === task.key)!;
         entry.reviewedCommentId = entry.commentId;
         for (const round of current.designRounds) if (round.taskKey === task.key && round.outcome === null) round.outcome = "accepted";
+        // This ends the review even when no round is open to mark, as after the round cap: the next plan starts a new one.
+        const rounds = current.designRounds.filter((round) => round.taskKey === task.key);
+        current.designReviews[task.key] = { startRound: (rounds.at(-1)?.round ?? 0) + 1, capNotifiedAt: null };
       });
       await stopUnfinishedReviewers(factory.designRounds.filter((round) => round.taskKey === task.key && round.outcome === null));
       await comment(task.id, `**Plan accepted without further design review** (comment \`${plan.commentId}\`), by ${threadId === null ? "the person" : "the Lead, for the person"}: ${reason.trim()}`);
