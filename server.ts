@@ -592,6 +592,14 @@ export function parsePersonQuestions(body: string): Pick<PersonQuestion, "id" | 
 }
 
 /** A Builder also waits for the person's answer to each question in the current READY plan, and for a new plan when an answer changes it. */
+/** The plan's questions the person answered differently from its assumption: the Planner owes a new plan that takes them in. */
+export function changedAnswers(plan: Pick<Factory["plans"][number], "personQuestions">): string[] {
+  return plan.personQuestions.filter((question) => question.answer?.choice === "change").map((question) => question.id);
+}
+function changedAnswersText(taskKey: string, ids: readonly string[]): string {
+  return `The person answered ${ids.join(", ")} differently from ${taskKey}'s plan, so the Planner owes a new READY plan that takes the answer in.`;
+}
+
 export function personQuestionsGate(factory: Pick<Factory, "plans" | "designReviewEnabled">, taskKey: string): void {
   const plan = factory.plans.find((entry) => entry.taskKey === taskKey);
   // Turning design review off lets plans marked ready while it was on go ahead.
@@ -603,10 +611,8 @@ export function personQuestionsGate(factory: Pick<Factory, "plans" | "designRevi
       hint: `Ask the person, then record each answer with \`bb factory plan-answer ${taskKey} keep --question <id>\` when the plan's assumption holds, or \`change --question <id> --answer "<their answer>"\`.`,
     });
   }
-  const changed = plan.personQuestions.filter((question) => question.answer?.choice === "change");
-  if (changed.length > 0) {
-    throw new PluginCliError(`The person answered ${changed.map((question) => question.id).join(", ")} differently from ${taskKey}'s plan, so the Planner owes a new READY plan that takes the answer in.`, { code: "person_answer_changes_plan" });
-  }
+  const changed = changedAnswers(plan);
+  if (changed.length > 0) throw new PluginCliError(changedAnswersText(taskKey, changed), { code: "person_answer_changes_plan" });
 }
 
 /** With design review on, a Builder waits until the current READY plan has passed or been accepted. */
@@ -625,8 +631,14 @@ export function designGate(factory: Pick<Factory, "plans" | "designRounds" | "de
       hint: `Bring the plan to the person: they can accept it as it is with \`bb factory design-accept ${taskKey} --reason "<why>"\`, or send it back to the Planner.`,
     });
   }
-  const why = state === null ? "its design review hasn't started"
-    : state === "reviewing" ? `design reviewers are still reading it (round ${round!.round})`
+  const failed = plan.roundNotStarted?.commentId === plan.commentId && plan.roundNotStarted.reason === "failed";
+  if (state === null) {
+    throw new PluginCliError(`${taskKey}'s plan hasn't passed design review: ${failed ? "its design reviewers couldn't start" : "no design review round has read it"}.`, {
+      code: "design_review_pending",
+      hint: `Have the Planner mark the same plan ready again with \`bb factory plan-ready ${taskKey} --comment ${plan.commentId}\`, which starts its round, or the person can accept it as it is with \`bb factory design-accept ${taskKey} --reason "<why>"\`.`,
+    });
+  }
+  const why = state === "reviewing" ? `design reviewers are still reading it (round ${round!.round})`
     : state === "resolving" ? "the Planner is resolving design findings"
     : state === "escalated" ? "the person hasn't answered an escalated design finding"
     : "a design finding is being fixed, so the Planner owes a new READY plan";
@@ -1082,6 +1094,11 @@ const factorySchema = z.object({
     reviewedCommentId: z.string().nullable().default(null),
     /** Questions the plan says only the person can answer, from its READY comment. */
     personQuestions: z.array(personQuestionSchema).default([]),
+    /**
+     * A READY comment whose design review round didn't start: the review is at the round cap, or its
+     * reviewers couldn't start. Cleared when a round starts. notifiedAt: when the Lead was told.
+     */
+    roundNotStarted: z.object({ commentId: z.string(), reason: z.enum(["cap", "failed"]), notifiedAt: z.string().nullable() }).nullable().default(null),
   })).default([]),
   /** Archived factories leave the Factory page tabs, take no new agents, and are not watched. */
   archivedAt: z.string().nullable().default(null),
@@ -2960,17 +2977,22 @@ export default async function plugin(bb: BbPluginApi) {
       if (document === undefined || !document.body.startsWith("Factory plan: READY") || !headings.every((heading) => document.body.includes(heading))) {
         throw new PluginCliError(`Post a complete READY planning comment from this Planner first (scope, acceptance criteria, implementation plan, dependencies, open questions${factory.designReviewEnabled ? " and success checks" : ""}).`, { code: "plan_incomplete" });
       }
+      // The current READY comment, marked again.
+      const again = plan.commentId === document.id;
       if (factory.designReviewEnabled) {
         // A round's findings can't be shaken off by reviewing the same plan again. A READY plan no round has
-        // read, and the person hasn't accepted, can be marked again: its round never started (the round cap,
-        // reviewers that couldn't start, or a version without the review), and that's how it gets one.
-        if (plan.commentId === document.id) {
-          const read = plan.reviewedCommentId === document.id || factory.designRounds.some((round) => round.taskKey === task.key && round.planCommentId === document.id);
-          if (read) throw new PluginCliError("This comment is already the READY plan, and design review has read it. Post the changed plan as a new task comment, then mark that one ready.", { code: "plan_already_ready" });
-          const changed = plan.personQuestions.filter((question) => question.answer?.choice === "change").map((question) => question.id);
-          if (changed.length > 0) {
-            throw new PluginCliError(`The person answered ${changed.join(", ")} differently from this plan's assumption. Post a new READY plan that follows their answer, then mark that one ready.`, { code: "plan_answer_changed" });
+        // read, and the person hasn't accepted, can be marked again: that's how a plan whose reviewers
+        // couldn't start gets its round, and a plan held by the round cap of an earlier version gets a new
+        // review. A review still at the cap starts no round, whatever is marked.
+        if (again) {
+          if (factory.designRounds.some((round) => round.taskKey === task.key && round.planCommentId === document.id)) {
+            throw new PluginCliError("This comment is already the READY plan, and design review has read it. Post the changed plan as a new task comment, then mark that one ready.", { code: "plan_already_ready" });
           }
+          if (plan.reviewedCommentId === document.id) {
+            throw new PluginCliError("This comment is already the READY plan, and the person accepted it as it is. Post a changed plan as a new task comment, then mark that one ready.", { code: "plan_already_ready" });
+          }
+          const changed = changedAnswers(plan);
+          if (changed.length > 0) throw new PluginCliError(`${changedAnswersText(task.key, changed)} Post it as a new task comment, then mark that one ready.`, { code: "plan_answer_changed" });
         }
         const open = latestDesignRound(factory, task.key);
         if (open !== null && open.outcome === null) {
@@ -2990,7 +3012,6 @@ export default async function plugin(bb: BbPluginApi) {
       // again rather than approved on their behalf.
       // The same comment marked again keeps its answers: it's the plan the person answered.
       const earlier = plan.personQuestions;
-      const again = plan.commentId === document.id;
       const questions = (factory.designReviewEnabled ? parsePersonQuestions(document.body) : []).map((question) => {
         const same = earlier.find((entry) => entry.id === question.id && entry.text === question.text && entry.assumed === question.assumed && (again || entry.answer?.choice === "keep"));
         return { ...question, answer: same?.answer ?? null, notifiedAt: same?.notifiedAt ?? null };
@@ -3049,6 +3070,7 @@ export default async function plugin(bb: BbPluginApi) {
         await comment(task.id, `**Design review:** no round started for plan comment \`${planCommentId}\`. This review has had ${MAX_DESIGN_ROUNDS} rounds, so the person decides: accept the plan as it is, or send it back. A Builder waits until then.`);
         await mutateFactory(prefix, (current) => { current.designReviews[taskKey] = { startRound, capNotifiedAt: new Date().toISOString() }; });
       }
+      await setRoundNotStarted(prefix, taskKey, planCommentId, "cap", told ? undefined : new Date().toISOString());
       return `No design review round started: this review has had ${MAX_DESIGN_ROUNDS} rounds, so ${told ? "the person decides, as the Lead was told when the review reached the cap" : "the Lead brings the plan to the person"}. A Builder waits until they accept it.`;
     }
     const sensitive = planSensitivePaths(body);
@@ -3081,12 +3103,20 @@ export default async function plugin(bb: BbPluginApi) {
       }
     } catch (error) {
       for (const entry of started) await bb.sdk.threads.stop({ threadId: entry.threadId }).catch(() => undefined);
-      await tellLead(factory, `[factory] Design review of ${taskKey}'s plan couldn't start: ${String(error).slice(0, 300)}. A Builder waits until the plan passes. Ask the Planner to mark it ready again, or the person can accept it as it is with \`bb factory design-accept ${taskKey} --reason "<why>"\`.`);
-      return "No design review round started: its reviewers couldn't start, and the Lead has been told. A Builder waits until the plan passes.";
+      // Once per plan: marking it ready again while the provider is still down tells the Lead nothing new.
+      const before = factory.plans.find((entry) => entry.taskKey === taskKey)?.roundNotStarted;
+      const told = before?.commentId === planCommentId && before.reason === "failed" && before.notifiedAt !== null;
+      if (!told) {
+        await tellLead(factory, `[factory] Design review of ${taskKey}'s plan couldn't start: ${String(error).slice(0, 300)}. A Builder waits until the plan passes. Ask the Planner to mark the same plan ready again once the reviewers' provider works, or the person can accept it as it is with \`bb factory design-accept ${taskKey} --reason "<why>"\`.`);
+      }
+      await setRoundNotStarted(prefix, taskKey, planCommentId, "failed", told ? undefined : new Date().toISOString());
+      return `No design review round started: its reviewers couldn't start${told ? " again; the Lead already knows" : ", and the Lead has been told"}. Mark the same plan ready again to retry. A Builder waits until the plan passes.`;
     }
     const now = new Date().toISOString();
     await mutateFactory(prefix, (current) => {
       for (const entry of started) current.agents.push({ threadId: entry.threadId, role: "designreview", taskKey, providerId: execution.providerId, createdAt: now, pr: null });
+      const plan = current.plans.find((entry) => entry.taskKey === taskKey);
+      if (plan !== undefined) plan.roundNotStarted = null;
       current.designRounds.push({
         taskKey, round: number, planCommentId, planDigest: planDigest(body), depth, focused, startedAt: now,
         lenses: started.map((entry) => ({ lens: entry.lens, threadId: entry.threadId, findingsCommentId: null, recordedAt: null, quietNotifiedAt: null, worktreeDeletedAt: null, cleanedAt: null })),
@@ -3103,6 +3133,16 @@ export default async function plugin(bb: BbPluginApi) {
     await comment(task.id, `**Design review, round ${number}** of plan comment \`${planCommentId}\`: ${scope}. ${started.map((entry) => `${DESIGN_LENS_LABELS[entry.lens]} \`${entry.threadId}\``).join(", ")}.${fresh}${fellBack ? ` The design reviewer seat's provider isn't available here, so they run on the Planner's (${execution.providerId}).` : ""}`);
     bb.realtime.publish(BOARD_CHANGED, { prefix });
     return `Design review round ${number} started (${focused ? "a re-check" : depth === "full" ? "full depth" : "core lenses"}). A Builder waits until the plan passes.`;
+  }
+
+  /** Records that a READY comment's round didn't start, keeping when the Lead was told unless `notifiedAt` says it was just now. */
+  function setRoundNotStarted(prefix: string, taskKey: string, commentId: string, reason: "cap" | "failed", notifiedAt: string | undefined): Promise<void> {
+    return mutateFactory(prefix, (current) => {
+      const plan = current.plans.find((entry) => entry.taskKey === taskKey);
+      if (plan === undefined || plan.commentId !== commentId) return;
+      const same = plan.roundNotStarted?.commentId === commentId && plan.roundNotStarted.reason === reason;
+      plan.roundNotStarted = { commentId, reason, notifiedAt: notifiedAt ?? (same ? plan.roundNotStarted!.notifiedAt : null) };
+    });
   }
 
   async function recordDesignFindings(taskKey: string, commentId: string, threadId: string | null): Promise<{ lens: DesignLens; count: number }> {
@@ -3783,7 +3823,7 @@ export default async function plugin(bb: BbPluginApi) {
       }
       if (args.role === "plan") {
         current.plans = current.plans.filter((entry) => entry.taskKey !== task.key);
-        current.plans.push({ taskKey: task.key, threadId: thread.id, commentId: null, designRequired: false, reviewedCommentId: null, personQuestions: [] });
+        current.plans.push({ taskKey: task.key, threadId: thread.id, commentId: null, designRequired: false, reviewedCommentId: null, personQuestions: [], roundNotStarted: null });
       }
       // A new QA run replaces the old results, on every open PR of the task: the gate shouldn't stay open
       // on a pass someone is re-checking. A closed PR's result stays as the record of what happened to it.
