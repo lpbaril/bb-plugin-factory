@@ -136,6 +136,8 @@ const agentSchema = z.object({
   createdAt: z.string(),
   /** The pull request a reviewer was started for. */
   pr: z.number().nullable().default(null),
+  /** QA started with holdouts on: its final message reaches the Lead through the factory, which holds back one that quotes a scenario. */
+  relayFinal: z.boolean().optional(),
 });
 export type Agent = z.infer<typeof agentSchema>;
 
@@ -691,6 +693,22 @@ export function holdoutSummary(set: HoldoutSet, writerRunning: boolean, sha: str
   const fail = count("fail");
   const invalid = count("invalid");
   return { ...base, state: "ready", sha: at, pass, fail, invalid, notRun: set.scenarios.length - pass - fail - invalid };
+}
+
+/**
+ * The scenarios a text quotes: its title (when long enough to be distinctive) or a line of its body, ignoring
+ * case and spacing. QA reports failures as symptoms, so a match means a scenario was copied, not described.
+ */
+export function holdoutQuotes(text: string, scenarios: readonly { id: string; title: string; body: string }[]): string[] {
+  const squash = (value: string) => value.toLowerCase().replace(/\s+/g, " ").trim();
+  const haystack = squash(text);
+  return scenarios.filter((scenario) => {
+    const title = squash(scenario.title);
+    if (title.length >= 12 && haystack.includes(title)) return true;
+    return scenario.body.split("\n")
+      .map((line) => squash(line.replace(/^\s*(?:\d+[.)]|[-*]|start:|steps:|expect:|assumes:)\s*/i, "")))
+      .some((line) => line.length >= 30 && haystack.includes(line));
+  }).map((scenario) => scenario.id);
 }
 
 /** A writer's thread that can't be read this long after it started is treated as gone. */
@@ -3377,9 +3395,9 @@ export default async function plugin(bb: BbPluginApi) {
           projectId: factory.bbProjectId,
           ...execution,
           permissionMode: await permissionModeFor(execution.providerId),
-          // Its final message is only a count, and the Lead doesn't need waking for it.
-          parentThreadId: factory.leadThreadId ?? undefined,
-          parentNotifications: "stuck",
+          // No parent: its final message is only a count, and as a child of the Lead its thread would be listed
+          // where any agent could find and read it. A failure still reaches the Lead through the supervisor.
+          parentNotifications: "off",
           title: `${taskKey} · Scenario writer: ${task.title}`.slice(0, 200),
           prompt: scenarioWriterPrompt({ factoryName: factory.name, task, answers }),
           pluginMetadata: { factory: prefix, role: "scenarios", taskKey },
@@ -3405,7 +3423,8 @@ export default async function plugin(bb: BbPluginApi) {
           await bb.sdk.threads.stop({ threadId: thread.id }).catch(() => undefined);
           return;
         }
-        await comment(task.id, `**Holdout scenarios:** Scenario writer \`${thread.id}\` is writing them from the original request. Only QA and the person can read them.${fellBack ? ` The Scenario writer seat's provider isn't available here, so it runs on QA's (${execution.providerId}).` : ""}`);
+        // No thread id: the comment is read by the Builder, and the writer's thread holds the scenarios.
+        await comment(task.id, `**Holdout scenarios:** a Scenario writer is writing them from the original request. Only QA and the person can read them.${fellBack ? ` The Scenario writer seat's provider isn't available here, so it runs on QA's (${execution.providerId}).` : ""}`);
         bb.realtime.publish(BOARD_CHANGED, { prefix });
       });
     } catch (error) {
@@ -4067,7 +4086,8 @@ export default async function plugin(bb: BbPluginApi) {
       // The shadow reports to nobody: its findings must not reach the Lead or the gate.
       ...(isShadow ? { parentNotifications: "off" as const } : {
         parentThreadId: factory.leadThreadId,
-        parentNotifications: pr !== null && (PR_REVIEW_ROLES as readonly string[]).includes(args.role) ? "stuck" as const : "auto" as const,
+        // QA under holdouts reports through the factory, which holds back a final message that quotes a scenario.
+        parentNotifications: (pr !== null && (PR_REVIEW_ROLES as readonly string[]).includes(args.role)) || (args.role === "qa" && factory.holdoutsEnabled) ? "stuck" as const : "auto" as const,
       }),
       title: `${task.key} · ${role.label}${pr === null ? "" : ` · PR #${pr.number}`}: ${task.title}`.slice(0, 200),
       prompt: workerPrompt({
@@ -4153,6 +4173,7 @@ export default async function plugin(bb: BbPluginApi) {
         providerId,
         createdAt: new Date().toISOString(),
         pr: pr?.number ?? null,
+        relayFinal: args.role === "qa" && factory.holdoutsEnabled,
       });
       // Persist the reviewer assignment and its pending review together. A later
       // task-comment failure must not leave a spawned reviewer outside the gate.
@@ -5143,7 +5164,8 @@ ${sections.join("\n\n---\n\n")}`;
    * page. The page can't tell their tap from an agent's call (bb reports both as the same kind of
    * caller), so this is how one they didn't make gets seen. Also logged.
    */
-  async function notifyPageAction(notice: PageNotice): Promise<void> {
+  /** `warning`: end with "if you didn't do this, an agent made the call", for actions anyone could have made. */
+  async function notifyPageAction(notice: PageNotice, warning = true): Promise<void> {
     const { title, body, threadId } = notice;
     bb.log.info(`Factory page action: ${title}. ${body}`);
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -5152,7 +5174,7 @@ ${sections.join("\n\n---\n\n")}`;
         bb.sdk.plugins.callRpc({
           pluginId: "push-notifications",
           method: "notifications.send",
-          input: { title, body: `${body} ${PAGE_ACTION_WARNING}`, ...(threadId === null ? {} : { threadId }) } as never,
+          input: { title, body: warning ? `${body} ${PAGE_ACTION_WARNING}` : body, ...(threadId === null ? {} : { threadId }) } as never,
           outputSchema: z.unknown(),
         }),
         new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`no answer in ${PAGE_NOTICE_TIMEOUT_MS / 1000}s`)), PAGE_NOTICE_TIMEOUT_MS); }),
@@ -6048,6 +6070,38 @@ ${findings}`;
     }
   });
 
+  // QA under holdouts reports through here: its final message reaches the Lead unless it quotes a scenario,
+  // and a task comment of its that quotes one is flagged to the person, since the Builder reads those.
+  bb.events.on("thread.idle", async ({ thread }) => {
+    const entry = agentsByThread.get(thread.id);
+    if (entry === undefined || entry.agent.role !== "qa" || entry.agent.relayFinal !== true || entry.agent.taskKey === null) return;
+    const taskKey = entry.agent.taskKey;
+    try {
+      const factory = await findFactory(entry.factory.prefix);
+      const scenarios = factory.holdouts.find((candidate) => candidate.taskKey === taskKey)?.scenarios ?? [];
+      const output = ((await outputOf(thread.id)) ?? "").trim();
+      const quoted = holdoutQuotes(output, scenarios);
+      const who = `QA for ${taskKey} (\`${thread.id}\`)`;
+      if (quoted.length > 0) {
+        await tellLead(factory, `[factory] ${who} finished, but its final message quoted holdout scenario ${quoted.join(", ")}, so the factory held it back. Its verdict is in \`bb factory status ${factory.prefix}\`, and its report is its task comment.`);
+        await notifyPageAction({ title: `${taskKey}: QA quoted a holdout scenario`, body: `QA's final message quoted ${quoted.join(", ")}, so the factory held it back from the Lead.`, threadId: factory.leadThreadId }, false);
+      } else {
+        await tellLead(factory, `[factory] ${who} finished:\n\n${output === "" ? "(no final message; its report is its task comment)" : output}`);
+      }
+      const task = await getTaskByKey(taskKey);
+      const { comments } = await tasksRpc("listComments", { taskId: task.id }, z.object({ comments: z.array(commentSchema) }));
+      for (const posted of comments.filter((candidate) => candidate.threadId === thread.id)) {
+        const leaked = holdoutQuotes(posted.body, scenarios);
+        const key = `holdout-leak:${posted.id}`;
+        if (leaked.length === 0 || (await bb.storage.kv.get(key)) === true) continue;
+        await bb.storage.kv.set(key, true);
+        await notifyPageAction({ title: `${taskKey}: QA quoted a holdout scenario`, body: `QA's task comment ${posted.id} quotes ${leaked.join(", ")}, which the Builder can read. Edit the comment, or change the scenarios on the Factory page.`, threadId: factory.leadThreadId }, false);
+      }
+    } catch (error) {
+      bb.log.warn(`could not relay QA ${thread.id}'s result: ${String(error)}`);
+    }
+  });
+
   // A writer whose turn failed and won't be retried has ended too, though no idle event follows.
   bb.events.on("turn.failed", async (event) => {
     const entry = agentsByThread.get(event.threadId);
@@ -6221,7 +6275,8 @@ ${findings}`;
         ...group,
         ...(verdicts.get(`${group.role}\0${group.model ?? ""}`) ?? { approvals: 0, changes: 0 }),
       })),
-      recent: factoryStorage.recentRuns(factory.prefix, taskKey, 50),
+      // The Scenario writer's thread holds the scenarios: its turns count, but its thread isn't named.
+      recent: factoryStorage.recentRuns(factory.prefix, taskKey, 50).map((run) => run.role === "scenarios" ? { ...run, threadId: "(hidden)" } : run),
     };
   }
   const roleLabel = roleName;
@@ -7310,6 +7365,10 @@ ${findings}`;
               throw new PluginCliError(`Only ${task.key}'s latest QA thread, or the person from their own terminal, can read its holdout scenarios.`, { code: "not_the_qa" });
             }
             const set = factory.holdouts.find((entry) => entry.taskKey === task.key);
+            // Outside an agent thread is how the CLI knows the person, and an agent could fake it: say so.
+            if (threadId === null && set !== undefined && set.version > 0) {
+              await notifyPageAction({ title: `${task.key}: holdout scenarios read`, body: "They were read with bb factory scenarios, from a terminal outside an agent thread.", threadId: factory.leadThreadId });
+            }
             const running = await holdoutWriterRunning(set);
             const summary = set === undefined ? null : holdoutSummary(set, running !== false);
             const results = set === undefined || summary?.sha == null ? new Map<string, HoldoutResultEntry>() : holdoutResultsAt(set, summary.sha);
@@ -7353,6 +7412,9 @@ ${findings}`;
             }
             const threadId = ctx.threadId ?? null;
             const version = await saveHoldouts(task, scenarios, threadId === null ? "person" : "writer", threadId);
+            if (threadId === null) {
+              await notifyPageAction({ title: `${task.key}: holdout scenarios changed`, body: `Saved with bb factory scenarios-set from a terminal outside an agent thread, now version ${version}.`, threadId: (await factoryForTaskKey(task.key)).leadThreadId });
+            }
             return { exitCode: 0, stdout: `Saved ${scenarios.length} holdout scenario${scenarios.length === 1 ? "" : "s"} for ${task.key} (${scenarios.map((scenario) => scenario.id).join(", ")}; version ${version}).` };
           },
         }),
@@ -7837,7 +7899,8 @@ ${findings}`;
               .filter((task) => task.status !== "canceled")
               .map((task) => toBoardTask(factory, task));
             if (input.options.json) {
-              const value = { factory: await summarize(factory), agents: factory.agents, tasks };
+              // The Scenario writer's thread holds the scenarios, so it's left out where agents look.
+              const value = { factory: await summarize(factory), agents: factory.agents.filter((agent) => agent.role !== "scenarios"), tasks };
               return { exitCode: 0, stdout: JSON.stringify(value) };
             }
             const listed = (await bb.sdk.threads.list({ projectId: factory.bbProjectId, originPluginId: "factory", includeHidden: true, limit: 500 })) as {
@@ -7851,7 +7914,7 @@ ${findings}`;
               lines.push("", `${COLUMN_LABELS[column]} (${inColumn.length})`);
               for (const task of inColumn) {
                 const agents = factory.agents
-                  .filter((agent) => agent.taskKey === task.key)
+                  .filter((agent) => agent.taskKey === task.key && agent.role !== "scenarios")
                   .map((agent) => `${ROLES[agent.role].label} ${agent.threadId}`);
                 lines.push(`  ${task.key}  ${task.title}${agents.length > 0 ? `  [${agents.join(", ")}]` : ""}`);
                 if (task.track !== null) lines.push(`      Track ${task.track}${task.closeAdvice === null ? "" : ` · the ${task.closeAdvice.role === "plan" ? "Planner" : "Explorer"} recommends closing it (comment ${task.closeAdvice.commentId}); only the person can`}`);

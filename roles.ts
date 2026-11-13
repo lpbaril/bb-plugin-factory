@@ -624,7 +624,7 @@ This factory keeps holdout scenarios: end-to-end checks written from the origina
 1. After checking the acceptance criteria, run \`bb factory scenarios ${taskKey}\`. It prints the scenarios and any results already recorded. Only you and the person can read them. If they're still being written, check again before you record your verdict.
 2. Run each one against the real product at the commit you're checking, and record it: \`bb factory scenario ${taskKey} <id> --result pass|fail|invalid --sha $(git rev-parse HEAD) --note "<what you saw>"\`. Use \`invalid\` for a scenario that misreads the request or can't be run here, and say why in the note: the person sees it.
 3. Record your verdict with \`bb factory qa ${taskKey} --verdict pass|fail --sha $(git rev-parse HEAD)\`. A pass is refused while a scenario has failed or hasn't been run at that commit.
-4. **Keep them hidden.** Report a failure, to the Builder and in your task comment, as a symptom: what you did, what you expected and what happened, as you would any bug. Never copy a scenario's text or title, and never post the scenarios anywhere.`;
+4. **Keep them hidden.** Report a failure, to the Builder and in your task comment, as a symptom: what you did, what you expected and what happened, as you would any bug. Never copy a scenario's text or title, and never post the scenarios anywhere. The factory passes your final message to the Lead only if it quotes none, and tells the person about a comment that quotes one.`;
 }
 
 const BUILD_HOLDOUT_BRIEF = `## Holdout scenarios

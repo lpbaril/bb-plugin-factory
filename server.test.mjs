@@ -10,7 +10,7 @@ registerHooks({ resolve(specifier, context, next) {
   }
   return next(specifier, context);
 } });
-const { default: plugin, computePreset, computeTokenProfile, designRoundLenses, currentDesignReview, asSentence, PAGE_NOTICE_TIMEOUT_MS, leadCompactionDue, leadCompactBackoffMs, LEAD_COMPACT_COOLDOWN_MS, parsePersonQuestions, personQuestionsGate, parseDesignFindings, planSensitivePaths, designRoundState, designGate, trackGate, parseApproaches, exploreAssignment, readRecommendation, sectionText, supervisorAction, turnsFromEvents, creditUsage, mergeBlockers, sortChecks, latestRuns, mergeOverlapNote, migrateQaResults, qaCarryNote, leadMayMerge, rosterWarnings, computeHealth, parseDay, prsOpenedBetween, qaHold, qaNextStep, parseCoverage, changeRounds, fixLoopAdvice, holdoutGate, holdoutSummary, holdoutLine, computeHoldoutHealth, holdoutHealthLine, holdoutWriterLost, HOLDOUT_WRITER_LOST_MS } = await import('./server.ts');
+const { default: plugin, computePreset, computeTokenProfile, designRoundLenses, currentDesignReview, asSentence, PAGE_NOTICE_TIMEOUT_MS, leadCompactionDue, leadCompactBackoffMs, LEAD_COMPACT_COOLDOWN_MS, parsePersonQuestions, personQuestionsGate, parseDesignFindings, planSensitivePaths, designRoundState, designGate, trackGate, parseApproaches, exploreAssignment, readRecommendation, sectionText, supervisorAction, turnsFromEvents, creditUsage, mergeBlockers, sortChecks, latestRuns, mergeOverlapNote, migrateQaResults, qaCarryNote, leadMayMerge, rosterWarnings, computeHealth, parseDay, prsOpenedBetween, qaHold, qaNextStep, parseCoverage, changeRounds, fixLoopAdvice, holdoutGate, holdoutSummary, holdoutLine, computeHoldoutHealth, holdoutHealthLine, holdoutWriterLost, HOLDOUT_WRITER_LOST_MS, holdoutQuotes } = await import('./server.ts');
 const { shareBarWidth, sharePercent } = await import('./token-profile.ts');
 const { leadCharter, leadPrompt, reReviewMessage, workerPrompt, workerReminder, designReviewPrompt, parseHoldoutScenarios, formatHoldoutScenarios, scenarioWriterPrompt, WORKER_ROLE_IDS } = await import('./roles.ts');
 const { holdoutCounts, holdoutPassRate } = await import('./holdout-text.ts');
@@ -6325,15 +6325,16 @@ test('assigning a Builder starts one Scenario writer from the request, never the
   assert.equal(spawns.length, 2);
   const writer = spawns[1];
   assert.equal(writer.pluginMetadata.role, 'scenarios');
-  assert.equal(writer.parentThreadId, 'thr_lead');
-  assert.equal(writer.parentNotifications, 'stuck');
+  assert.equal(writer.parentThreadId, undefined, 'not a child of the Lead, where any agent could find its thread');
+  assert.equal(writer.parentNotifications, 'off');
   assert.equal(writer.environment.type, 'project-default');
   assert.equal(writer.providerId, 'codex');
   assert.match(writer.prompt, /Let people keep a shopping list\./);
   assert.match(writer.prompt, /Shared lists\?\n  Answer: Shared by a household/, "the person's answers are their intent");
   assert.ok(!writer.prompt.includes('plan_comment'), 'nothing points the writer at the plan');
   assert.match(writer.prompt, /bb factory scenarios-set TEST-1 --text/);
-  assert.ok(posted.some(body => /^\*\*Holdout scenarios:\*\* Scenario writer `thr_spawned_2` is writing them/.test(body)));
+  assert.ok(posted.some(body => /^\*\*Holdout scenarios:\*\* a Scenario writer is writing them/.test(body)));
+  assert.ok(!posted.some(body => body.includes('thr_spawned_2')), 'no comment names the writer\'s thread');
   assert.match(spawns[0].prompt, /QA also checks this task against hidden scenarios/, 'the Builder knows they exist');
 });
 
@@ -6614,4 +6615,71 @@ test('the Lead\'s standing rules mention holdouts only for a factory that has th
   assert.match(provider({ threadId: 'thr_builder' }), /QA also checks hidden scenarios/);
   const off = await holdoutFixture(t, { initial: { holdoutsEnabled: false, agents: [builderAgent, leadAgent] } });
   assert.ok(!off.harness.registrations.instructionProvider({ threadId: 'thr_lead' }).includes('holdout'));
+});
+
+// ----- Hardening the leak paths -----
+
+test('a quoted scenario is found by its title or a line of its body, and a symptom is not a quote', () => {
+  const scenarios = parseHoldoutScenarios(SCENARIOS);
+  assert.deepEqual(holdoutQuotes('S2 failed. Refuses an empty item.', scenarios), ['S2'], 'the title');
+  assert.deepEqual(holdoutQuotes('the list shows milk', scenarios), [], 'a body line this short is too common to count');
+  assert.deepEqual(holdoutQuotes('Expect: an error says the item is empty', scenarios), ['S2'], 'a long enough body line counts');
+  assert.deepEqual(holdoutQuotes('Adding nothing gave no error at all.', scenarios), [], 'a symptom in QA\'s own words');
+  const long = parseHoldoutScenarios('## S1. Shows the weekly report\nStart: a client with two campaigns running last week\nSteps:\n1. Open the reports page and pick last week\nExpect: both campaigns appear with their spend and leads');
+  assert.deepEqual(holdoutQuotes('I did:   open the REPORTS page and pick last week. It crashed.', long), ['S1'], 'a body line, ignoring case and spacing');
+  assert.deepEqual(holdoutQuotes('Opening the weekly report for last week crashed with a 500.', long), [], 'a symptom in QA\'s own words');
+});
+
+test('QA under holdouts reports through the factory, which holds back a final message that quotes a scenario', async t => {
+  const outputs = new Map();
+  const fx = await holdoutFixture(t, { initial: { agents: [builderAgent, leadAgent], holdouts: [holdoutSet()] }, threads: { output: async ({ threadId }) => ({ output: outputs.get(threadId) ?? null }) } });
+  assert.equal((await fx.harness.behavior.runCli(['assign', 'TEST-1', '--role', 'qa'])).exitCode, 0);
+  const qa = fx.spawns[0];
+  assert.equal(qa.parentNotifications, 'stuck', 'the Lead hears its result from the factory');
+  const qaThread = 'thr_spawned_1';
+  assert.equal((await storedFactory(fx.bb)).agents.find(agent => agent.threadId === qaThread).relayFinal, true);
+  const lead = () => fx.messages.filter(message => message.threadId === 'thr_lead').map(message => message.input[0].text);
+  outputs.set(qaThread, 'FAIL at aaaaaaa: adding an empty item is accepted silently. Comment c1.');
+  await fx.harness.behavior.emitThreadEvent('thread.idle', { thread: makeThreadResponse({ id: qaThread }) });
+  assert.match(lead().at(-1), /^\[factory\] QA for TEST-1 \(`thr_spawned_1`\) finished:\n\nFAIL at aaaaaaa: adding an empty item/);
+  outputs.set(qaThread, 'FAIL: S2 Refuses an empty item did not pass.');
+  await fx.harness.behavior.emitThreadEvent('thread.idle', { thread: makeThreadResponse({ id: qaThread }) });
+  assert.match(lead().at(-1), /quoted holdout scenario S2, so the factory held it back/);
+  assert.ok(!lead().at(-1).includes('Refuses an empty item'));
+  assert.ok(fx.notices.some(notice => /QA quoted a holdout scenario/.test(notice.title) && !/an agent made the call/.test(notice.body)));
+  const off = await holdoutFixture(t, { initial: { holdoutsEnabled: false, agents: [builderAgent, leadAgent] } });
+  await off.harness.behavior.runCli(['assign', 'TEST-1', '--role', 'qa']);
+  assert.equal(off.spawns[0].parentNotifications, 'auto', 'holdouts off: as before');
+});
+
+test('a QA task comment that quotes a scenario is flagged to the person once', async t => {
+  const fx = await holdoutFixture(t, { initial: { agents: [builderAgent, leadAgent, { ...qaAgent, relayFinal: true }], holdouts: [holdoutSet()] }, threads: { output: async () => ({ output: 'PASS' }) } });
+  fx.comments.push({ id: 'c_leak', kind: 'agent', authorName: 'QA', threadId: 'thr_qa', body: 'Ran S2. Refuses an empty item: it did.', createdAt: '' });
+  fx.comments.push({ id: 'c_ok', kind: 'agent', authorName: 'QA', threadId: 'thr_qa', body: 'All checks pass at aaaaaaa.', createdAt: '' });
+  for (let i = 0; i < 2; i++) await fx.harness.behavior.emitThreadEvent('thread.idle', { thread: makeThreadResponse({ id: 'thr_qa' }) });
+  const flagged = fx.notices.filter(notice => /comment c_leak quotes S2/.test(notice.body));
+  assert.equal(flagged.length, 1);
+});
+
+test('reading or saving scenarios from a terminal outside an agent thread tells the person', async t => {
+  const fx = await holdoutFixture(t, { initial: { agents: [builderAgent, leadAgent, qaAgent], holdouts: [holdoutSet()] } });
+  await fx.harness.behavior.runCli(['scenarios', 'TEST-1'], { threadId: 'thr_qa' });
+  assert.equal(fx.notices.length, 0, 'QA reading them is its job');
+  await fx.harness.behavior.runCli(['scenarios', 'TEST-1']);
+  assert.match(fx.notices.at(-1).title, /TEST-1: holdout scenarios read/);
+  assert.match(fx.notices.at(-1).body, /outside an agent thread\. If you didn't do this, an agent made the call/);
+  assert.equal((await fx.harness.behavior.runCli(['scenarios-set', 'TEST-1', '--text', '## S1. New\nDo a.'])).exitCode, 0);
+  assert.match(fx.notices.at(-1).title, /TEST-1: holdout scenarios changed/);
+});
+
+test('the Scenario writer is left out of status and the run ledger, where agents look', async t => {
+  const fx = await holdoutFixture(t, { initial: { agents: [builderAgent, leadAgent, writerAgent], holdouts: [holdoutSet({ version: 0, scenarios: [] })] } });
+  const text = (await fx.harness.behavior.runCli(['status', 'TEST'])).stdout;
+  const json = (await fx.harness.behavior.runCli(['status', 'TEST', '--json'])).stdout;
+  assert.ok(!text.includes('thr_writer') && !json.includes('thr_writer'));
+  assert.ok(text.includes('thr_builder'));
+  createFactoryStorage(fx.bb.storage, value => value).appendRuns('thr_writer', [{ threadId: 'thr_writer', endSeq: 1, prefix: 'TEST', taskKey: 'TEST-1', role: 'scenarios', providerId: 'codex', model: null, reasoning: null, outcome: 'completed', error: null, startedAt: 1, endedAt: 2, tokensTotal: 10, tokensCached: 0, tokensOutput: 1 }], { lastSeq: 1, usageSeq: 1, tokensTotal: 10, tokensCached: 0, tokensOutput: 1 });
+  const runs = (await fx.harness.behavior.runCli(['runs', 'TEST', '--json'])).stdout;
+  assert.ok(runs.includes('"role":"scenarios"'), 'its turns still count');
+  assert.ok(!runs.includes('thr_writer'));
 });
