@@ -37,6 +37,8 @@ import {
   type RosterPreset,
 } from "./roster";
 export { computePreset, rosterWarnings, ROSTER_PRESETS, ROSTER_PRESET_LABELS };
+import { holdoutHealthLine, holdoutLine, type HoldoutHealth, type HoldoutSummary } from "./holdout-text";
+export { holdoutHealthLine, holdoutLine, type HoldoutHealth, type HoldoutSummary };
 import { TOKEN_OUTCOMES, TOKEN_OUTCOME_LABELS, compactTokens, computeTokenProfile, sharePercent, type TokenProfile } from "./token-profile";
 export { computeTokenProfile };
 export type { RosterWarning, PresetSeat } from "./roster";
@@ -678,20 +680,6 @@ export function holdoutResultsAt(set: Pick<HoldoutSet, "version" | "results">, s
   return latest;
 }
 
-export type HoldoutSummary = {
-  /** writing: a writer is at work and none are saved; none: no writer at work and none saved. */
-  state: "writing" | "none" | "ready";
-  version: number;
-  total: number;
-  pass: number;
-  fail: number;
-  invalid: number;
-  notRun: number;
-  /** The commit the counts are about: the one asked for, or else the latest QA ran them at. */
-  sha: string | null;
-  savedBy: HoldoutSet["savedBy"];
-};
-
 /** Counts only, never the scenarios' text: this is what the board, status and merge card show. */
 export function holdoutSummary(set: HoldoutSet, writerRunning: boolean, sha: string | null = null): HoldoutSummary {
   const base = { version: set.version, total: set.scenarios.length, pass: 0, fail: 0, invalid: 0, notRun: set.scenarios.length, savedBy: set.savedBy };
@@ -705,24 +693,12 @@ export function holdoutSummary(set: HoldoutSet, writerRunning: boolean, sha: str
   return { ...base, state: "ready", sha: at, pass, fail, invalid, notRun: set.scenarios.length - pass - fail - invalid };
 }
 
-/** Health's line for holdouts. Invalid scenarios count neither way. */
-export function holdoutHealthLine(health: HoldoutHealth): string {
-  const judged = health.passed + health.failed;
-  const rate = judged === 0 ? "none passed or failed" : `${health.passed} of ${judged} passed (${Math.round((health.passed / judged) * 100)}%)`;
-  return `Holdout scenarios on QA's first run: ${rate}, on ${health.tasks} task${health.tasks === 1 ? "" : "s"}${health.invalid === 0 ? "" : `; ${health.invalid} marked invalid`}`;
-}
-
-/** One line for status, the merge card and QA's verdict comment. */
-export function holdoutLine(summary: HoldoutSummary): string {
-  if (summary.state === "writing") return "Holdouts: being written";
-  if (summary.state === "none") return "Holdouts: none written";
-  if (summary.sha === null) return `Holdouts: ${summary.total} written, not run yet`;
-  const extra = [
-    summary.fail > 0 ? `${summary.fail} failed` : null,
-    summary.invalid > 0 ? `${summary.invalid} invalid` : null,
-    summary.notRun > 0 ? `${summary.notRun} not run` : null,
-  ].filter((part) => part !== null);
-  return `Holdouts: ${summary.pass}/${summary.total} pass at ${summary.sha.slice(0, 7)}${extra.length === 0 ? "" : ` (${extra.join(", ")})`}`;
+/** A writer's thread that can't be read this long after it started is treated as gone. */
+export const HOLDOUT_WRITER_LOST_MS = 30 * 60_000;
+export function holdoutWriterLost(set: Pick<HoldoutSet, "startedAt" | "writerEndedAt">, now: number): boolean {
+  if (set.writerEndedAt !== null) return true;
+  const started = Date.parse(set.startedAt);
+  return !Number.isFinite(started) || now - started >= HOLDOUT_WRITER_LOST_MS;
 }
 
 /**
@@ -1371,8 +1347,7 @@ const tokenProfileSchema = z.object({
   leadGrowth: z.object({ threads: z.number(), turns: z.number(), firstQuarter: z.number(), lastQuarter: z.number() }).nullable(),
 }) satisfies z.ZodType<TokenProfile>;
 export type { TokenProfile };
-const holdoutHealthSchema = z.object({ tasks: z.number(), scenarios: z.number(), passed: z.number(), failed: z.number(), invalid: z.number() });
-export type HoldoutHealth = z.infer<typeof holdoutHealthSchema>;
+const holdoutHealthSchema = z.object({ tasks: z.number(), scenarios: z.number(), passed: z.number(), failed: z.number(), invalid: z.number() }) satisfies z.ZodType<HoldoutHealth>;
 const factoryHealthSchema = z.object({
   prs: z.number(),
   open: z.number(),
@@ -2515,7 +2490,7 @@ export default async function plugin(bb: BbPluginApi) {
     const entry = agentsByThread.get(threadId);
     if (entry === undefined || entry.factory.archivedAt !== null) return null;
     const { factory, agent } = entry;
-    if (agent.role === "lead") return leadCharter({ factoryName: factory.name, prefix: factory.prefix, mergePolicy: factory.mergePolicy, evidenceContract: factory.evidenceContract, tracks: factory.tracksEnabled, designReview: factory.designReviewEnabled });
+    if (agent.role === "lead") return leadCharter({ factoryName: factory.name, prefix: factory.prefix, mergePolicy: factory.mergePolicy, evidenceContract: factory.evidenceContract, tracks: factory.tracksEnabled, designReview: factory.designReviewEnabled, holdouts: factory.holdoutsEnabled });
     if (agent.taskKey === null) return null;
     return workerReminder({ role: agent.role, factoryName: factory.name, taskKey: agent.taskKey, evidenceContract: factory.evidenceContract, tracks: factory.tracksEnabled, designReview: factory.designReviewEnabled, holdouts: factory.holdoutsEnabled });
   });
@@ -2756,8 +2731,8 @@ export default async function plugin(bb: BbPluginApi) {
         });
       }
       if (task.status === "in_progress" && !isBlocked) {
-        // A Scenario writer is the factory's own helper, like a design reviewer: it neither keeps a task alive nor owns it.
-        const taskAgents = factory.agents.filter((agent) => agent.taskKey === task.key && agent.role !== "lead" && agent.role !== "scenarios");
+        // Agents the factory starts itself (design reviewers, the Scenario writer, the shadow) neither keep a task alive nor own it.
+        const taskAgents = factory.agents.filter((agent) => agent.taskKey === task.key && agent.role !== "lead" && !ROLES[agent.role].factoryStarted);
         let anyActive = false;
         for (const agent of taskAgents) {
           const thread = await bb.sdk.threads.get({ threadId: agent.threadId }).catch(() => null);
@@ -2775,7 +2750,7 @@ export default async function plugin(bb: BbPluginApi) {
         // or a plan the READY list above already reports; neither is a worker gone quiet.
         // An Explorer isn't one either: the exploration watch covers its time box, and after its report the
         // task waits for the person's decision.
-        const hasWorker = taskAgents.some((agent) => agent.role !== "plan" && agent.role !== "explore" && agent.role !== "designreview");
+        const hasWorker = taskAgents.some((agent) => agent.role !== "plan" && agent.role !== "explore");
         if (hasWorker && !anyActive && (pr === null || pr.state !== "open")) {
           const lastRoles = [...new Set(taskAgents.map((agent) => ROLES[agent.role].label))];
           inProgressWithoutLiveWorker.push({ taskKey: task.key, title: task.title, lastRoles });
@@ -3118,7 +3093,12 @@ export default async function plugin(bb: BbPluginApi) {
     if (args.role === "explore" && args.candidate === undefined) {
       return startExploration({ taskKey: args.taskKey, instructions: args.instructions, candidates: 1 }).then((ids) => ids[0]!);
     }
-    return withTaskLock(args.taskKey, () => assignUnlocked(args));
+    return withTaskLock(args.taskKey, () => assignUnlocked(args)).then(async (threadId) => {
+      // With a Builder, so they're ready by the time QA runs; with QA, to replace a writer that failed.
+      // After the assignment's lock, so other work on the task doesn't wait for a second spawn.
+      if (args.role === "build" || args.role === "qa") await startHoldoutWriter((await factoryForTaskKey(args.taskKey)).prefix, args.taskKey.trim().toUpperCase());
+      return threadId;
+    });
   }
   /**
    * One Explorer, or several candidates each trying one approach from the Lead's numbered list. They
@@ -3355,11 +3335,14 @@ export default async function plugin(bb: BbPluginApi) {
 
   // ----- Holdout scenarios -----
 
-  /** null: the writer's thread couldn't be read. */
-  async function holdoutWriterRunning(set: HoldoutSet | undefined): Promise<boolean | null> {
+  /**
+   * null: the writer's thread couldn't be read, so QA waits a little. A writer still unreadable well
+   * after it started counts as gone (deleted, or lost), so it can't hold QA or block a replacement for good.
+   */
+  async function holdoutWriterRunning(set: HoldoutSet | undefined, now = Date.now()): Promise<boolean | null> {
     if (set === undefined || set.version > 0 || set.writerThreadId === null) return false;
     const thread = await bb.sdk.threads.get({ threadId: set.writerThreadId }).catch(() => null);
-    if (thread === null) return null;
+    if (thread === null) return holdoutWriterLost(set, now) ? false : null;
     return !(thread.deletedAt !== null || thread.status === "idle" || thread.status === "error");
   }
 
@@ -3403,7 +3386,11 @@ export default async function plugin(bb: BbPluginApi) {
           environment: { type: "project-default" },
         });
         const now = new Date().toISOString();
+        let saved = false;
         await mutateFactory(prefix, (current) => {
+          // Scenarios saved while the writer spawned (the person, on the page) make it unneeded.
+          saved = (current.holdouts.find((entry) => entry.taskKey === taskKey)?.version ?? 0) > 0;
+          if (saved) return;
           current.agents.push({ threadId: thread.id, role: "scenarios", taskKey, providerId: execution.providerId, createdAt: now, pr: null });
           const set = current.holdouts.find((entry) => entry.taskKey === taskKey);
           if (set === undefined) {
@@ -3414,6 +3401,10 @@ export default async function plugin(bb: BbPluginApi) {
             set.writerEndedAt = null;
           }
         });
+        if (saved) {
+          await bb.sdk.threads.stop({ threadId: thread.id }).catch(() => undefined);
+          return;
+        }
         await comment(task.id, `**Holdout scenarios:** Scenario writer \`${thread.id}\` is writing them from the original request. Only QA and the person can read them.${fellBack ? ` The Scenario writer seat's provider isn't available here, so it runs on QA's (${execution.providerId}).` : ""}`);
         bb.realtime.publish(BOARD_CHANGED, { prefix });
       });
@@ -4180,8 +4171,6 @@ export default async function plugin(bb: BbPluginApi) {
     }
     const where = pr === null ? "" : ` for [PR #${pr.number}](${pr.url})`;
     await comment(task.id, `Assigned to **${role.label}** (${providerId})${where} · thread \`${thread.id}\``);
-    // With a Builder, so they're ready by the time QA runs; with QA, to replace a writer that failed.
-    if (args.role === "build" || args.role === "qa") await startHoldoutWriter(factory.prefix, task.key);
     return thread.id;
   }
 
@@ -5095,18 +5084,23 @@ ${sections.join("\n\n---\n\n")}`;
     const overlaps = await findMergeOverlaps(factory, hostId, repo, pr, files.length === 0 ? undefined : files.map((file) => file.path));
     const carry = !factory.evidenceContract || pr.qa?.verdict !== "pass" ? ""
       : await currentQaCarryNote(factory, hostId, repo, pr, view.commits === undefined ? undefined : view.commits.map((commit) => commit.oid));
-    const holdouts = factory.holdouts.find((entry) => entry.taskKey === pr.taskKey);
     // Counts only: an invalid scenario's reason is QA's note, which the person reads on the Factory page.
-    const holdoutText = holdouts === undefined || pr.qa?.verdict === "skipped" ? null : (() => {
-      const summary = holdoutSummary(holdouts, holdouts.writerThreadId !== null && holdouts.writerEndedAt === null, pr.qa?.sha ?? null);
-      return `${holdoutLine(summary)}${summary.invalid > 0 ? ". QA's reasons for the invalid ones are on the task in the Factory page" : ""}`;
-    })();
+    // Shown while holdouts are on and the task has some, or a writer at work.
+    const holdouts = factory.holdoutsEnabled ? factory.holdouts.find((entry) => entry.taskKey === pr.taskKey) : undefined;
+    const holdoutState = holdouts === undefined || pr.qa?.verdict === "skipped" ? null
+      : holdoutSummary(holdouts, holdouts.writerThreadId !== null && holdouts.writerEndedAt === null, pr.qa?.sha ?? null);
+    const shownHoldouts = holdoutState === null || holdoutState.state === "none" ? null : holdoutState;
+    const holdoutText = shownHoldouts === null ? null
+      : `${holdoutLine(shownHoldouts)}${shownHoldouts.invalid > 0 ? ". QA's reasons for the invalid ones are on the task in the Factory page" : ""}`;
     const qaText = !factory.evidenceContract ? holdoutText
       : `${pr.qa == null ? "No QA result"
         : pr.qa.verdict === "skipped" ? "Skipped for this commit, with a recorded reason"
         : carry || `${pr.qa.verdict === "pass" ? "Passed" : "Failed"} at this commit`}${holdoutText === null ? "" : ` · ${holdoutText}`}`;
-    // Only a pass on this very commit, or a recorded skip, reads as fine.
-    const qaOk = factory.evidenceContract && pr.qa != null && (pr.qa.verdict === "skipped" || (pr.qa.verdict === "pass" && carry === ""));
+    // Only a pass on this very commit, or a recorded skip, reads as fine. Without the contract the row
+    // shows only holdouts, which read as fine once every scenario has run with none failing.
+    const qaOk = factory.evidenceContract
+      ? pr.qa != null && (pr.qa.verdict === "skipped" || (pr.qa.verdict === "pass" && carry === ""))
+      : shownHoldouts !== null && shownHoldouts.state === "ready" && shownHoldouts.fail === 0 && shownHoldouts.notRun === 0;
     return { payload: {
       prefix: factory.prefix,
       taskKey: pr.taskKey,
@@ -6054,6 +6048,20 @@ ${findings}`;
     }
   });
 
+  // A writer whose turn failed and won't be retried has ended too, though no idle event follows.
+  bb.events.on("turn.failed", async (event) => {
+    const entry = agentsByThread.get(event.threadId);
+    if (entry === undefined || entry.agent.role !== "scenarios" || entry.agent.taskKey === null) return;
+    const action = supervisorAction(event);
+    if (action === "leave" || (action === "retry" && (await settings.get()).superviseAgents)) return;
+    const taskKey = entry.agent.taskKey;
+    await mutateFactory(entry.factory.prefix, (current) => {
+      const set = current.holdouts.find((candidate) => candidate.taskKey === taskKey);
+      if (set !== undefined && set.writerThreadId === event.threadId && set.writerEndedAt === null) set.writerEndedAt = new Date().toISOString();
+    }).catch((error: unknown) => bb.log.warn(`could not record that Scenario writer ${event.threadId} failed: ${String(error)}`));
+    bb.realtime.publish(BOARD_CHANGED, { prefix: entry.factory.prefix });
+  });
+
   // A view that can't look the writer's thread up still shows whether it's at work.
   bb.events.on("thread.idle", async ({ thread }) => {
     const entry = agentsByThread.get(thread.id);
@@ -6112,7 +6120,8 @@ ${findings}`;
         return;
       }
       bb.log.info(`supervisor retried ${event.threadId} (${why})`);
-      if (agent.role !== "lead" && agent.role !== "shadow") {
+      // The writer reports to nobody, so the Lead has no result to wait for.
+      if (agent.role !== "lead" && agent.role !== "shadow" && agent.role !== "scenarios") {
         await tellLead(factory, `[factory] ${who} stopped: ${why}. The factory retried it once; wait for its result before reassigning the task.`);
       }
       return;

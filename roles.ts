@@ -7,9 +7,6 @@ export type RoleId = (typeof ROLE_IDS)[number];
 export type WorkerRoleId = Exclude<RoleId, "lead">;
 /** Roles the Lead or the person can assign. The shadow reviewer, design reviewers and the Scenario writer are started only by the factory. */
 export type AssignableRoleId = Exclude<WorkerRoleId, "shadow" | "designreview" | "scenarios">;
-export const WORKER_ROLE_IDS = ROLE_IDS.filter(
-  (role): role is AssignableRoleId => role !== "lead" && role !== "shadow" && role !== "designreview" && role !== "scenarios",
-);
 /** Roles that review a pull request and record a verdict on it. */
 export const PR_REVIEW_ROLES = ["review1", "review2", "security", "shadow"] as const;
 export type PrReviewRole = (typeof PR_REVIEW_ROLES)[number];
@@ -137,6 +134,8 @@ export interface RoleInfo {
   environment: "project" | "own-worktree" | "builder-worktree";
   /** The status a task moves to when this role is assigned. */
   movesTaskTo: "in_progress" | "in_review" | null;
+  /** Started only by the factory, never assigned: it neither owns a task nor keeps one alive. */
+  factoryStarted?: boolean;
 }
 
 export const ROLES: Record<RoleId, RoleInfo> = {
@@ -149,10 +148,13 @@ export const ROLES: Record<RoleId, RoleInfo> = {
   review1: { label: "Reviewer 1", environment: "builder-worktree", movesTaskTo: "in_review" },
   review2: { label: "Reviewer 2", environment: "builder-worktree", movesTaskTo: "in_review" },
   security: { label: "Security", environment: "builder-worktree", movesTaskTo: "in_review" },
-  shadow: { label: "Shadow security", environment: "builder-worktree", movesTaskTo: null },
-  designreview: { label: "Design reviewer", environment: "project", movesTaskTo: null },
-  scenarios: { label: "Scenario writer", environment: "project", movesTaskTo: null },
+  shadow: { label: "Shadow security", environment: "builder-worktree", movesTaskTo: null, factoryStarted: true },
+  designreview: { label: "Design reviewer", environment: "project", movesTaskTo: null, factoryStarted: true },
+  scenarios: { label: "Scenario writer", environment: "project", movesTaskTo: null, factoryStarted: true },
 };
+
+/** Roles the Lead or the person can assign: every worker the factory doesn't start itself. */
+export const WORKER_ROLE_IDS = ROLE_IDS.filter((role): role is AssignableRoleId => role !== "lead" && !ROLES[role].factoryStarted);
 
 const CULTURE = `## Team culture
 
@@ -346,21 +348,21 @@ ${firstStep}`;
 // compaction can't drop them; the full brief stays in the first message.
 // bb caps each contribution at 4096 characters.
 
-export function leadCharter(args: { factoryName: string; prefix: string; mergePolicy?: MergePolicy; evidenceContract?: boolean; tracks?: boolean; designReview?: boolean }): string {
+export function leadCharter(args: { factoryName: string; prefix: string; mergePolicy?: MergePolicy; evidenceContract?: boolean; tracks?: boolean; designReview?: boolean; holdouts?: boolean }): string {
   return `# Standing role: Lead of the "${args.factoryName}" software factory
 
-This restates your role in case earlier context was compacted. Your first message has the full brief; the software-factory skill has commands.
+This restates your role after compaction. Your first message has the full brief; the software-factory skill has commands.
 
 - You run a team of bb agent threads. The person talks to you; you preserve their original request in tasks on the bb Tasks board \`${args.prefix}\` and hand each task to a specialist with \`bb factory assign <KEY> --role plan|build|design|qa\`. Reviewers and Security start automatically when a PR opens.
 - You coordinate; the Planner owns PRDs, architecture and task breakdown. Assign plan for new features, ambiguity, migrations or cross-cutting changes. Small explicit fixes may skip planning. Never change acceptance criteria or waive review gates. Escalate technical disputes and repeated failed fixes to the Planner, product decisions to the person.
-- Keep repository alignment intact: \`AGENTS.md\`, \`.specify/memory/constitution.md\`, \`docs/architecture.md\` and \`docs/roadmap.md\` hold living system truth (` + `\`bb factory doctor ${args.prefix}\`, \`bb factory init-specs ${args.prefix}\`).
+- Keep \`AGENTS.md\`, \`.specify/memory/constitution.md\` and \`docs/\` aligned with merged work (\`bb factory doctor ${args.prefix}\`).
 - Do not write product code yourself; delegate it. Run at most 3 builders at once. ${NO_PAGE_CALLS}
 - Keep context lean: forward references and deltas, not logs or whole diffs; do not poll workers. Don't read source files or diffs yourself: read the task's comments, and send a specialist when code needs a look. Routine reviewer replies are suppressed; wait for the round message.
 - Open draft PRs for a builder's branch from your checkout. ${mergeRule(args.prefix, args.mergePolicy ?? "person")}
-- Keep the board true: all work in flight has a task in the column that matches reality. Use \`bb factory reconcile ${args.prefix}\` when merged PRs or stalled tasks need cleanup. Never leave a task Blocked silently.
-- Batch the fix loop: wait for the factory's "review round complete" message, then send the builder one handoff with PR/comment and reviewer-thread references; it reads and addresses every finding directly. Each push re-runs CI and re-reviews.
+- Keep the board true, with \`bb factory reconcile ${args.prefix}\` for merged PRs or stalled tasks. Never leave a task Blocked silently.
+- Batch the fix loop: after the factory's "review round complete" message, send the builder one handoff with the PR, comment and reviewer-thread references. Each push re-runs CI and re-reviews.
 - Messages that start with [factory] come from the factory itself. When it says it retried an agent, wait for that agent's result before reassigning its task. When it reports a recurring review finding, create a task for it and assign the Planner. Mark a long coordination task, or one only the person can finish, with \`bb factory task-kind <KEY> coordination|person\`, so it isn't reported as stalled.
-- After a context reset, run \`bb factory status ${args.prefix}\` and \`bb factory doctor ${args.prefix}\` to see the board, who is working on what, and each task's PR before you act.${args.evidenceContract ? `\n- Check an agent's claim against its evidence (QA's verdict, CI, a task comment, \`git diff --stat\`), not its report; ask QA or a reviewer to look deeper. A PR needs QA to pass, or \`bb factory qa-skip <KEY> --reason "<why>"\`. Follow what a round-complete message says about going to the Planner or the person.` : ""}${args.tracks ? `\n- Give each task a track before work starts: \`bb factory track <KEY> direct|plan|explore\`. direct goes to a Builder; plan needs a READY plan first; explore runs a time-boxed Explorer (\`--role explore\`, more candidates only when the person asks) that opens no PR. Bring each exploration's report to the person; they pick the next step. Only the person closes a task on an agent's advice.` : ""}${args.designReview ? `\n- A READY plan gets fresh design reviewers before any Builder; wait for the factory to say it passed. Bring each ESCALATE, and each question a plan lists for the person, to the person; record answers with \`bb factory design-decide\` or \`bb factory plan-answer\`. Set \`bb factory design-depth <KEY> full\` before the plan is READY when the work is risky.` : ""}`;
+- After a context reset, run \`bb factory status ${args.prefix}\` and \`bb factory doctor ${args.prefix}\` to see the board, who is working on what, and each task's PR before you act.${args.evidenceContract ? `\n- Check an agent's claim against its evidence (QA's verdict, CI, a task comment, \`git diff --stat\`), not its report; ask QA or a reviewer to look deeper. A PR needs QA to pass, or \`bb factory qa-skip <KEY> --reason "<why>"\`. Follow what a round-complete message says about going to the Planner or the person.` : ""}${args.tracks ? `\n- Give each task a track before work starts: \`bb factory track <KEY> direct|plan|explore\`. direct goes to a Builder; plan needs a READY plan first; explore runs a time-boxed Explorer (\`--role explore\`, more candidates only when the person asks) that opens no PR. Bring each exploration's report to the person; they pick the next step. Only the person closes a task on an agent's advice.` : ""}${args.designReview ? `\n- A READY plan gets fresh design reviewers before any Builder; wait for the factory to say it passed. Bring each ESCALATE, and each question a plan lists for the person, to the person; record answers with \`bb factory design-decide\` or \`bb factory plan-answer\`. Set \`bb factory design-depth <KEY> full\` before the plan is READY when the work is risky.` : ""}${args.holdouts ? `\n- With each Builder, the factory starts a Scenario writer whose holdout scenarios only QA and the person read. Never ask for or relay them; a QA pass waits until QA has run them.` : ""}`;
 }
 
 /**

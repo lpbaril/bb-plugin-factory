@@ -128,7 +128,8 @@ test('upgrading clears ledger rows with bad token credit, and only those', async
   const { bb, harness } = createFakePluginHost({ pluginId: 'factory' });
   t.after(() => harness.lifecycle.dispose());
   const db = bb.storage.database();
-  bb.storage.migrate(db, FACTORY_MIGRATIONS.slice(0, -1));
+  // The database as it was before the migration that clears bad ledger rows (index 3).
+  bb.storage.migrate(db, FACTORY_MIGRATIONS.slice(0, 3));
   db.prepare("INSERT INTO factory_runs VALUES ('thr', 5, 'BIG', 'BIG-1', 'build', 'codex', 'm', null, 'completed', null, 1, 2, 10, 4, 2)").run();
   db.prepare("INSERT INTO factory_run_cursors VALUES ('thr', 5, 10, 4, 2)").run();
   db.prepare("INSERT INTO factory_lessons (prefix, rule, created_at) VALUES ('BIG', 'Keep this lesson.', '')").run();
@@ -192,10 +193,29 @@ test('holdout scenarios are stored as rows of their own, never in the factory me
   const db = bb.storage.database();
   const metadata = db.prepare("SELECT payload FROM factory_metadata WHERE prefix='HO'").get().payload;
   assert.ok(!metadata.includes('hidden result') && !metadata.includes('holdouts":'), metadata);
-  assert.equal(db.prepare("SELECT count(*) AS n FROM factory_records WHERE kind='holdout' AND task_key='HO-1'").get().n, 1);
+  assert.equal(db.prepare("SELECT count(*) AS n FROM factory_holdouts WHERE prefix='HO' AND task_key='HO-1'").get().n, 1);
+  assert.equal(db.prepare("SELECT count(*) AS n FROM factory_records WHERE prefix='HO'").get().n, 0, 'no record kind an earlier version would refuse');
   assert.deepEqual(await createFactoryStorage(bb.storage, identity).read('HO'), factory);
   const without = { ...factory, prefix: 'NO' };
   delete without.holdouts;
   await store.write(without);
   assert.deepEqual(await store.read('NO'), without, 'a record without holdouts reads back without them');
+});
+
+test('a factory with holdout scenarios stays readable by a version that predates them', async t => {
+  const { bb, harness } = createFakePluginHost({ pluginId: 'factory' });
+  t.after(() => harness.lifecycle.dispose());
+  const factory = { prefix: 'RB', name: 'Rollback', bbProjectId: 'p', trackerProjectId: 't', blockedLabelId: 'b', leadThreadId: null, createdAt: '', repo: null, archivedAt: null, agents: [], prs: [], plans: [],
+    holdouts: [{ taskKey: 'RB-1', writerThreadId: null, startedAt: '', writerEndedAt: null, version: 1, scenarios: [{ id: 'S1', title: 't', body: 'b' }], savedBy: 'person', savedAt: '', results: [] }] };
+  await createFactoryStorage(bb.storage, identity).write(factory);
+  // An earlier version: its migrations are a prefix of today's, and it reads only the tables it knows.
+  const earlier = createFactoryStorage(bb.storage, identity);
+  const { holdouts, ...rest } = await earlier.read('RB');
+  assert.equal(holdouts.length, 1);
+  const db = bb.storage.database();
+  const kinds = db.prepare("SELECT DISTINCT kind FROM factory_records WHERE prefix='RB'").all().map(row => row.kind);
+  assert.ok(kinds.every(kind => ['agent', 'plan', 'pr', 'review', 'scan'].includes(kind)), kinds.join(','));
+  void rest;
+  await earlier.remove('RB');
+  assert.equal(db.prepare("SELECT count(*) AS n FROM factory_holdouts WHERE prefix='RB'").get().n, 0, 'deleting a factory deletes its scenarios');
 });

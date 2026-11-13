@@ -242,7 +242,8 @@ separately, from the original request, that the Builder never sees.
 - **The gate:** `bb factory qa --verdict pass` is refused while a scenario has failed or
   hasn't been run at that commit, and while the writer is still at work. A fail is never
   held. A task whose writer ended without saving any passes QA as before, and assigning
-  QA again starts a new writer.
+  QA again starts a new writer. A writer whose thread can't be read 30 minutes after it
+  started counts as gone, so it can't hold QA for good.
 - **Changing them:** edit them on the task on the Factory page, or save new ones with
   `bb factory scenarios-set` from your own terminal. Each save is a new version: QA's
   results on the earlier one stop counting, and if QA had already run them, the Lead is

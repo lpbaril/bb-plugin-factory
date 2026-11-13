@@ -40,6 +40,7 @@ import type { RepoInspection } from "./host-contract";
 import { DESIGN_LENS_LABELS, MERGE_POLICIES, ROLES, TRACKS, WORKER_ROLE_IDS, type AssignableRoleId, type ProjectMode, type Track } from "./roles";
 import { ROSTER_PRESETS, ROSTER_PRESET_LABELS, ROSTER_PRESET_NOTES, rosterWarnings, showExec, type RosterPreset } from "./roster";
 import { TOKEN_OUTCOME_LABELS, shareBarWidth, sharePercent } from "./token-profile";
+import { holdoutCounts, holdoutPassRate } from "./holdout-text";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import {
@@ -295,15 +296,8 @@ function holdoutLabel(holdouts: Holdouts): string {
   if (holdouts.sha === null) return `${holdouts.total} holdouts, not run`;
   return `Holdouts ${holdouts.pass}/${holdouts.total}`;
 }
-function holdoutDetail(holdouts: Holdouts): string {
-  if (holdouts.state !== "ready" || holdouts.sha === null) return holdoutLabel(holdouts);
-  const extra = [
-    holdouts.fail > 0 ? `${holdouts.fail} failed` : null,
-    holdouts.invalid > 0 ? `${holdouts.invalid} invalid` : null,
-    holdouts.notRun > 0 ? `${holdouts.notRun} not run` : null,
-  ].filter((part) => part !== null);
-  return `${holdouts.pass} of ${holdouts.total} pass at ${holdouts.sha.slice(0, 7)}${extra.length === 0 ? "" : ` · ${extra.join(", ")}`}`;
-}
+/** The same words as status and the merge card. */
+const holdoutDetail = (holdouts: Holdouts): string => holdoutCounts(holdouts);
 
 function HoldoutChip({ task }: { task: BoardTask }) {
   const holdouts = task.holdouts;
@@ -1110,7 +1104,7 @@ function HealthDialog({ open, prefix, onClose }: { open: boolean; prefix: string
           },
           ...(health.holdouts === null ? [] : [{
             label: "Holdout scenarios passed on QA's first run",
-            value: health.holdouts.passed + health.holdouts.failed === 0 ? "—" : `${Math.round((health.holdouts.passed / (health.holdouts.passed + health.holdouts.failed)) * 100)}%`,
+            value: holdoutPassRate(health.holdouts) === null ? "—" : `${holdoutPassRate(health.holdouts)}%`,
             sample: `${health.holdouts.passed + health.holdouts.failed} scenarios, ${health.holdouts.tasks} task${health.holdouts.tasks === 1 ? "" : "s"}`,
             note: `Checks the Builder never saw, so they measure the work better than its own tests.${health.holdouts.invalid === 0 ? "" : ` ${health.holdouts.invalid} marked invalid aren't counted.`} Runs that started in the window.`,
           }]),
