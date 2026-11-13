@@ -10,9 +10,9 @@ registerHooks({ resolve(specifier, context, next) {
   }
   return next(specifier, context);
 } });
-const { default: plugin, computePreset, computeTokenProfile, designRoundLenses, currentDesignReview, asSentence, PAGE_NOTICE_TIMEOUT_MS, leadCompactionDue, leadCompactBackoffMs, LEAD_COMPACT_COOLDOWN_MS, parsePersonQuestions, personQuestionsGate, parseDesignFindings, planSensitivePaths, designRoundState, designGate, trackGate, parseApproaches, exploreAssignment, readRecommendation, sectionText, supervisorAction, turnsFromEvents, creditUsage, mergeBlockers, sortChecks, latestRuns, mergeOverlapNote, migrateQaResults, qaCarryNote, leadMayMerge, rosterWarnings, computeHealth, parseDay, prsOpenedBetween, qaHold, qaNextStep, parseCoverage, changeRounds, fixLoopAdvice } = await import('./server.ts');
+const { default: plugin, computePreset, computeTokenProfile, designRoundLenses, currentDesignReview, asSentence, PAGE_NOTICE_TIMEOUT_MS, leadCompactionDue, leadCompactBackoffMs, LEAD_COMPACT_COOLDOWN_MS, parsePersonQuestions, personQuestionsGate, parseDesignFindings, planSensitivePaths, designRoundState, designGate, trackGate, parseApproaches, exploreAssignment, readRecommendation, sectionText, supervisorAction, turnsFromEvents, creditUsage, mergeBlockers, sortChecks, latestRuns, mergeOverlapNote, migrateQaResults, qaCarryNote, leadMayMerge, rosterWarnings, computeHealth, parseDay, prsOpenedBetween, qaHold, qaNextStep, parseCoverage, changeRounds, fixLoopAdvice, holdoutGate, holdoutSummary, holdoutLine, computeHoldoutHealth, holdoutHealthLine } = await import('./server.ts');
 const { shareBarWidth, sharePercent } = await import('./token-profile.ts');
-const { leadCharter, leadPrompt, reReviewMessage, workerPrompt, workerReminder, designReviewPrompt } = await import('./roles.ts');
+const { leadCharter, leadPrompt, reReviewMessage, workerPrompt, workerReminder, designReviewPrompt, parseHoldoutScenarios, formatHoldoutScenarios, scenarioWriterPrompt } = await import('./roles.ts');
 const { createFactoryStorage } = await import('./factory-storage.ts');
 
 const failure = (category, httpStatusCode = null, attemptNumber = 1) =>
@@ -5344,7 +5344,7 @@ test('bb factory agents preset previews each seat with why, and only the person 
   assert.match(agent.stderr, /Only the person can change which model an agent runs on/);
   assert.equal((await roles()).qa.reasoningLevel, 'high');
   const applied = await harness.behavior.runCli(['agents', 'preset', 'lower-cost', '--apply']);
-  assert.equal(applied.stdout, 'Applied the Lower cost preset to Lead, Explorer, QA, Design reviewer.', 'the ticked seats, no reviewer seat');
+  assert.equal(applied.stdout, 'Applied the Lower cost preset to Lead, Explorer, QA, Design reviewer, Scenario writer.', 'the ticked seats, no reviewer seat');
   const after = await roles();
   assert.equal(after.qa.reasoningLevel, 'low');
   assert.deepEqual(after.review1, liveRoster().review1, 'a reviewer seat isn\'t applied unless named');
@@ -5850,7 +5850,7 @@ test('roster changes and a factory deleted from the page tell the person', async
   const preview = await fx2.harness.behavior.callRpc('agents_preset_preview', { preset: 'lower-cost' });
   const seats = preview.seats.filter(entry => entry.ticked).map(entry => ({ key: entry.key, proposed: entry.proposed }));
   await fx2.harness.behavior.callRpc('agents_preset_apply', { preset: 'lower-cost', seats });
-  assert.match(notices.at(-1).body, /^The Lower cost preset was applied on the settings page to Lead, Explorer, QA, Design reviewer\./);
+  assert.match(notices.at(-1).body, /^The Lower cost preset was applied on the settings page to Lead, Explorer, QA, Design reviewer, Scenario writer\./);
   const before = notices.length;
   await fx2.harness.behavior.callRpc('factory_delete', { prefix: 'TEST', deleteTasks: false, archiveThreads: false });
   assert.equal(notices.length, before + 1);
@@ -6220,4 +6220,294 @@ test('a plan the person accepted can\'t be marked again', async t => {
   assert.match(refused.stderr, /already the READY plan, and the person accepted it as it is/);
   assert.ok(!refused.stderr.includes('design review has read it'), 'no round read it');
   assert.equal(fx.spawns.length, 0);
+});
+
+// ----- Holdout scenarios -----
+
+const SCENARIOS = '## S1. Saves an item\nStart: an empty list\nSteps:\n1. Add "milk"\nExpect: the list shows milk\n\n## S2. Refuses an empty item\nStart: an empty list\nSteps:\n1. Add nothing\nExpect: an error says the item is empty\n';
+const HIDDEN = 'the list shows milk';
+const holdoutSet = (over = {}) => ({
+  taskKey: 'TEST-1', writerThreadId: 'thr_writer', startedAt: '', writerEndedAt: null, version: 1,
+  scenarios: parseHoldoutScenarios(SCENARIOS), savedBy: 'writer', savedAt: '', results: [], ...over,
+});
+const holdoutResult = (scenarioId, result, sha = SHA_A, over = {}) => ({ scenarioId, version: 1, result, sha, note: null, threadId: 'thr_qa', at: '2026-11-11T10:00:00Z', ...over });
+
+test('scenarios are numbered in order, and text outside a scenario is refused rather than dropped', () => {
+  const parsed = parseHoldoutScenarios('# Holdouts for TEST-1\n\n## S4. First\nDo a.\n## S9: Second\nDo b.\n');
+  assert.deepEqual(parsed.map(entry => [entry.id, entry.title, entry.body]), [['S1', 'First', 'Do a.'], ['S2', 'Second', 'Do b.']]);
+  assert.deepEqual(parseHoldoutScenarios(formatHoldoutScenarios(parsed)), parsed, 'the edit form reads back unchanged');
+  assert.throws(() => parseHoldoutScenarios('Some notes\n## S1. First\nDo a.'), /Text before the first scenario/);
+  assert.throws(() => parseHoldoutScenarios('Just prose.'), /Text before the first scenario/);
+  assert.throws(() => parseHoldoutScenarios(''), /No scenarios found/);
+  assert.throws(() => parseHoldoutScenarios('## S1. Empty\n\n## S2. Full\nDo b.'), /S1 \("Empty"\) has no steps/);
+  assert.throws(() => parseHoldoutScenarios(Array.from({ length: 11 }, (_, i) => `## S${i + 1}. T\nx`).join('\n')), /11 scenarios is more than 10/);
+  assert.throws(() => parseHoldoutScenarios(`## S1. Long\n${'x'.repeat(2001)}`), /S1 is longer than 2000/);
+  assert.throws(() => parseHoldoutScenarios(`## S1. ${'t'.repeat(201)}\nx`), /title is longer than 200/);
+});
+
+test('the holdout gate waits for the writer, refuses failed or missing scenarios at the commit, and counts only the current version', () => {
+  assert.equal(holdoutGate(undefined, 'TEST-1', SHA_A, false), null, 'no holdouts, as before');
+  const unsaved = holdoutSet({ version: 0, scenarios: [] });
+  assert.match(holdoutGate(unsaved, 'TEST-1', SHA_A, true), /still being written/);
+  assert.match(holdoutGate(unsaved, 'TEST-1', SHA_A, null), /Couldn't tell whether TEST-1's Scenario writer has finished/);
+  assert.equal(holdoutGate(unsaved, 'TEST-1', SHA_A, false), null, 'a writer that finished without saving leaves QA as before');
+  assert.match(holdoutGate(holdoutSet(), 'TEST-1', SHA_A, false), /Run holdout scenarios S1, S2 at aaaaaaa/);
+  const failed = holdoutSet({ results: [holdoutResult('S1', 'pass'), holdoutResult('S2', 'fail')] });
+  assert.match(holdoutGate(failed, 'TEST-1', SHA_A, false), /Holdout scenario S2 failed at aaaaaaa, so QA can't pass TEST-1/);
+  const fixed = holdoutSet({ results: [...failed.results, holdoutResult('S2', 'pass')] });
+  assert.equal(holdoutGate(fixed, 'TEST-1', SHA_A, false), null, 'the latest result counts');
+  assert.match(holdoutGate(fixed, 'TEST-1', 'bbbbbbb2222', false), /Run holdout scenarios S1, S2 at bbbbbbb/, 'results at another commit do not count');
+  assert.equal(holdoutGate(fixed, 'TEST-1', `${SHA_A}ffff`, false), null, 'a longer hash of the same commit matches');
+  const invalid = holdoutSet({ results: [holdoutResult('S1', 'pass'), holdoutResult('S2', 'invalid', SHA_A, { note: 'Asks for a feature not requested' })] });
+  assert.equal(holdoutGate(invalid, 'TEST-1', SHA_A, false), null, 'invalid, with a reason, does not hold the pass');
+  const edited = holdoutSet({ version: 2, results: fixed.results });
+  assert.match(holdoutGate(edited, 'TEST-1', SHA_A, false), /Run holdout scenarios S1, S2/, 'results on an earlier version do not count');
+});
+
+test('the holdout summary and its line give counts only', () => {
+  const set = holdoutSet({ results: [holdoutResult('S1', 'pass'), holdoutResult('S2', 'invalid')] });
+  const summary = holdoutSummary(set, false);
+  assert.deepEqual({ ...summary }, { state: 'ready', version: 1, total: 2, pass: 1, fail: 0, invalid: 1, notRun: 0, sha: SHA_A, savedBy: 'writer' });
+  assert.equal(holdoutLine(summary), 'Holdouts: 1/2 pass at aaaaaaa (1 invalid)');
+  assert.equal(holdoutLine(holdoutSummary(holdoutSet(), false)), 'Holdouts: 2 written, not run yet');
+  assert.equal(holdoutLine(holdoutSummary(holdoutSet({ version: 0, scenarios: [] }), true)), 'Holdouts: being written');
+  assert.equal(holdoutLine(holdoutSummary(holdoutSet({ version: 0, scenarios: [] }), false)), 'Holdouts: none written');
+  assert.equal(holdoutLine(holdoutSummary(set, false, 'bbbbbbb2222')), 'Holdouts: 0/2 pass at bbbbbbb (2 not run)');
+  assert.ok(!JSON.stringify(summary).includes(HIDDEN));
+});
+
+test('holdout health counts only QA\'s first run of each task, in the window', () => {
+  const first = holdoutSet({ results: [holdoutResult('S1', 'pass'), holdoutResult('S2', 'fail'), holdoutResult('S2', 'pass', 'bbbbbbb2222', { at: '2026-11-11T12:00:00Z' })] });
+  const other = holdoutSet({ taskKey: 'TEST-2', results: [holdoutResult('S1', 'invalid', SHA_A, { at: '2026-11-12T10:00:00Z' }), holdoutResult('S2', 'pass', SHA_A, { at: '2026-11-12T10:00:00Z' })] });
+  const none = holdoutSet({ taskKey: 'TEST-3' });
+  assert.deepEqual(computeHoldoutHealth([first, other, none], null, null), { tasks: 2, scenarios: 4, passed: 2, failed: 1, invalid: 1 });
+  assert.deepEqual(computeHoldoutHealth([first, other], Date.parse('2026-11-12T00:00:00Z'), null), { tasks: 1, scenarios: 2, passed: 1, failed: 0, invalid: 1 });
+  assert.equal(computeHoldoutHealth([first, other], null, Date.parse('2026-11-01T00:00:00Z')), null);
+  assert.equal(holdoutHealthLine({ tasks: 2, scenarios: 4, passed: 2, failed: 1, invalid: 1 }), "Holdout scenarios on QA's first run: 2 of 3 passed (67%), on 2 tasks; 1 marked invalid");
+});
+
+const holdoutFixture = async (t, { initial = {}, running = new Set(), status = 'in_review' } = {}) => {
+  const posted = [];
+  const updates = [];
+  const notices = [];
+  const task = { id: 'task_1', key: 'TEST-1', projectId: 'tracker', title: 'Shopping list', description: 'Let people keep a shopping list.', status, priority: 'none', position: 0, labelIds: [], createdAt: '', updatedAt: '' };
+  const result = await fixture(t, false, {
+    repo: 'owner/repo', evidenceContract: true, qaResults: {}, holdoutsEnabled: true,
+    agents: [builderAgent, leadAgent],
+    ...initial,
+  }, {
+    threads: {
+      list: threadList,
+      get: async ({ threadId }) => makeThreadResponse({ id: threadId, environmentId: 'env_builder', status: running.has(threadId) ? 'active' : 'idle' }),
+    },
+    hostRpc: async ({ input }) => ({ code: 0, stderr: '', stdout: input.args?.[1] === 'list' ? ghList([{ headRefOid: SHA_A }]) : '' }),
+    tasksRpc: async ({ method, input }) => {
+      if (method === 'getTaskByKey') return { task };
+      if (method === 'listTasks') return { tasks: [task] };
+      if (method === 'createComment') posted.push(input.body);
+      if (method === 'updateTask') { updates.push(input); return { task: { ...task, ...input } }; }
+      if (method === 'notifications.send') { notices.push(input); return { ok: true }; }
+      return undefined;
+    },
+  });
+  return { ...result, posted, updates, notices, task };
+};
+const holdoutPlan = {
+  taskKey: 'TEST-1', threadId: 'thr_planner', commentId: 'plan_comment', designRequired: false, reviewedCommentId: null,
+  personQuestions: [{ id: 'Q1', text: 'Shared lists?', assumed: 'One list per person', answer: { choice: 'change', text: 'Shared by a household', by: 'person', at: '' }, notifiedAt: null }],
+};
+
+test('assigning a Builder starts one Scenario writer from the request, never the plan, that does not wake the Lead', async t => {
+  const { harness, spawns, posted } = await holdoutFixture(t, { initial: { plans: [holdoutPlan] }, status: 'in_progress' });
+  assert.equal((await harness.behavior.runCli(['assign', 'TEST-1', '--role', 'build'])).exitCode, 0);
+  assert.equal(spawns.length, 2);
+  const writer = spawns[1];
+  assert.equal(writer.pluginMetadata.role, 'scenarios');
+  assert.equal(writer.parentThreadId, 'thr_lead');
+  assert.equal(writer.parentNotifications, 'stuck');
+  assert.equal(writer.environment.type, 'project-default');
+  assert.equal(writer.providerId, 'codex');
+  assert.match(writer.prompt, /Let people keep a shopping list\./);
+  assert.match(writer.prompt, /Shared lists\?\n  Answer: Shared by a household/, "the person's answers are their intent");
+  assert.ok(!writer.prompt.includes('plan_comment'), 'nothing points the writer at the plan');
+  assert.match(writer.prompt, /bb factory scenarios-set TEST-1 --text/);
+  assert.ok(posted.some(body => /^\*\*Holdout scenarios:\*\* Scenario writer `thr_spawned_2` is writing them/.test(body)));
+  assert.match(spawns[0].prompt, /QA also checks this task against hidden scenarios/, 'the Builder knows they exist');
+});
+
+test('a writer at work or scenarios already saved start no second writer, and holdouts off starts none', async t => {
+  const busy = await holdoutFixture(t, { initial: { holdouts: [holdoutSet({ version: 0, scenarios: [] })] }, running: new Set(['thr_writer']) });
+  assert.equal((await busy.harness.behavior.runCli(['assign', 'TEST-1', '--role', 'qa'])).exitCode, 0);
+  assert.deepEqual(busy.spawns.map(spawn => spawn.pluginMetadata.role), ['qa']);
+  const saved = await holdoutFixture(t, { initial: { holdouts: [holdoutSet()] } });
+  assert.equal((await saved.harness.behavior.runCli(['assign', 'TEST-1', '--role', 'qa'])).exitCode, 0);
+  assert.deepEqual(saved.spawns.map(spawn => spawn.pluginMetadata.role), ['qa']);
+  const failedWriter = await holdoutFixture(t, { initial: { holdouts: [holdoutSet({ version: 0, scenarios: [] })] } });
+  assert.equal((await failedWriter.harness.behavior.runCli(['assign', 'TEST-1', '--role', 'qa'])).exitCode, 0);
+  assert.deepEqual(failedWriter.spawns.map(spawn => spawn.pluginMetadata.role), ['qa', 'scenarios'], 'QA replaces a writer that ended without saving');
+  const off = await holdoutFixture(t, { initial: { holdoutsEnabled: false }, status: 'in_progress' });
+  assert.equal((await off.harness.behavior.runCli(['assign', 'TEST-1', '--role', 'build'])).exitCode, 0);
+  assert.deepEqual(off.spawns.map(spawn => spawn.pluginMetadata.role), ['build']);
+  assert.ok(!off.spawns[0].prompt.includes('hidden scenarios'));
+});
+
+test('only the writer saves its scenarios, once; after that only the person changes them', async t => {
+  const writer = { threadId: 'thr_writer', role: 'scenarios', taskKey: 'TEST-1', providerId: 'codex', createdAt: '', pr: null };
+  const { bb, harness, posted } = await holdoutFixture(t, { initial: { agents: [builderAgent, leadAgent, writer], holdouts: [holdoutSet({ version: 0, scenarios: [] })] } });
+  const save = (threadId, text = SCENARIOS) => harness.behavior.runCli(['scenarios-set', 'TEST-1', '--text', text], threadId === null ? {} : { threadId });
+  for (const threadId of ['thr_builder', 'thr_lead']) {
+    const denied = await save(threadId);
+    assert.notEqual(denied.exitCode, 0);
+    assert.match(denied.stderr, /Only TEST-1's Scenario writer, or the person/);
+  }
+  assert.match((await save('thr_writer', 'notes only')).stderr, /Text before the first scenario/);
+  const saved = await save('thr_writer');
+  assert.equal(saved.exitCode, 0, saved.stderr);
+  assert.match(saved.stdout, /Saved 2 holdout scenarios for TEST-1 \(S1, S2; version 1\)/);
+  assert.match((await save('thr_writer')).stderr, /already saved\. Only the person can change them now/);
+  assert.ok(posted.some(body => /^\*\*Holdout scenarios:\*\* 2 scenarios saved by the Scenario writer/.test(body)));
+  assert.ok(!posted.some(body => body.includes(HIDDEN)), 'no comment carries a scenario');
+  const person = await save(null, '## S1. Only one\nDo a.');
+  assert.equal(person.exitCode, 0, person.stderr);
+  const set = (await storedFactory(bb)).holdouts[0];
+  assert.equal(set.version, 2);
+  assert.equal(set.savedBy, 'person');
+  assert.deepEqual(set.scenarios.map(entry => entry.title), ['Only one']);
+});
+
+test('only the latest QA thread and the person read the scenarios', async t => {
+  const oldQa = { ...qaAgent, threadId: 'thr_old_qa' };
+  const writer = { threadId: 'thr_writer', role: 'scenarios', taskKey: 'TEST-1', providerId: 'codex', createdAt: '', pr: null };
+  const { harness } = await holdoutFixture(t, { initial: { agents: [builderAgent, leadAgent, writer, oldQa, qaAgent], holdouts: [holdoutSet({ results: [holdoutResult('S1', 'fail', SHA_A, { note: 'Nothing appeared' })] })] } });
+  const read = (threadId) => harness.behavior.runCli(['scenarios', 'TEST-1'], threadId === null ? {} : { threadId });
+  for (const threadId of ['thr_builder', 'thr_lead', 'thr_writer', 'thr_old_qa']) {
+    const denied = await read(threadId);
+    assert.notEqual(denied.exitCode, 0, threadId);
+    assert.match(denied.stderr, /Only TEST-1's latest QA thread, or the person/);
+    assert.ok(!denied.stdout.includes(HIDDEN) && !denied.stderr.includes(HIDDEN));
+  }
+  for (const threadId of ['thr_qa', null]) {
+    const shown = await read(threadId);
+    assert.equal(shown.exitCode, 0, shown.stderr);
+    assert.ok(shown.stdout.includes(HIDDEN));
+    assert.match(shown.stdout, /Holdouts: 0\/2 pass at aaaaaaa \(1 failed, 1 not run\)/);
+    assert.match(shown.stdout, /QA result at aaaaaaa: fail · Nothing appeared/);
+  }
+});
+
+test('nothing an agent can list shows the scenarios: list, status, the board and Health give counts only', async t => {
+  const { harness } = await holdoutFixture(t, { initial: { agents: [builderAgent, leadAgent, qaAgent], holdouts: [holdoutSet({ results: [holdoutResult('S1', 'pass')] })] } });
+  for (const args of [['list', '--json'], ['status', 'TEST', '--json'], ['status', 'TEST'], ['health', 'TEST'], ['doctor', 'TEST', '--json']]) {
+    const out = await harness.behavior.runCli(args, { threadId: 'thr_builder' });
+    assert.ok(!out.stdout.includes(HIDDEN) && !out.stdout.includes('Saves an item'), args.join(' '));
+  }
+  assert.match((await harness.behavior.runCli(['status', 'TEST'])).stdout, /Holdouts: 1\/2 pass at aaaaaaa \(1 not run\)/);
+  const board = await harness.behavior.callRpc('factory_board', { prefix: 'TEST' });
+  assert.ok(!JSON.stringify(board).includes(HIDDEN));
+  assert.equal(board.tasks.find(task => task.key === 'TEST-1').holdouts.pass, 1);
+  assert.ok(!JSON.stringify(await harness.behavior.callRpc('factories_list', null)).includes(HIDDEN));
+  assert.match((await harness.behavior.runCli(['health', 'TEST'])).stdout, /Holdout scenarios on QA's first run: 1 of 1 passed \(100%\), on 1 task/);
+});
+
+test('QA records each scenario, and a pass waits until all have run at that commit without a failure', async t => {
+  const { bb, harness, posted } = await holdoutFixture(t, { initial: { agents: [builderAgent, leadAgent, qaAgent], prs: [prRecord({ headSha: SHA_A })], holdouts: [holdoutSet()] } });
+  const record = (id, result, extra = [], threadId = 'thr_qa') => harness.behavior.runCli(['scenario', 'TEST-1', id, '--result', result, '--sha', SHA_A, ...extra], { threadId });
+  const pass = () => harness.behavior.runCli(['qa', 'TEST-1', '--verdict', 'pass', '--sha', SHA_A], { threadId: 'thr_qa' });
+  assert.match((await record('S1', 'pass', [], 'thr_builder')).stderr, /Only the latest QA thread/);
+  assert.match((await record('S9', 'pass')).stderr, /no holdout scenario S9\. Its scenarios are S1, S2/);
+  assert.match((await record('S1', 'invalid')).stderr, /Say why the scenario is invalid with --note/);
+  assert.match((await record('S1', 'pass', ['--note', 'x'.repeat(501)])).stderr, /longer than 500/);
+  assert.match((await harness.behavior.runCli(['scenario', 'TEST-1', 'S1', '--result', 'pass', '--sha', 'not-a-sha'], { threadId: 'thr_qa' })).stderr, /--sha must be a commit hash/);
+  assert.equal((await record('s1', 'pass')).exitCode, 0, 'ids are case-insensitive');
+  const missing = await pass();
+  assert.notEqual(missing.exitCode, 0);
+  assert.match(missing.stderr, /Run holdout scenario S2 at aaaaaaa/);
+  assert.equal((await record('S2', 'fail', ['--note', 'No error shown'])).exitCode, 0);
+  assert.match((await pass()).stderr, /Holdout scenario S2 failed at aaaaaaa/);
+  assert.equal((await harness.behavior.runCli(['qa', 'TEST-1', '--verdict', 'fail', '--sha', SHA_A], { threadId: 'thr_qa' })).exitCode, 0, 'a fail is never held');
+  assert.equal((await record('S2', 'pass')).exitCode, 0);
+  const passed = await pass();
+  assert.equal(passed.exitCode, 0, passed.stderr);
+  assert.equal((await readPrs(bb))[0].qa.verdict, 'pass');
+  assert.ok(posted.some(body => body === '**QA:** PASS at `aaaaaaa` · Holdouts: 2/2 pass at aaaaaaa'), posted.join('\n'));
+  assert.equal((await storedFactory(bb)).holdouts[0].results.length, 3, 'every result is kept, refusals record nothing');
+});
+
+test('a QA pass waits for a writer still at work, and holdouts off never holds it', async t => {
+  const waiting = await holdoutFixture(t, { initial: { agents: [builderAgent, leadAgent, qaAgent], prs: [prRecord({ headSha: SHA_A })], holdouts: [holdoutSet({ version: 0, scenarios: [] })] }, running: new Set(['thr_writer']) });
+  const pass = (harness) => harness.behavior.runCli(['qa', 'TEST-1', '--verdict', 'pass', '--sha', SHA_A], { threadId: 'thr_qa' });
+  assert.match((await pass(waiting.harness)).stderr, /still being written/);
+  assert.match((await waiting.harness.behavior.runCli(['scenarios', 'TEST-1'], { threadId: 'thr_qa' })).stdout, /still writing them/);
+  const off = await holdoutFixture(t, { initial: { holdoutsEnabled: false, agents: [builderAgent, leadAgent, qaAgent], prs: [prRecord({ headSha: SHA_A })], holdouts: [holdoutSet()] } });
+  assert.equal((await pass(off.harness)).exitCode, 0);
+});
+
+test('the person turns holdouts on and off from their own terminal; the page can only turn them on', async t => {
+  const { bb, harness } = await holdoutFixture(t, { initial: { holdoutsEnabled: false } });
+  assert.match((await harness.behavior.runCli(['holdouts', 'TEST', 'on'], { threadId: 'thr_lead' })).stderr, /Only the person can change this/);
+  assert.match((await harness.behavior.runCli(['holdouts', 'TEST'])).stdout, /holdout scenarios off/);
+  assert.equal((await harness.behavior.runCli(['holdouts', 'TEST', 'on'])).exitCode, 0);
+  assert.equal((await storedFactory(bb)).holdoutsEnabled, true);
+  await assert.rejects(harness.behavior.callRpc('factory_set_option', { prefix: 'TEST', change: { kind: 'holdouts', enabled: false } }), /bb factory holdouts TEST off/);
+  assert.equal((await harness.behavior.runCli(['holdouts', 'TEST', 'off'])).exitCode, 0);
+  await harness.behavior.callRpc('factory_set_option', { prefix: 'TEST', change: { kind: 'holdouts', enabled: true } });
+  assert.equal((await storedFactory(bb)).holdoutsEnabled, true);
+});
+
+test('the page reads and edits the scenarios; an edit after QA ran them tells the Lead and notifies the person', async t => {
+  const { bb, harness, messages, notices } = await holdoutFixture(t, { initial: { agents: [builderAgent, leadAgent, qaAgent], holdouts: [holdoutSet({ results: [holdoutResult('S1', 'pass')] })] } });
+  const view = await harness.behavior.callRpc('task_scenarios_get', { taskKey: 'TEST-1' });
+  assert.deepEqual(parseHoldoutScenarios(view.text), parseHoldoutScenarios(SCENARIOS));
+  assert.deepEqual(notices, [], 'reading notifies nobody');
+  assert.deepEqual(view.scenarios.map(entry => [entry.id, entry.latest?.result ?? null]), [['S1', 'pass'], ['S2', null]]);
+  await assert.rejects(harness.behavior.callRpc('task_scenarios_save', { taskKey: 'TEST-1', text: 'prose' }), /Text before the first scenario/);
+  const saved = await harness.behavior.callRpc('task_scenarios_save', { taskKey: 'TEST-1', text: '## S1. New\nDo a.' });
+  assert.equal(saved.version, 2);
+  assert.equal((await storedFactory(bb)).holdouts[0].savedBy, 'page');
+  const told = messages.filter(message => message.threadId === 'thr_lead' && /holdout scenarios were changed from the Factory page after QA ran them/.test(message.input[0].text));
+  assert.equal(told.length, 1);
+  assert.ok(!told[0].input[0].text.includes('Do a.'));
+  assert.equal(notices.length, 1);
+  assert.match(notices[0].title, /TEST-1: holdout scenarios changed/);
+  assert.match(notices[0].body, /If you didn't do this, an agent made the call/);
+  assert.equal(notices[0].threadId, 'thr_lead');
+});
+
+test('a Scenario writer that fails is reported to the Lead without blocking the task', async t => {
+  const writer = { threadId: 'thr_writer', role: 'scenarios', taskKey: 'TEST-1', providerId: 'codex', createdAt: '', pr: null };
+  const { harness, updates, messages } = await holdoutFixture(t, { initial: { agents: [builderAgent, leadAgent, writer], holdouts: [holdoutSet({ version: 0, scenarios: [] })] } });
+  await harness.behavior.emitThreadEvent('turn.failed', { ...failure('unauthorized'), threadId: 'thr_writer' });
+  assert.deepEqual(updates, [], 'the task is not blocked');
+  assert.ok(messages.some(message => /Scenario writer for TEST-1 .* failed: unauthorized\. Without holdout scenarios, QA can still pass TEST-1/.test(message.input[0].text)));
+});
+
+test('the Scenario writer\'s end is recorded, so the board stops saying it is at work', async t => {
+  const writer = { threadId: 'thr_writer', role: 'scenarios', taskKey: 'TEST-1', providerId: 'codex', createdAt: '', pr: null };
+  const { bb, harness } = await holdoutFixture(t, { initial: { agents: [builderAgent, leadAgent, writer], holdouts: [holdoutSet({ version: 0, scenarios: [] })] } });
+  assert.equal((await harness.behavior.callRpc('factory_board', { prefix: 'TEST' })).tasks[0].holdouts.state, 'writing');
+  await harness.behavior.emitThreadEvent('thread.idle', { thread: makeThreadResponse({ id: 'thr_writer' }), lastAssistantText: 'Saved 0.' });
+  assert.notEqual((await storedFactory(bb)).holdouts[0].writerEndedAt, null);
+  assert.equal((await harness.behavior.callRpc('factory_board', { prefix: 'TEST' })).tasks[0].holdouts.state, 'none');
+});
+
+test('holdout prompts: QA runs them and keeps them hidden, the writer never re-reads the task, and the Lead charter still fits', () => {
+  const task = { key: 'TEST-1', title: 'T', description: 'D' };
+  const qa = workerPrompt({ role: 'qa', factoryName: 'F', prefix: 'TEST', task, instructions: null, builderThreadId: null, holdouts: true });
+  assert.match(qa, /bb factory scenarios TEST-1/);
+  assert.match(qa, /bb factory scenario TEST-1 <id> --result pass\|fail\|invalid/);
+  assert.match(qa, /Never copy a scenario's text or title/);
+  assert.ok(!workerPrompt({ role: 'qa', factoryName: 'F', prefix: 'TEST', task, instructions: null, builderThreadId: null }).includes('Holdout'));
+  const reminder = workerReminder({ role: 'scenarios', factoryName: 'F', taskKey: 'TEST-1', holdouts: true });
+  assert.ok(!reminder.includes('bb tasks show TEST-1`'), 'the comments hold the plan');
+  assert.match(reminder, /never block the task/);
+  assert.match(workerReminder({ role: 'qa', factoryName: 'F', taskKey: 'TEST-1', holdouts: true }), /bb factory scenarios <KEY>/);
+  assert.match(leadPrompt({ factoryName: 'F', prefix: 'TEST', goal: null, holdouts: true }), /never see the scenarios/);
+  assert.ok(!leadPrompt({ factoryName: 'F', prefix: 'TEST', goal: null }).includes('Scenario writer'));
+  const writer = scenarioWriterPrompt({ factoryName: 'F', task, answers: [] });
+  assert.match(writer, /Never post a scenario as a task or PR comment/);
+  assert.ok(!writer.includes("The person's answers"));
+  for (const role of ['qa', 'build', 'scenarios', 'plan']) {
+    const all = workerReminder({ role, factoryName: 'BusinessOS', taskKey: 'BOS-123', evidenceContract: true, tracks: true, designReview: true, holdouts: true });
+    assert.ok(all.length < 4096, `${role}: ${all.length}`);
+  }
 });

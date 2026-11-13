@@ -26,8 +26,8 @@ a project and a task prefix, and start the Lead.
 Settings → Plugins → Factory, or `bb plugin config factory`:
 
 - **Agents**: one line per agent (Lead, Planner, Explorer, Builder, QA, Designer,
-  Reviewer 1, Reviewer 2, Security, Design reviewer, Shadow security, and the
-  reviewer-trial comparison),
+  Reviewer 1, Reviewer 2, Security, Design reviewer, Scenario writer, Shadow security,
+  and the reviewer-trial comparison),
   each with bb's provider, model and reasoning picker. Until you pick, an agent
   uses the provider's catalog defaults, exactly as shown (never the level a
   project used last); **Use defaults** goes back to them. The shadow
@@ -45,7 +45,7 @@ Settings → Plugins → Factory, or `bb plugin config factory`:
     to a provider other than the Builder's, design reviewers to one other than
     the Planner's, and any seat off a provider that isn't available.
   - **Lower cost** is Balanced with the lowest reasoning level on the seats that read
-    more than they write: Lead, QA, Explorer and Design reviewer.
+    more than they write: Lead, QA, Explorer, Design reviewer and Scenario writer.
   - **Maximum depth** is Balanced with the highest reasoning level on the Planner,
     the design reviewers and the PR reviewers, and Reviewer 2 on a third
     provider when there is one.
@@ -217,6 +217,52 @@ send parent notifications only when stuck; Factory reports the complete review
 round and alerts when a reviewer finishes without recording a verdict. Existing
 reviewer threads retain their notification settings.
 
+## Holdout scenarios
+
+QA's checks used to come from the same task and plan the Builder read, so a Builder could
+aim its code at the checks it expected. Holdout scenarios are end-to-end checks written
+separately, from the original request, that the Builder never sees.
+
+- **Who writes them:** when a Builder is assigned, the factory also starts a **Scenario
+  writer**. It reads the task's description and your answers to the plan's questions,
+  never the plan, and reads the code only to learn how a person uses the product. It
+  writes 3 to 7 scenarios, each with a starting state, steps and what you should see,
+  including at least one failure case, and saves them with
+  `bb factory scenarios-set APP-12 --text "..."`. It does that once; its final message is
+  only a count, and it doesn't wake the Lead.
+- **Who reads them:** only the task's latest QA thread, and you: on the task on the
+  Factory page, or with `bb factory scenarios APP-12` from your own terminal. They're
+  kept in the plugin's database, never as a task comment, since the Builder reads every
+  task comment. Status, the board, the merge card and Health show counts only.
+- **How QA uses them:** QA runs each one at the commit it checks and records it with
+  `bb factory scenario APP-12 S2 --result pass|fail|invalid --sha <commit>`. **Invalid**
+  is for a scenario that misreads the request or can't be run here, with QA's reason,
+  which you see on the task. QA reports a failure to the Builder as a symptom, never by
+  copying the scenario.
+- **The gate:** `bb factory qa --verdict pass` is refused while a scenario has failed or
+  hasn't been run at that commit, and while the writer is still at work. A fail is never
+  held. A task whose writer ended without saving any passes QA as before, and assigning
+  QA again starts a new writer.
+- **Changing them:** edit them on the task on the Factory page, or save new ones with
+  `bb factory scenarios-set` from your own terminal. Each save is a new version: QA's
+  results on the earlier one stop counting, and if QA had already run them, the Lead is
+  asked to run QA again. A save from the page sends you a notification, like other page
+  actions.
+- **Health** shows how many scenarios passed on QA's first run of each task: checks the
+  Builder never saw, so they measure the work better than its own tests do.
+
+Holdouts are on for new factories. Existing factories turn them on with
+`bb factory holdouts APP on`, or from **Settings** on the Factory page; turning them off
+is from your own terminal only. The Scenario writer seat in Agents defaults to QA's
+provider, Codex; if its provider isn't available, the writer runs on QA's and the task
+says so. If a writer fails, the task isn't blocked: the Lead hears, and QA can still
+pass without scenarios.
+
+This is a rule the factory keeps, not a security boundary. An agent with file access can
+still reach the plugin's database or read the writer's thread, and the page's calls
+can't tell you from an agent. Agents are told never to look for the scenarios or use
+`bb plugin rpc` on the factory.
+
 ## Merge policy
 
 Each factory has one written rule for who may merge, and only you can change it,
@@ -318,8 +364,8 @@ skipped, and the Lead is told.
 
 Open **Health** on the Factory page, or run `bb factory health APP [--json]`, to see how
 much rework PRs take: review rounds per merged PR, how often changes are requested, time
-from open to ready, tokens per merged task excluding cached input, and PRs closed without
-merging. Each number shows its sample size, because a small history can swing on one PR.
+from open to ready, tokens per merged task excluding cached input, PRs closed without
+merging, and how many holdout scenarios passed on QA's first run. Each number shows its sample size, because a small history can swing on one PR.
 PRs from before this view estimate time to ready from their last approval on the head.
 
 To compare before and after a change, such as turning on the evidence contract, count only

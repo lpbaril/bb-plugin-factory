@@ -178,3 +178,24 @@ test('tokenTurns keeps turns that started in a window, with tokens defined as to
   assert.deepEqual(starts(1001, 3000), [2000]);
   assert.equal(store.tokensByTask('BIG').get('BIG-1'), 70 + 40 + 0, 'the same definition: the profile and tokens per task agree');
 });
+
+test('holdout scenarios are stored as rows of their own, never in the factory metadata', async t => {
+  const { bb, harness } = createFakePluginHost({ pluginId: 'factory' });
+  t.after(() => harness.lifecycle.dispose());
+  const store = createFactoryStorage(bb.storage, identity);
+  const factory = {
+    prefix: 'HO', name: 'Holdouts', bbProjectId: 'proj', trackerProjectId: 'tracker', blockedLabelId: 'blocked', leadThreadId: null, createdAt: '', repo: null, archivedAt: null,
+    agents: [], prs: [], plans: [], holdoutsEnabled: true,
+    holdouts: [{ taskKey: 'HO-1', writerThreadId: 'thr_w', startedAt: '', writerEndedAt: null, version: 1, scenarios: [{ id: 'S1', title: 'Secret check', body: 'Expect: a hidden result' }], savedBy: 'writer', savedAt: '', results: [] }],
+  };
+  await store.write(factory);
+  const db = bb.storage.database();
+  const metadata = db.prepare("SELECT payload FROM factory_metadata WHERE prefix='HO'").get().payload;
+  assert.ok(!metadata.includes('hidden result') && !metadata.includes('holdouts":'), metadata);
+  assert.equal(db.prepare("SELECT count(*) AS n FROM factory_records WHERE kind='holdout' AND task_key='HO-1'").get().n, 1);
+  assert.deepEqual(await createFactoryStorage(bb.storage, identity).read('HO'), factory);
+  const without = { ...factory, prefix: 'NO' };
+  delete without.holdouts;
+  await store.write(without);
+  assert.deepEqual(await store.read('NO'), without, 'a record without holdouts reads back without them');
+});
