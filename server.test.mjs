@@ -6481,7 +6481,9 @@ test('a Scenario writer that fails is reported to the Lead without blocking the 
   const { harness, updates, messages } = await holdoutFixture(t, { initial: { agents: [builderAgent, leadAgent, writer], holdouts: [holdoutSet({ version: 0, scenarios: [] })] } });
   await harness.behavior.emitThreadEvent('turn.failed', { ...failure('unauthorized'), threadId: 'thr_writer' });
   assert.deepEqual(updates, [], 'the task is not blocked');
-  assert.ok(messages.some(message => /Scenario writer for TEST-1 .* failed: unauthorized\. Without holdout scenarios, QA can still pass TEST-1/.test(message.input[0].text)));
+  const told = messages.filter(message => /Scenario writer for TEST-1 failed: unauthorized\. Without holdout scenarios, QA can still pass TEST-1/.test(message.input[0].text));
+  assert.equal(told.length, 1);
+  assert.ok(!told[0].input[0].text.includes('thr_writer'), 'the Lead isn\'t told which thread holds the scenarios');
 });
 
 test('the Scenario writer\'s end is recorded, so the board stops saying it is at work', async t => {
@@ -6678,6 +6680,9 @@ test('the Scenario writer is left out of status and the run ledger, where agents
   const json = (await fx.harness.behavior.runCli(['status', 'TEST', '--json'])).stdout;
   assert.ok(!text.includes('thr_writer') && !json.includes('thr_writer'));
   assert.ok(text.includes('thr_builder'));
+  const board = await fx.harness.behavior.callRpc('factory_board', { prefix: 'TEST' });
+  assert.ok(!JSON.stringify(board).includes('thr_writer'), 'the board, which any agent can call through bb plugin rpc');
+  assert.ok(board.agents.some(agent => agent.threadId === 'thr_builder'));
   createFactoryStorage(fx.bb.storage, value => value).appendRuns('thr_writer', [{ threadId: 'thr_writer', endSeq: 1, prefix: 'TEST', taskKey: 'TEST-1', role: 'scenarios', providerId: 'codex', model: null, reasoning: null, outcome: 'completed', error: null, startedAt: 1, endedAt: 2, tokensTotal: 10, tokensCached: 0, tokensOutput: 1 }], { lastSeq: 1, usageSeq: 1, tokensTotal: 10, tokensCached: 0, tokensOutput: 1 });
   const runs = (await fx.harness.behavior.runCli(['runs', 'TEST', '--json'])).stdout;
   assert.ok(runs.includes('"role":"scenarios"'), 'its turns still count');

@@ -2370,6 +2370,13 @@ export default async function plugin(bb: BbPluginApi) {
     );
     return tasks;
   }
+  /**
+   * The agents any listing shows: all but the Scenario writer, whose thread holds the scenarios. Every
+   * output an agent can read (status, the board, which the page and `bb plugin rpc` both reach) uses this.
+   */
+  function listedAgents(factory: Pick<Factory, "agents">): Agent[] {
+    return factory.agents.filter((agent) => agent.role !== "scenarios");
+  }
   /** The task's holdout counts, at the commit QA last checked on its open PR, or else the latest QA ran them at. */
   function boardHoldouts(factory: Factory, taskKey: string): HoldoutSummary | null {
     const set = factory.holdouts.find((entry) => entry.taskKey === taskKey);
@@ -6156,7 +6163,8 @@ ${findings}`;
     const action = supervisorAction(event);
     if (action === "leave") return;
     const { factory, agent } = entry;
-    const who = `${ROLES[agent.role].label}${agent.taskKey === null ? "" : ` for ${agent.taskKey}`} (\`${event.threadId}\`)`;
+    // The writer's thread holds the scenarios, so the Lead isn't told which it is.
+    const who = `${ROLES[agent.role].label}${agent.taskKey === null ? "" : ` for ${agent.taskKey}`}${agent.role === "scenarios" ? "" : ` (\`${event.threadId}\`)`}`;
     const why =
       event.errorInfo === null
         ? "no error details; often a daemon restart, a lost connection or a stalled provider turn"
@@ -6502,7 +6510,7 @@ ${findings}`;
       const tasks = await listTasks(factory);
       return {
         factory: await summarize(factory),
-        agents: factory.agents,
+        agents: listedAgents(factory),
         tasks: tasks.filter((task) => task.status !== "canceled").map((task) => toBoardTask(factory, task)),
       };
     },
@@ -7900,7 +7908,7 @@ ${findings}`;
               .map((task) => toBoardTask(factory, task));
             if (input.options.json) {
               // The Scenario writer's thread holds the scenarios, so it's left out where agents look.
-              const value = { factory: await summarize(factory), agents: factory.agents.filter((agent) => agent.role !== "scenarios"), tasks };
+              const value = { factory: await summarize(factory), agents: listedAgents(factory), tasks };
               return { exitCode: 0, stdout: JSON.stringify(value) };
             }
             const listed = (await bb.sdk.threads.list({ projectId: factory.bbProjectId, originPluginId: "factory", includeHidden: true, limit: 500 })) as {
@@ -7913,8 +7921,8 @@ ${findings}`;
               const inColumn = tasks.filter((task) => task.column === column);
               lines.push("", `${COLUMN_LABELS[column]} (${inColumn.length})`);
               for (const task of inColumn) {
-                const agents = factory.agents
-                  .filter((agent) => agent.taskKey === task.key && agent.role !== "scenarios")
+                const agents = listedAgents(factory)
+                  .filter((agent) => agent.taskKey === task.key)
                   .map((agent) => `${ROLES[agent.role].label} ${agent.threadId}`);
                 lines.push(`  ${task.key}  ${task.title}${agents.length > 0 ? `  [${agents.join(", ")}]` : ""}`);
                 if (task.track !== null) lines.push(`      Track ${task.track}${task.closeAdvice === null ? "" : ` · the ${task.closeAdvice.role === "plan" ? "Planner" : "Explorer"} recommends closing it (comment ${task.closeAdvice.commentId}); only the person can`}`);
