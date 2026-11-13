@@ -259,10 +259,21 @@ provider, Codex; if its provider isn't available, the writer runs on QA's and th
 says so. If a writer fails, the task isn't blocked: the Lead hears, and QA can still
 pass without scenarios.
 
-This is a rule the factory keeps, not a security boundary. An agent with file access can
-still reach the plugin's database or read the writer's thread, and the page's calls
-can't tell you from an agent. Agents are told never to look for the scenarios or use
-`bb plugin rpc` on the factory.
+How they're kept from agents:
+
+- **The writer's thread isn't advertised.** It has no parent, so it isn't listed among
+  the Lead's child threads, and no task comment, `bb factory status` or run ledger names it.
+- **QA reports through the factory.** With holdouts on, QA's final message reaches the
+  Lead only if it quotes no scenario; one that does is held back and you're told. A QA
+  task comment that quotes one, which the Builder could read, is flagged to you too.
+- **Reads and saves from a terminal are reported.** Outside an agent thread is how the
+  CLI knows it's you, and an agent could fake that, so you get a notification each time
+  the scenarios are read or saved that way.
+
+This is detection, not a security boundary. An agent with file access can still reach the
+plugin's database, find the writer's thread by searching, or describe a scenario in its
+own words, and the page's calls can't tell you from an agent. Agents are told never to
+look for the scenarios or use `bb plugin rpc` on the factory.
 
 ## Merge policy
 
