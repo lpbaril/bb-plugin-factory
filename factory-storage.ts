@@ -98,13 +98,15 @@ export function createFactoryStorage(storage: BbPluginApi["storage"], parse: (va
 
   const writeRows = db.transaction((factory: Factory, legacy?: unknown) => {
     if (legacy !== undefined) backup.run(factory.prefix, JSON.stringify(legacy), new Date().toISOString());
-    const { agents, prs, plans, ...rest } = factory;
+    const { agents, prs, plans, holdouts, ...rest } = factory;
     putMetadata.run(factory.prefix, JSON.stringify(rest));
     clearRecords.run(factory.prefix);
     const add = (kind: string, position: number, taskKey: string | null, value: unknown, parent = -1) =>
       putRecord.run(factory.prefix, kind, position, parent, taskKey, JSON.stringify(value));
     agents.forEach((agent, i) => add("agent", i, agent.taskKey, agent));
     plans.forEach((plan, i) => add("plan", i, plan.taskKey, plan));
+    // Holdout scenarios get rows of their own: they never ride along in the metadata payload.
+    (holdouts ?? []).forEach((set, i) => add("holdout", i, set.taskKey, set));
     prs.forEach(({ reviews, scans, ...pr }, i) => {
       add("pr", i, pr.taskKey, pr);
       reviews.forEach((review, j) => add("review", j, pr.taskKey, review, i));
@@ -121,6 +123,7 @@ export function createFactoryStorage(storage: BbPluginApi["storage"], parse: (va
       switch (row.kind) {
         case "agent": factory.agents[row.position] = value; break;
         case "plan": factory.plans[row.position] = value; break;
+        case "holdout": (factory.holdouts ??= [])[row.position] = value; break;
         case "pr": factory.prs[row.position] = { ...value, reviews: [], scans: [] }; break;
         case "review": factory.prs[row.parent].reviews[row.position] = value; break;
         case "scan": factory.prs[row.parent].scans[row.position] = value; break;

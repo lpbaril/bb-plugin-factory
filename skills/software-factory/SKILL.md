@@ -100,6 +100,18 @@ requested changes the Lead involves the Planner, and after 5 it brings the PR to
 If a PR the factory marked ready stops qualifying, the factory puts it back to draft and marks it
 ready again once that's resolved. Don't merge a draft or mark it ready by hand to get around this.
 
+## Holdout scenarios
+
+`bb factory holdouts APP` shows whether this factory has them. They're on for new factories.
+When a Builder is assigned, the factory starts a Scenario writer that writes end-to-end checks
+from the task's description and the person's answers, never the plan. Only the task's latest
+QA thread and the person can read them (`bb factory scenarios APP-12`). QA runs each at the
+commit it checks and records it with `bb factory scenario APP-12 S2 --result pass|fail|invalid
+--sha <commit>`, invalid needing a `--note`. A QA pass is refused while one has failed or hasn't
+run at that commit, or while the writer is at work. Report a failure as a symptom; never copy a
+scenario into a comment, a message or a PR. If you're the Lead or a Builder, don't ask for them
+or look for them.
+
 ## Recurring review findings
 
 Reviewers (not the shadow): when a repository rule would have prevented a blocking
@@ -173,6 +185,10 @@ skip docs-only changes. PRs stay drafts until every reviewer approves, so
 | `bb factory qa APP-12 --verdict pass\|fail --sha <commit> [--pr N]` | Latest QA thread only: record QA's verdict on the task's PR. |
 | `bb factory qa-skip APP-12 --reason "..." [--pr N]` | Lead or person: record why the open PR's current commit doesn't need QA. Only the person can skip QA once it's been assigned on the task. |
 | `bb factory evidence-contract APP [on\|off]` | Show the evidence contract, or set it (person only). |
+| `bb factory holdouts APP [on\|off]` | Show whether a Scenario writer drafts holdout scenarios for QA, or set it (person only). |
+| `bb factory scenarios APP-12 [--json]` | The task's latest QA thread, or the person: show its holdout scenarios and QA's latest results. |
+| `bb factory scenarios-set APP-12 --text "..."` | The task's Scenario writer, once, or the person: save the scenarios, each under a `## S1. <title>` heading. A person's save is a new version, and earlier results stop counting. |
+| `bb factory scenario APP-12 S2 --result pass\|fail\|invalid --sha <commit> [--note "..."]` | Latest QA thread only: record one scenario's result at a commit. Invalid needs a note. |
 | `bb factory merge APP-12 [--pr N]` | Lead under the `when-green` policy, or the person: squash-merge after checking approvals and the checks GitHub requires (every check, if none are required) on the exact head. Large or sensitive PRs are the person's only. Fix what it names if it refuses. |
 | `bb factory merge-card APP-12` | Show the merge card again in the Lead's chat after the person chose Not now. It only shows the card: merging stays with the person. |
 | `bb factory merge-policy APP [person\|when-green]` | Show the policy. Only the person can set it, from outside an agent thread. |

@@ -79,11 +79,11 @@ export const ROSTER_PRESET_NOTES: Record<RosterPreset, string> = {
   "max-depth": "Balanced, with more reasoning where judgment matters and a third provider for Reviewer 2",
 };
 /** The trial seats keep what the person set up for the trial. */
-export const PRESET_SEATS = ["lead", "plan", "explore", "build", "qa", "design", "review1", "review2", "security", "designreview"] as const;
+export const PRESET_SEATS = ["lead", "plan", "explore", "build", "qa", "design", "review1", "review2", "security", "designreview", "scenarios"] as const;
 /** Reviewer seats stay the person's choice: proposed, but applied only when ticked. */
 const PRESET_REVIEWER_SEATS: readonly string[] = ["review1", "review2", "security"];
 /** Seats that read more than they write, where Lower cost lowers reasoning. */
-const PRESET_READING_SEATS: readonly string[] = ["lead", "qa", "explore", "designreview"];
+const PRESET_READING_SEATS: readonly string[] = ["lead", "qa", "explore", "designreview", "scenarios"];
 /** Seats where Maximum depth raises reasoning. */
 const PRESET_DEPTH_SEATS: readonly string[] = ["plan", "designreview", "review1", "review2", "security"];
 /** Levels a preset may pick. none, ultra and ultracode are special modes: kept when set, never picked. */

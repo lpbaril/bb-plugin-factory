@@ -287,10 +287,137 @@ function DesignReviewPanel({ task }: { task: BoardTask }) {
   );
 }
 
+type Holdouts = NonNullable<BoardTask["holdouts"]>;
+/** The counts in words: never the scenarios themselves. */
+function holdoutLabel(holdouts: Holdouts): string {
+  if (holdouts.state === "writing") return "Holdouts being written";
+  if (holdouts.state === "none") return "No holdouts";
+  if (holdouts.sha === null) return `${holdouts.total} holdouts, not run`;
+  return `Holdouts ${holdouts.pass}/${holdouts.total}`;
+}
+function holdoutDetail(holdouts: Holdouts): string {
+  if (holdouts.state !== "ready" || holdouts.sha === null) return holdoutLabel(holdouts);
+  const extra = [
+    holdouts.fail > 0 ? `${holdouts.fail} failed` : null,
+    holdouts.invalid > 0 ? `${holdouts.invalid} invalid` : null,
+    holdouts.notRun > 0 ? `${holdouts.notRun} not run` : null,
+  ].filter((part) => part !== null);
+  return `${holdouts.pass} of ${holdouts.total} pass at ${holdouts.sha.slice(0, 7)}${extra.length === 0 ? "" : ` · ${extra.join(", ")}`}`;
+}
+
+function HoldoutChip({ task }: { task: BoardTask }) {
+  const holdouts = task.holdouts;
+  if (holdouts === null || holdouts.state === "none") return null;
+  const warn = holdouts.fail > 0 || holdouts.invalid > 0;
+  return (
+    <span className={cn("rounded border px-1.5 py-0.5", warn ? "border-amber-500/50 text-amber-600 dark:text-amber-400" : "border-border text-muted-foreground")} title={holdoutDetail(holdouts)}>
+      {holdoutLabel(holdouts)}
+    </span>
+  );
+}
+
+const HOLDOUT_TEMPLATE = "## S1. <one-line title>\nStart: <the state before the steps>\nSteps:\n1. <what the person does>\nExpect: <what the person observes>\n";
+const HOLDOUT_RESULT_TONE: Record<string, string> = {
+  pass: "text-emerald-600 dark:text-emerald-400",
+  fail: "text-destructive",
+  invalid: "text-amber-600 dark:text-amber-400",
+};
+
+/** The task's holdout scenarios, which only QA and the person read: loaded on request, and editable. */
+function HoldoutsPanel({ task, enabled }: { task: BoardTask; enabled: boolean }) {
+  const rpc = useRpc<typeof rpcContract>();
+  type View = Awaited<ReturnType<typeof rpc.call<"task_scenarios_get">>>;
+  const [view, setView] = useState<View | null>(null);
+  const [draft, setDraft] = useState<string | null>(null);
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const holdouts = task.holdouts;
+  if (holdouts === null && !enabled) return null;
+  const load = async () => {
+    setPending(true);
+    setError(null);
+    try {
+      setView(await rpc.call("task_scenarios_get", { taskKey: task.key }));
+    } catch (cause) {
+      setError(errorText(cause));
+    } finally {
+      setPending(false);
+    }
+  };
+  const save = async () => {
+    if (draft === null) return;
+    setPending(true);
+    setError(null);
+    try {
+      await rpc.call("task_scenarios_save", { taskKey: task.key, text: draft });
+      setDraft(null);
+      setView(await rpc.call("task_scenarios_get", { taskKey: task.key }));
+    } catch (cause) {
+      setError(errorText(cause));
+    } finally {
+      setPending(false);
+    }
+  };
+  return (
+    <div className="space-y-1">
+      <div className="text-xs font-medium text-muted-foreground">
+        Holdout scenarios{holdouts === null ? " · none yet: a Scenario writer starts with the Builder" : ` · ${holdoutDetail(holdouts)}`}
+      </div>
+      {view === null ? (
+        <Button size="sm" variant="outline" disabled={pending} onClick={() => void load()}>{pending ? "Loading…" : "Show scenarios"}</Button>
+      ) : draft !== null ? (
+        <div className="space-y-1.5">
+          <textarea
+            className="min-h-48 w-full rounded-md border border-input bg-transparent px-3 py-2 font-mono text-xs focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+            value={draft}
+            onChange={(event) => setDraft(event.target.value)}
+            aria-label={`Holdout scenarios for ${task.key}`}
+          />
+          <p className="text-xs text-muted-foreground">Each scenario starts with a heading like "## S1. Title". Saving makes a new version: QA's earlier results stop counting, and the Lead is asked to run QA again.</p>
+          <div className="flex gap-1">
+            <Button size="sm" disabled={pending || draft.trim() === ""} onClick={() => void save()}>{pending ? "Saving…" : "Save"}</Button>
+            <Button size="sm" variant="outline" disabled={pending} onClick={() => setDraft(null)}>Cancel</Button>
+          </div>
+        </div>
+      ) : (
+        <div className="space-y-1.5">
+          {view.scenarios.length === 0 ? (
+            <p className="text-xs text-muted-foreground">{view.summary?.state === "writing" ? "The Scenario writer is still writing them." : "None saved."}</p>
+          ) : (
+            <ul className="space-y-1 text-xs">
+              {view.scenarios.map((scenario) => (
+                <li key={scenario.id} className="rounded-md border border-border p-2">
+                  <div className="flex items-baseline gap-2">
+                    <span className="font-medium">{scenario.id}.</span>
+                    <span>{scenario.title}</span>
+                    {scenario.latest === null ? (
+                      <span className="ml-auto shrink-0 text-muted-foreground">not run</span>
+                    ) : (
+                      <span className={cn("ml-auto shrink-0 font-medium", HOLDOUT_RESULT_TONE[scenario.latest.result])}>{scenario.latest.result} at {scenario.latest.sha.slice(0, 7)}</span>
+                    )}
+                  </div>
+                  {scenario.latest?.note == null ? null : <div className="text-muted-foreground">QA: {scenario.latest.note}</div>}
+                </li>
+              ))}
+            </ul>
+          )}
+          <div className="flex gap-1">
+            <Button size="sm" variant="outline" disabled={pending} onClick={() => setDraft(view.text ?? HOLDOUT_TEMPLATE)}>{view.text === null ? "Write them" : "Edit"}</Button>
+            <Button size="sm" variant="outline" disabled={pending} onClick={() => setView(null)}>Hide</Button>
+          </div>
+          <p className="text-xs text-muted-foreground">Only QA and you read these. The Builder never sees them, so keep them out of task comments.</p>
+        </div>
+      )}
+      {error === null ? null : <Alert>{error}</Alert>}
+    </div>
+  );
+}
+
 /** The track, how far exploring has got, and advice to close, as chips on a card. */
 function TrackChips({ task }: { task: BoardTask }) {
   const unanswered = task.personQuestions.filter((question) => question.answer === null).length;
-  if (task.track === null && task.closeAdvice === null && task.design === null && unanswered === 0) return null;
+  const holdoutChip = task.holdouts !== null && task.holdouts.state !== "none";
+  if (task.track === null && task.closeAdvice === null && task.design === null && unanswered === 0 && !holdoutChip) return null;
   const reported = task.exploration?.filter((entry) => entry.recommendation !== null).length ?? 0;
   const total = task.exploration?.length ?? 0;
   return (
@@ -304,6 +431,7 @@ function TrackChips({ task }: { task: BoardTask }) {
         </span>
       )}
       <DesignChip task={task} />
+      <HoldoutChip task={task} />
       {unanswered === 0 ? null : (
         <span className="rounded border border-amber-500/50 px-1.5 py-0.5 text-amber-600 dark:text-amber-400">{unanswered === 1 ? "A question for you" : `${unanswered} questions for you`}</span>
       )}
@@ -855,6 +983,7 @@ function FactoryView({ prefix }: { prefix: string }) {
         task={openTask}
         hasLead={board.factory.leadThreadId !== null}
         tracksEnabled={board.factory.tracksEnabled}
+        holdoutsEnabled={board.factory.holdoutsEnabled}
         live={live.filter((entry) => openTask !== null && entry.agent.taskKey === openTask.key)}
         onMove={move}
         onClose={() => setOpenTaskId(null)}
@@ -979,6 +1108,12 @@ function HealthDialog({ open, prefix, onClose }: { open: boolean; prefix: string
             sample: `${health.prs} PRs`,
             note: "Work started and then abandoned.",
           },
+          ...(health.holdouts === null ? [] : [{
+            label: "Holdout scenarios passed on QA's first run",
+            value: health.holdouts.passed + health.holdouts.failed === 0 ? "—" : `${Math.round((health.holdouts.passed / (health.holdouts.passed + health.holdouts.failed)) * 100)}%`,
+            sample: `${health.holdouts.passed + health.holdouts.failed} scenarios, ${health.holdouts.tasks} task${health.holdouts.tasks === 1 ? "" : "s"}`,
+            note: `Checks the Builder never saw, so they measure the work better than its own tests.${health.holdouts.invalid === 0 ? "" : ` ${health.holdouts.invalid} marked invalid aren't counted.`} Runs that started in the window.`,
+          }]),
         ];
   return (
     <Dialog open={open} onOpenChange={(next) => { if (!next) onClose(); }}>
@@ -1209,6 +1344,14 @@ function SettingsDialog({
       checked: factory.evidenceContract,
       offCommand: `bb factory evidence-contract ${factory.prefix} off`,
       change: (next) => ({ kind: "evidenceContract", enabled: next }),
+    },
+    {
+      id: "holdouts",
+      label: "Holdout scenarios",
+      note: "A Scenario writer drafts end-to-end checks from each request, which only QA and you can read. QA can't pass a task until it has run them.",
+      checked: factory.holdoutsEnabled,
+      offCommand: `bb factory holdouts ${factory.prefix} off`,
+      change: (next) => ({ kind: "holdouts", enabled: next }),
     },
     {
       id: "reviewsPaused",
@@ -2131,6 +2274,7 @@ function TaskDialog({
   task,
   hasLead,
   tracksEnabled,
+  holdoutsEnabled,
   live,
   onMove,
   onClose,
@@ -2138,6 +2282,7 @@ function TaskDialog({
   task: BoardTask | null;
   hasLead: boolean;
   tracksEnabled: boolean;
+  holdoutsEnabled: boolean;
   live: LiveAgent[];
   onMove: (taskId: string, column: Column) => void;
   onClose: () => void;
@@ -2237,6 +2382,7 @@ function TaskDialog({
             <ExplorationCompare task={task} />
             <PersonQuestionsPanel task={task} />
             <DesignReviewPanel task={task} />
+            <HoldoutsPanel key={task.key} task={task} enabled={holdoutsEnabled} />
 
             {task.pr === null ? null : (
               <div className="space-y-1">

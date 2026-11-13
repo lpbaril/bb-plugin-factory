@@ -2,13 +2,13 @@
 // (github.com/mvschwarz/openrig, Apache-2.0): the culture and role contracts
 // are theirs; the coordination commands are bb's.
 
-export const ROLE_IDS = ["lead", "plan", "explore", "build", "qa", "design", "review1", "review2", "security", "shadow", "designreview"] as const;
+export const ROLE_IDS = ["lead", "plan", "explore", "build", "qa", "design", "review1", "review2", "security", "shadow", "designreview", "scenarios"] as const;
 export type RoleId = (typeof ROLE_IDS)[number];
 export type WorkerRoleId = Exclude<RoleId, "lead">;
-/** Roles the Lead or the person can assign. The shadow reviewer and design reviewers are started only by the factory. */
-export type AssignableRoleId = Exclude<WorkerRoleId, "shadow" | "designreview">;
+/** Roles the Lead or the person can assign. The shadow reviewer, design reviewers and the Scenario writer are started only by the factory. */
+export type AssignableRoleId = Exclude<WorkerRoleId, "shadow" | "designreview" | "scenarios">;
 export const WORKER_ROLE_IDS = ROLE_IDS.filter(
-  (role): role is AssignableRoleId => role !== "lead" && role !== "shadow" && role !== "designreview",
+  (role): role is AssignableRoleId => role !== "lead" && role !== "shadow" && role !== "designreview" && role !== "scenarios",
 );
 /** Roles that review a pull request and record a verdict on it. */
 export const PR_REVIEW_ROLES = ["review1", "review2", "security", "shadow"] as const;
@@ -60,6 +60,58 @@ export type DesignResolution = (typeof DESIGN_RESOLUTIONS)[number];
 /** After this many rounds, the person decides whether to keep going. */
 export const MAX_DESIGN_ROUNDS = 5;
 
+/**
+ * Holdout scenarios: end-to-end checks a Scenario writer drafts from the original request, not the plan.
+ * Only QA and the person can read them, so the Builder can't write code to pass checks it has seen.
+ * That's a rule the factory keeps, not a security boundary: an agent with file access could still
+ * reach the plugin's database.
+ */
+export const MAX_HOLDOUTS = 10;
+export const HOLDOUT_TITLE_MAX = 200;
+export const HOLDOUT_BODY_MAX = 2000;
+export const HOLDOUT_NOTE_MAX = 500;
+/** invalid: the scenario misreads the request or can't be run here; QA gives the reason and the person sees it. */
+export const HOLDOUT_RESULTS = ["pass", "fail", "invalid"] as const;
+export type HoldoutResult = (typeof HOLDOUT_RESULTS)[number];
+export type HoldoutScenario = { id: string; title: string; body: string };
+
+/**
+ * Reads scenarios written as `## S1. <title>` headings, each followed by its text. They're numbered
+ * S1, S2… in the order written, whatever numbers the headings carry. A `# ` title line before the
+ * first scenario is allowed; any other text there is refused rather than dropped.
+ */
+export function parseHoldoutScenarios(text: string): HoldoutScenario[] {
+  const lines = text.replace(/\r\n?/g, "\n").split("\n");
+  const found: { title: string; body: string[] }[] = [];
+  for (const line of lines) {
+    const heading = /^##\s+S\d+\s*[.:)\-]?\s+(\S.*?)\s*$/.exec(line);
+    if (heading !== null) {
+      found.push({ title: heading[1], body: [] });
+      continue;
+    }
+    const current = found.at(-1);
+    if (current !== undefined) current.body.push(line);
+    else if (line.trim() !== "" && !/^#\s/.test(line)) {
+      throw new Error("Text before the first scenario isn't part of any scenario. Start each one with a heading like \"## S1. <title>\".");
+    }
+  }
+  if (found.length === 0) throw new Error("No scenarios found. Start each one with a heading like \"## S1. <title>\".");
+  if (found.length > MAX_HOLDOUTS) throw new Error(`${found.length} scenarios is more than ${MAX_HOLDOUTS}. Keep the ones that matter most.`);
+  return found.map((entry, index) => {
+    const id = `S${index + 1}`;
+    const body = entry.body.join("\n").trim();
+    if (body === "") throw new Error(`${id} ("${entry.title.slice(0, 60)}") has no steps or expected result.`);
+    if (entry.title.length > HOLDOUT_TITLE_MAX) throw new Error(`${id}'s title is longer than ${HOLDOUT_TITLE_MAX} characters.`);
+    if (body.length > HOLDOUT_BODY_MAX) throw new Error(`${id} is longer than ${HOLDOUT_BODY_MAX} characters. Split it, or keep only what QA needs to run it.`);
+    return { id, title: entry.title, body };
+  });
+}
+
+/** The text form `parseHoldoutScenarios` reads back unchanged. */
+export function formatHoldoutScenarios(scenarios: readonly HoldoutScenario[]): string {
+  return `${scenarios.map((scenario) => `## ${scenario.id}. ${scenario.title}\n\n${scenario.body}`).join("\n\n")}\n`;
+}
+
 /** Tasks no specialist will finish, so the factory never reports them as stalled. */
 export const TASK_KINDS = ["coordination", "person"] as const;
 
@@ -99,6 +151,7 @@ export const ROLES: Record<RoleId, RoleInfo> = {
   security: { label: "Security", environment: "builder-worktree", movesTaskTo: "in_review" },
   shadow: { label: "Shadow security", environment: "builder-worktree", movesTaskTo: null },
   designreview: { label: "Design reviewer", environment: "project", movesTaskTo: null },
+  scenarios: { label: "Scenario writer", environment: "project", movesTaskTo: null },
 };
 
 const CULTURE = `## Team culture
@@ -222,6 +275,7 @@ The factory sends their findings to the Planner, who resolves each one: FIX, CON
 }
 
 export function leadPrompt(args: {
+  holdouts?: boolean;
   designReview?: boolean;
   tracks?: boolean;
   evidenceContract?: boolean;
@@ -268,7 +322,7 @@ Reviewer 1, Reviewer 2 and Security are started **automatically by the factory**
 1. **Intake and planning.** Preserve the person's original request verbatim in the task description, with source message references and constraints. For new features, ambiguous acceptance criteria, migrations or cross-cutting changes, assign the Planner with \`bb factory assign <KEY> --role plan\`. The Planner owns the PRD, architecture, dependencies, task breakdown and acceptance criteria. Wait for its ready plan before assigning the Builder. A small, unambiguous fix may skip planning. Clarify product decisions with the person; do not guess. Create tasks with \`bb tasks create --project ${args.prefix} --title "<verb-first title>" --description-file <file>\`; a description states the outcome, acceptance criteria, and what is out of scope. New tasks land in Backlog. Move the ones ready to start to To do.
 2. **Design first when the UX is ambiguous.** Assign the designer; feed its result into the builder's task.
 3. **Build.** Assign the builder. Keep at most 3 builders running at once.
-4. **QA.** When a builder reports done, assign QA for behavior. ${args.evidenceContract ? `A PR can't be marked ready or merged until QA passes. If a small, low-risk change doesn't need it, open the PR, then record why with \`bb factory qa-skip <KEY> --reason "<why>"\`. A skip covers that commit only, so a new commit needs a new one. A QA failure goes back to the builder, then assign QA again; only the person can skip QA once it's been assigned on a task.` : "Small, low-risk changes can skip QA."}
+4. **QA.** When a builder reports done, assign QA for behavior. ${args.evidenceContract ? `A PR can't be marked ready or merged until QA passes. If a small, low-risk change doesn't need it, open the PR, then record why with \`bb factory qa-skip <KEY> --reason "<why>"\`. A skip covers that commit only, so a new commit needs a new one. A QA failure goes back to the builder, then assign QA again; only the person can skip QA once it's been assigned on a task.` : "Small, low-risk changes can skip QA."}${args.holdouts ? " When you assign a Builder, the factory also starts a Scenario writer, which writes holdout scenarios from the original request for QA alone. You don't assign it and you never see the scenarios: don't ask for them, relay them or pass them to a Builder. A QA pass waits until QA has run them." : ""}
 5. **Open a draft PR.** Once the builder (and QA, if assigned) is done, open a draft pull request for the builder's branch from your checkout. Find the branch with \`bb factory status ${args.prefix}\`, then run \`git push -u origin <branch>\` and \`gh pr create --draft --head <branch> --title "<KEY>: <title>" --body-file <file>\`. The body summarizes the change, links the task, and lists the evidence. Never push to or create PRs from the base branch.
 6. **Automatic review.** Within about two minutes the factory sees the PR and starts Reviewer 1 and a Rafter security scan with the Security reviewer, plus Reviewer 2 for large or sensitive diffs. Each posts its verdict as a PR comment. Routine reviewer completions do not wake you; the factory sends one actionable result when the round is complete. Reviewers can still report that they are stuck.
 7. **Fix loop, batched.** Wait for the factory's "review round complete" message, then send the builder the PR/comment and reviewer-thread references in one \`bb thread tell\`, so the fixes land in a single push. Every push re-runs CI, the Security reviewer and the reviewers who asked for changes, so one batched round beats several small ones. The builder reads and addresses every finding directly. Never relay reviews one at a time as they land.
@@ -328,6 +382,7 @@ const REVIEW_LESSONS = `- If a repository rule would have prevented a blocking f
 const REVIEW_LESSONS_REMINDER = "Record a blocking finding a repo rule would have prevented with `bb factory lesson`.";
 
 const WORKER_RULES: Record<WorkerRoleId, string> = {
+  scenarios: "Work from the task's description and the person's answers in your first message, not the plan: don't run `bb tasks show` or read task comments. Never post a scenario as a comment or put one in your final message. Save them with `bb factory scenarios-set <KEY> --text \"$(cat <file>)\"`, then end with one line: how many you saved.",
   designreview: "Read only the plan (`bb factory plan <KEY>`) and the code it names; don't read task comments, other reviewers' findings or the Planner's thread. Don't edit files or git state, and don't message other agents. End your report with \"## Checked\" and \"## Not checked\", then record it with `bb factory design-findings <KEY> --comment <comment-id>`.",
   explore: "Stay inside your time box and your approach. Commit if it helps, but never push or open a pull request: your worktree is deleted after your report. Record the report with `bb factory explore-report <KEY> --comment <comment-id>`.",
   plan: "Read the original request, `AGENTS.md`, `.specify/memory/constitution.md` and the repository. Save the PRD and plan as a task comment, then run `bb factory plan-ready <KEY> --comment <comment-id>` only when no blocking questions remain. Do not edit product code or git state. Never waive review gates; escalate product decisions to the person through the Lead.",
@@ -341,6 +396,7 @@ const WORKER_RULES: Record<WorkerRoleId, string> = {
 };
 
 const EVIDENCE_REMINDERS: Record<WorkerRoleId, string> = {
+  scenarios: "Each scenario names concrete steps and what the person should see.",
   designreview: "Each finding cites the plan's text or a file:line, and a Blocker names what goes wrong if it's built as written.",
   explore: "Back each finding with what you ran and saw, and fill in \"## Not checked\" in your report.",
   plan: "Mark what you haven't verified, and end your report with \"Not checked:\".",
@@ -359,19 +415,27 @@ const DESIGN_REMINDERS: Partial<Record<WorkerRoleId, string>> = {
   plan: "A READY plan needs \"## Success checks\", and lists each question only the person can answer under Open questions as `- For the person: Q1. <question> Assumed: <what the plan builds on>`. Resolve each design finding with `bb factory design-resolve <KEY> --finding <id> --as fix|contest|escalate|decline --note \"...\"`; after any fix, post a new complete READY plan and mark it ready again.",
 };
 
+/** With holdouts on, QA runs the hidden scenarios and the Builder knows they exist. */
+const HOLDOUT_REMINDERS: Partial<Record<WorkerRoleId, string>> = {
+  qa: "Run the holdout scenarios too (`bb factory scenarios <KEY>`) and record each with `bb factory scenario <KEY> <id> --result pass|fail|invalid --sha <commit>`. Report a failure as a symptom, never by copying a scenario, and never post the scenarios anywhere.",
+  build: "QA also checks hidden scenarios written from the original request: build the whole request, its failure cases included, and don't look for them.",
+};
+
 const TRACK_REMINDERS: Partial<Record<WorkerRoleId, string>> = {
   plan: "If only an experiment can settle the approach, end with NEEDS SPIKE; if the task shouldn't be done, with RECOMMEND CLOSE (`bb factory plan-outcome <KEY> needs-spike|recommend-close --comment <id>`).",
   design: "When more than one interaction model is reasonable, propose two or more with their trade-offs.",
 };
 
-export function workerReminder(args: { role: WorkerRoleId; factoryName: string; taskKey: string; evidenceContract?: boolean; tracks?: boolean; designReview?: boolean }): string {
-  const track = [args.tracks ? TRACK_REMINDERS[args.role] : undefined, args.designReview ? DESIGN_REMINDERS[args.role] : undefined].filter((part) => part !== undefined).join(" ") || undefined;
+export function workerReminder(args: { role: WorkerRoleId; factoryName: string; taskKey: string; evidenceContract?: boolean; tracks?: boolean; designReview?: boolean; holdouts?: boolean }): string {
+  const track = [args.tracks ? TRACK_REMINDERS[args.role] : undefined, args.designReview ? DESIGN_REMINDERS[args.role] : undefined, args.holdouts ? HOLDOUT_REMINDERS[args.role] : undefined].filter((part) => part !== undefined).join(" ") || undefined;
+  const offTask = args.role === "designreview" || args.role === "scenarios";
   return `# Standing role: ${ROLES[args.role].label} in the "${args.factoryName}" software factory, on task ${args.taskKey}
 
-Your first message has your full brief. If it is no longer in your context, re-read the task with \`bb tasks show ${args.taskKey}\`. ${args.role === "designreview" ? "If you can't finish, say why in your final message; never block the task, which others are working on." : `If you cannot continue, run \`bb factory block ${args.taskKey} --reason "<what you need>"\` instead of stalling.`} Don't move the task to Done. ${NO_PAGE_CALLS} ${FINAL_MESSAGE_ROLES.includes(args.role) ? `${FINAL_MESSAGE} ` : ""}${WORKER_RULES[args.role]}${track === undefined ? "" : ` ${track}`}${args.evidenceContract ? ` ${EVIDENCE_REMINDERS[args.role]}` : ""}`;
+Your first message has your full brief. ${args.role === "scenarios" ? "If it is no longer in your context, stop and say so in your final message: don't re-read the task, whose comments hold the plan." : `If it is no longer in your context, re-read the task with \`bb tasks show ${args.taskKey}\`.`} ${offTask ? "If you can't finish, say why in your final message; never block the task, which others are working on." : `If you cannot continue, run \`bb factory block ${args.taskKey} --reason "<what you need>"\` instead of stalling.`} Don't move the task to Done. ${NO_PAGE_CALLS} ${FINAL_MESSAGE_ROLES.includes(args.role) ? `${FINAL_MESSAGE} ` : ""}${WORKER_RULES[args.role]}${track === undefined ? "" : ` ${track}`}${args.evidenceContract ? ` ${EVIDENCE_REMINDERS[args.role]}` : ""}`;
 }
 
 const WORKER_CONTRACTS: Record<WorkerRoleId, string> = {
+  scenarios: "# You are the Scenario writer\n\nYour task and rules are in your assignment.",
   designreview: "# You are a design reviewer\n\nYour lens and your plan are in your assignment.",
   explore: `# You are the Explorer
 
@@ -549,7 +613,24 @@ const PLAN_OUTCOMES = `## When there's no plan to write
 - If only an experiment can settle the approach, post a comment that starts with "Factory plan: NEEDS SPIKE", stating the question and what an Explorer should try, then run \`bb factory plan-outcome <KEY> needs-spike --comment <comment-id>\`. The task moves to the explore track.
 - If the task shouldn't be done, post a comment that starts with "Factory plan: RECOMMEND CLOSE" with your reasons, then run \`bb factory plan-outcome <KEY> recommend-close --comment <comment-id>\`. Only the person can close the task.`;
 
+/** QA's part in holdout scenarios, for factories with them on. */
+function qaHoldoutBrief(taskKey: string): string {
+  return `## Holdout scenarios
+
+This factory keeps holdout scenarios: end-to-end checks written from the original request by a separate agent. The Builder never sees them, so they test the work without its author having aimed at them.
+
+1. After checking the acceptance criteria, run \`bb factory scenarios ${taskKey}\`. It prints the scenarios and any results already recorded. Only you and the person can read them. If they're still being written, check again before you record your verdict.
+2. Run each one against the real product at the commit you're checking, and record it: \`bb factory scenario ${taskKey} <id> --result pass|fail|invalid --sha $(git rev-parse HEAD) --note "<what you saw>"\`. Use \`invalid\` for a scenario that misreads the request or can't be run here, and say why in the note: the person sees it.
+3. Record your verdict with \`bb factory qa ${taskKey} --verdict pass|fail --sha $(git rev-parse HEAD)\`. A pass is refused while a scenario has failed or hasn't been run at that commit.
+4. **Keep them hidden.** Report a failure, to the Builder and in your task comment, as a symptom: what you did, what you expected and what happened, as you would any bug. Never copy a scenario's text or title, and never post the scenarios anywhere.`;
+}
+
+const BUILD_HOLDOUT_BRIEF = `## Holdout scenarios
+
+QA also checks this task against hidden scenarios, written from the original request by another agent. Don't look for them or ask for them: build the whole request, its failure cases included, not only what the plan's checks name.`;
+
 export function workerPrompt(args: {
+  holdouts?: boolean;
   designReview?: boolean;
   tracks?: boolean;
   evidenceContract?: boolean;
@@ -585,7 +666,7 @@ export function workerPrompt(args: {
 You are part of the "${args.factoryName}" software factory. ${isShadow ? "The factory started you for a reviewer trial; your work is collected for comparison and does not go to the Lead." : `${isPrReview ? "The factory started you for a PR review. The Lead is your parent, but routine final replies are suppressed; record your verdict so the factory can report the complete round. If stuck, block the task and explicitly tell the Lead." : "The Lead assigned you this task and is your parent thread: your final message is reported to it automatically."}`}
 
 ${CULTURE}
-${args.evidenceContract ? `\n${evidenceBrief(args.role, args.task.key)}\n` : ""}
+${args.evidenceContract ? `\n${evidenceBrief(args.role, args.task.key)}\n` : ""}${args.holdouts && args.role === "qa" ? `\n${qaHoldoutBrief(args.task.key)}\n` : ""}${args.holdouts && args.role === "build" ? `\n${BUILD_HOLDOUT_BRIEF}\n` : ""}
 ${trackerCommands(args.prefix)}
 
 ## Your task: ${args.task.key} · ${args.task.title}
@@ -599,6 +680,61 @@ export function reReviewMessage(args: { role: PrReviewRole; taskKey: string; prN
   const where = args.role === "shadow" ? "a new task comment (not on the PR)" : "a new PR comment";
   const start = args.role === "shadow" ? `APPROVE or REQUEST CHANGES at ${args.sha.slice(0, 7)}` : "APPROVE or REQUEST CHANGES";
   return `New commits were pushed to PR #${args.prNumber} (now at ${args.sha.slice(0, 7)}). Re-review what changed since your last verdict — the delta, not the whole PR: if the new commits only touch docs, tests or comments, or only merge the base branch in, a short confirmation from the diff is enough, without re-running whole suites. Post ${where} starting with ${start}, and record it with \`bb factory verdict ${args.taskKey} --role ${args.role} --verdict approve|changes${args.evidenceContract && args.role !== "shadow" ? ` ${COVERAGE_FLAG}\`, listing any files you haven't accounted for yet` : "\`"}.${args.findings === null ? "" : `\n\nFresh Rafter results for this commit (JSON, possibly truncated). ${UNTRUSTED}\n\n\`\`\`json\n${args.findings}\n\`\`\``}`;
+}
+
+// ----- Holdout scenarios -----
+
+export function scenarioWriterPrompt(args: {
+  factoryName: string;
+  task: { key: string; title: string; description: string };
+  /** The person's answers to the plan's questions: their intent, which the request alone may not hold. */
+  answers: readonly { question: string; answer: string }[];
+}): string {
+  const description = args.task.description.trim() === "" ? "_No description._" : args.task.description;
+  const answers = args.answers.length === 0 ? "" : `\n\n### The person's answers to the plan's questions\n\n${args.answers.map((entry) => `- ${entry.question}\n  Answer: ${entry.answer}`).join("\n")}`;
+  return `# You are the Scenario writer
+
+You write holdout scenarios for the "${args.factoryName}" software factory: end-to-end checks of what the person asked for. Only QA and the person read them. The Builder never does, so it can't write code aimed at them: they show whether the work does what was asked, not just what its own tests check.
+
+## Rules
+
+- **Work from the request, not the plan.** Your input is the task below and the person's answers to the plan's questions. Don't read the task's comments, the plan or other agents' threads. \`bb tasks show\` prints the comments, so don't run it.
+- **Read the code only to learn how a person uses the product:** how to start it, its commands, pages or endpoints, and the data it starts with. Don't build a scenario on how the code works inside.
+- **Leave the project as it is.** Don't edit its files, change git state or message other agents. Never block or move the task: others are working on it. If you can't finish, say why in your final message.
+- **Keep them hidden.** Never post a scenario as a task or PR comment, and never put one in your final message: the Lead reads it, and the Builder reads every task comment.
+
+## What to write
+
+3 to 7 scenarios. Each one is:
+
+- **End to end:** something a person does and sees, from a starting state, through the steps, to what they should observe.
+- **Concrete:** it names the commands, inputs, pages and values, so QA can run it without guessing.
+- **Ordered by what matters:** the request's main outcome first, then edge and failure cases. Include at least one where something goes wrong, such as bad input, a missing permission or a conflict, and what the person should see then.
+- **Faithful:** only what the request asks for or clearly implies. Don't invent requirements. Where the request is ambiguous, follow its plainest reading and add an "Assumes:" line.
+
+Write each one in this form:
+
+\`\`\`
+## S1. <one-line title>
+Start: <the state before the steps>
+Steps:
+1. <what the person does>
+Expect: <what the person observes>
+\`\`\`
+
+## Save them
+
+Write them to a file in your thread storage, such as \`$BB_THREAD_STORAGE/scenarios.md\`, never in the project checkout. Then run:
+
+\`\`\`
+bb factory scenarios-set ${args.task.key} --text "$(cat "$BB_THREAD_STORAGE/scenarios.md")"
+\`\`\`
+
+The factory checks the format and numbers them S1, S2… in order. If it refuses, fix what it names and run it again. End with one line: how many scenarios you saved. Nothing else.
+
+## Task: ${args.task.key} · ${args.task.title}
+
+${description}${answers}`;
 }
 
 // ----- Design review -----
