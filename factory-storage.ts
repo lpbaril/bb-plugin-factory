@@ -78,6 +78,11 @@ export const FACTORY_MIGRATIONS = [
     `DELETE FROM factory_runs;
      DELETE FROM factory_run_cursors;
      ALTER TABLE factory_run_cursors ADD COLUMN usage_seq INTEGER NOT NULL DEFAULT 0;`,
+    // Holdout scenarios get a table of their own, not a factory_records kind: an earlier plugin version
+    // refuses record kinds it doesn't know, but never reads this table, so rolling back keeps factories readable.
+    `CREATE TABLE factory_holdouts (
+       prefix TEXT NOT NULL, position INTEGER NOT NULL, task_key TEXT NOT NULL, payload TEXT NOT NULL,
+       PRIMARY KEY (prefix, position));`,
 ];
 
 /** KV is only a fixed-size locator. Histories grow as rows, never as KV values
@@ -90,6 +95,9 @@ export function createFactoryStorage(storage: BbPluginApi["storage"], parse: (va
   const putMetadata = db.prepare("INSERT INTO factory_metadata VALUES (?, ?) ON CONFLICT(prefix) DO UPDATE SET payload=excluded.payload");
   const putRecord = db.prepare("INSERT INTO factory_records VALUES (?, ?, ?, ?, ?, ?)");
   const clearRecords = db.prepare("DELETE FROM factory_records WHERE prefix = ?");
+  const holdoutRows = db.prepare("SELECT payload FROM factory_holdouts WHERE prefix = ? ORDER BY position");
+  const putHoldout = db.prepare("INSERT INTO factory_holdouts VALUES (?, ?, ?, ?)");
+  const clearHoldouts = db.prepare("DELETE FROM factory_holdouts WHERE prefix = ?");
   const backup = db.prepare("INSERT OR IGNORE INTO factory_legacy_backups VALUES (?, ?, ?)");
   const pointer = (prefix: string) => ({ storageVersion: 2, prefix });
   const isPointer = (value: unknown, prefix: string) =>
@@ -101,12 +109,13 @@ export function createFactoryStorage(storage: BbPluginApi["storage"], parse: (va
     const { agents, prs, plans, holdouts, ...rest } = factory;
     putMetadata.run(factory.prefix, JSON.stringify(rest));
     clearRecords.run(factory.prefix);
+    clearHoldouts.run(factory.prefix);
     const add = (kind: string, position: number, taskKey: string | null, value: unknown, parent = -1) =>
       putRecord.run(factory.prefix, kind, position, parent, taskKey, JSON.stringify(value));
     agents.forEach((agent, i) => add("agent", i, agent.taskKey, agent));
     plans.forEach((plan, i) => add("plan", i, plan.taskKey, plan));
     // Holdout scenarios get rows of their own: they never ride along in the metadata payload.
-    (holdouts ?? []).forEach((set, i) => add("holdout", i, set.taskKey, set));
+    (holdouts ?? []).forEach((set, i) => putHoldout.run(factory.prefix, i, set.taskKey, JSON.stringify(set)));
     prs.forEach(({ reviews, scans, ...pr }, i) => {
       add("pr", i, pr.taskKey, pr);
       reviews.forEach((review, j) => add("review", j, pr.taskKey, review, i));
@@ -123,13 +132,14 @@ export function createFactoryStorage(storage: BbPluginApi["storage"], parse: (va
       switch (row.kind) {
         case "agent": factory.agents[row.position] = value; break;
         case "plan": factory.plans[row.position] = value; break;
-        case "holdout": (factory.holdouts ??= [])[row.position] = value; break;
         case "pr": factory.prs[row.position] = { ...value, reviews: [], scans: [] }; break;
         case "review": factory.prs[row.parent].reviews[row.position] = value; break;
         case "scan": factory.prs[row.parent].scans[row.position] = value; break;
         default: throw new Error(`Unknown factory record kind: ${row.kind}`);
       }
     }
+    const holdouts = (holdoutRows.all(prefix) as { payload: string }[]).map((row) => JSON.parse(row.payload));
+    if (holdouts.length > 0) factory.holdouts = holdouts;
     return parse(factory);
   }
 
@@ -162,6 +172,7 @@ export function createFactoryStorage(storage: BbPluginApi["storage"], parse: (va
     await storage.kv.delete("factory:" + prefix);
     db.transaction(() => {
       clearRecords.run(prefix);
+      clearHoldouts.run(prefix);
       db.prepare("DELETE FROM factory_metadata WHERE prefix = ?").run(prefix);
       db.prepare("DELETE FROM factory_run_cursors WHERE thread_id IN (SELECT thread_id FROM factory_runs WHERE prefix = ?)").run(prefix);
       db.prepare("DELETE FROM factory_runs WHERE prefix = ?").run(prefix);
