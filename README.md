@@ -343,6 +343,26 @@ the Factory page", not as yours, and that's how the Planner hears about them. Ev
 is told never to use `bb plugin rpc` on the factory. That stops one following an
 instruction planted in a PR or an issue, not one determined to get round it.
 
+## CodeRabbit and other review apps
+
+The factory has no CodeRabbit integration, and needs none to run beside it. Rafter is
+a security scanner that feeds the Security reviewer; CodeRabbit is a general reviewer,
+like the factory's own Reviewer 1 and 2. With the CodeRabbit GitHub App installed on the
+repository, it reviews a factory PR like any other: it posts its comments and a check
+named `CodeRabbit`. The same holds for other review apps.
+
+- **Its comments aren't part of the review.** Each factory reviewer works from its own
+  analysis, and the Lead points the Builder at the factory reviewers' findings only. To
+  have a CodeRabbit comment acted on, tell the Lead which one.
+- **Its check can hold a merge.** If the base branch requires checks and `CodeRabbit`
+  isn't one of them, it never holds one. If the base branch requires none, every check
+  counts, so `bb factory merge` and the merge card wait while the `CodeRabbit` check is
+  running and are held if it fails. Name the required checks in the branch's protection
+  rules to keep it out of the gate.
+- **Expect skipped reviews.** CodeRabbit limits reviews per developer per hour, and a
+  factory pushes many fix commits to one PR. What its check reports on a push it
+  skipped for that limit hasn't been tested with the factory.
+
 ## Evidence contract
 
 New factories run with a stricter contract for what counts as done. Existing factories

@@ -21,6 +21,7 @@ Agents use the `bb factory` command: `create`, `start`, `doctor`, `init-specs`, 
 - Accounts for the agent CLIs you pick per role. Agents use their own subscription or API quota.
 - For PR review: a GitHub remote and the `gh` CLI signed in on the project's machine. The factory only reviews same-repository PRs that your `gh` account opened.
 - Optional: a Rafter account (https://rafter.so). Scans send the PR branch to Rafter's servers and use your scan quota, two scans per PR.
+- CodeRabbit and other GitHub review apps run beside the factory without setup. The factory doesn't read their comments; their checks count like any other CI check.
 
 ## Safety
 
