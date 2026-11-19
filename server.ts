@@ -141,6 +141,18 @@ const agentSchema = z.object({
 });
 export type Agent = z.infer<typeof agentSchema>;
 
+/** The start of a Builder's task comment that says it stopped rather than work around a rule or a check. */
+export const STOP_REPORT_MARKER = "Factory stop report:";
+/** A Builder's stop report: recorded, so stops can be counted apart from failures. */
+const stopReportSchema = z.object({
+  taskKey: z.string(),
+  threadId: z.string(),
+  commentId: z.string(),
+  reason: z.string(),
+  at: z.string(),
+});
+export type StopReport = z.infer<typeof stopReportSchema>;
+
 /** "dismissed": a shadow REQUEST CHANGES that the Security reviewer or the person dismissed with a reason. */
 const VERDICTS = ["pending", "approve", "changes", "dismissed"] as const;
 type Verdict = (typeof VERDICTS)[number];
@@ -1073,7 +1085,42 @@ export function computeHealth(prs: readonly Pr[], tokensByTask: ReadonlyMap<stri
     undated: 0,
     tokenProfile: null,
     holdouts: null,
+    stopReports: { reports: 0, tasks: 0, mergedSince: 0 },
   };
+}
+
+/** Builder stop reports filed in a window, and how many of their tasks have merged a PR since the stop. */
+export type StopReportHealth = { reports: number; tasks: number; mergedSince: number };
+
+/**
+ * A stop report is a Builder saying "I can't meet this honestly" instead of gaming a check, so Health
+ * counts them apart from failed turns. Reports are counted when they were filed in [from, until). A
+ * task counts as merged since when one of its PRs merged after its first report in the window; a
+ * merged PR with no close date counts too.
+ */
+export function computeStopReportHealth(reports: readonly StopReport[], prs: readonly Pick<Pr, "taskKey" | "state" | "closedAt">[], from: number | null, until: number | null): StopReportHealth {
+  const first = new Map<string, number>();
+  let counted = 0;
+  for (const report of reports) {
+    const at = Date.parse(report.at);
+    if ((from !== null && !(at >= from)) || (until !== null && !(at < until))) continue;
+    counted += 1;
+    const earlier = first.get(report.taskKey);
+    if (earlier === undefined || at < earlier) first.set(report.taskKey, at);
+  }
+  let mergedSince = 0;
+  for (const [taskKey, at] of first) {
+    const merged = prs.some((pr) => pr.taskKey === taskKey && pr.state === "merged" && (pr.closedAt === null || !(Date.parse(pr.closedAt) < at)));
+    if (merged) mergedSince += 1;
+  }
+  return { reports: counted, tasks: first.size, mergedSince };
+}
+
+/** Health's line for stop reports. */
+export function stopReportHealthLine(health: StopReportHealth): string {
+  if (health.reports === 0) return "Builder stop reports: none";
+  const tasks = `${health.tasks} task${health.tasks === 1 ? "" : "s"}`;
+  return `Builder stop reports: ${health.reports} on ${tasks}; ${health.mergedSince} of ${health.tasks === 1 ? "that task" : "those tasks"} merged since`;
 }
 
 /**
@@ -1278,6 +1325,8 @@ const factorySchema = z.object({
   holdouts: z.array(holdoutSetSchema).default([]),
   /** A Planner's or Explorer's advice to close a task, which only the person can act on. */
   closeAdvice: z.record(z.string(), z.object({ role: z.enum(["plan", "explore"]), threadId: z.string(), commentId: z.string(), at: z.string() })).default({}),
+  /** Each time a Builder stopped and reported instead of working around a rule, a check or a criterion. */
+  stopReports: z.array(stopReportSchema).default([]),
 });
 export type Factory = z.infer<typeof factorySchema>;
 
@@ -1384,6 +1433,8 @@ const factoryHealthSchema = z.object({
   tokenProfile: tokenProfileSchema.nullable().default(null),
   /** QA's first run of each task's holdout scenarios, for runs that started in the window. */
   holdouts: holdoutHealthSchema.nullable().default(null),
+  /** Builder stop reports filed in the window. */
+  stopReports: z.object({ reports: z.number(), tasks: z.number(), mergedSince: z.number() }).default({ reports: 0, tasks: 0, mergedSince: 0 }),
 });
 export type FactoryHealth = z.infer<typeof factoryHealthSchema>;
 
@@ -2598,6 +2649,7 @@ export default async function plugin(bb: BbPluginApi) {
       tracks: {},
       explorations: [],
       closeAdvice: {},
+      stopReports: [],
       designReviewEnabled: true,
       designRounds: [],
       designReviews: {},
@@ -4217,6 +4269,46 @@ export default async function plugin(bb: BbPluginApi) {
     if (reason !== null) await comment(task.id, `${blocked ? "**Blocked:**" : "**Unblocked:**"} ${reason}`);
     bb.realtime.publish(BOARD_CHANGED, { prefix: factory.prefix });
     return updated;
+  }
+
+  /**
+   * A Builder's sanctioned exit: it couldn't meet a rule, a check or a criterion honestly, so it stops
+   * and says so instead of working around it. Recorded so Health can count stops apart from failures,
+   * and the Lead is told how to route it. Filing the same comment twice records it once.
+   */
+  async function recordStopReport(taskKey: string, commentId: string, reason: string, threadId: string | null): Promise<Task> {
+    return withTaskLock(taskKey, async () => {
+      const task = await getTaskByKey(taskKey);
+      const factory = await factoryForTaskKey(task.key);
+      const builder = factory.agents.filter((agent) => agent.role === "build" && agent.taskKey === task.key).at(-1);
+      if (threadId === null || builder?.threadId !== threadId) {
+        throw new PluginCliError(`Only the latest Builder the factory started for ${task.key} can file a stop report.`, {
+          code: "not_the_builder", hint: "To block the task for another reason, leave out --stop-report.",
+        });
+      }
+      const { comments } = await tasksRpc("listComments", { taskId: task.id }, z.object({ comments: z.array(commentSchema) }));
+      const document = comments.find((entry) => entry.id === commentId && entry.kind === "agent" && entry.threadId === threadId);
+      if (document === undefined || !document.body.startsWith(STOP_REPORT_MARKER)) {
+        throw new PluginCliError(`Post a task comment from this Builder that starts with "${STOP_REPORT_MARKER}" first.`, { code: "stop_report_comment" });
+      }
+      const now = new Date().toISOString();
+      let added = false;
+      await mutateFactory(factory.prefix, (current) => {
+        added = !current.stopReports.some((entry) => entry.threadId === threadId && entry.commentId === document.id);
+        if (added) current.stopReports.push({ taskKey: task.key, threadId, commentId: document.id, reason: reason.slice(0, 500), at: now });
+      });
+      const updated = await setBlocked(task.key, true, added ? `Builder stop report (comment \`${document.id}\`): ${reason}` : null);
+      if (added) {
+        const told = await tellLead(factory, [
+          `[factory] ${task.key}: the Builder filed a stop report (task comment \`${document.id}\`): ${asSentence(reason)} The task is Blocked.`,
+          "This is a valid result, not a failure: the Builder stopped instead of working around a rule or a check.",
+          "Read the comment, then take a conflict with the plan, a rule or the acceptance criteria to the Planner, and a product, scope or budget choice to the person.",
+          `Don't send the Builder back to try again until one of them has changed something. Then run \`bb factory unblock ${task.key} --note "<what changed>"\` and tell the Builder, or assign a fresh one.`,
+        ].join(" "));
+        if (!told) bb.log.warn(`could not tell the Lead about the stop report on ${task.key}`);
+      }
+      return updated;
+    });
   }
 
   async function moveTask(factory: Factory, taskId: string, column: Column): Promise<Task> {
@@ -6326,6 +6418,7 @@ ${findings}`;
       // Every PR, not just the window's: a task's outcome is what became of it, whenever its PR opened.
       tokenProfile: computeTokenProfile(factoryStorage.tokenTurns(factory.prefix, from, until), factory.prs),
       holdouts: computeHoldoutHealth(factory.holdouts, from, until),
+      stopReports: computeStopReportHealth(factory.stopReports, factory.prs, from, until),
     };
   }
 
@@ -6343,6 +6436,7 @@ ${findings}`;
       `  Tokens per merged task, excluding cached: ${measure(health.tokensPerMergedTask, (value) => number(Math.round(value)))}`,
       ...(health.undated === 0 ? [] : [`  Left out: ${health.undated} PR(s) with no open date, which can't be placed in the window.`]),
       ...(health.holdouts === null ? [] : [`  ${holdoutHealthLine(health.holdouts)}`]),
+      `  ${stopReportHealthLine(health.stopReports)}`,
       ...(health.tokenProfile === null ? [] : ["", ...formatTokenProfile(health.tokenProfile, window)]),
     ].join("\n");
   }
@@ -7870,8 +7964,19 @@ ${findings}`;
         block: cliCommand({
           summary: "Mark a task Blocked, with the reason",
           positionals: [{ name: "task", description: "Task key", required: true }],
-          options: { reason: { type: "string", required: true, description: "What is needed to continue" } },
-          async run(input) {
+          options: {
+            reason: { type: "string", required: true, description: "What is needed to continue" },
+            "stop-report": { type: "string", description: `The task's Builder only: ID of your task comment starting with "${STOP_REPORT_MARKER}", when you stop rather than work around a rule or a check` },
+          },
+          async run(input, ctx) {
+            // One line: it goes into the task's Blocked comment and the message to the Lead.
+            const reason = input.options.reason.replace(/\s+/g, " ").trim();
+            const stopReport = input.options["stop-report"]?.trim();
+            if (stopReport !== undefined) {
+              if (stopReport === "" || reason === "") throw new PluginCliError("A stop report needs its comment ID and a one-line --reason.", { code: "stop_report_input" });
+              const task = await recordStopReport(input.positionals.task, stopReport, reason, ctx.threadId ?? null);
+              return { exitCode: 0, stdout: `${task.key} is Blocked and your stop report is recorded. Stop here: a stop report is a valid result, and the Lead takes it from here.` };
+            }
             const task = await setBlocked(input.positionals.task, true, input.options.reason);
             return { exitCode: 0, stdout: `${task.key} is Blocked.` };
           },
