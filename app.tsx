@@ -1108,6 +1108,12 @@ function HealthDialog({ open, prefix, onClose }: { open: boolean; prefix: string
             sample: `${health.holdouts.passed + health.holdouts.failed} scenarios, ${health.holdouts.tasks} task${health.holdouts.tasks === 1 ? "" : "s"}`,
             note: `Checks the Builder never saw, so they measure the work better than its own tests.${health.holdouts.invalid === 0 ? "" : ` ${health.holdouts.invalid} marked invalid aren't counted.`} Runs that started in the window.`,
           }]),
+          {
+            label: "Builder stop reports",
+            value: String(health.stopReports.reports),
+            sample: `${health.stopReports.tasks} task${health.stopReports.tasks === 1 ? "" : "s"}, ${health.stopReports.mergedSince} merged since`,
+            note: "A Builder that couldn't meet a rule or a check honestly, and said so instead of working around it. Not a failure. Reports filed in the window.",
+          },
         ];
   return (
     <Dialog open={open} onOpenChange={(next) => { if (!next) onClose(); }}>

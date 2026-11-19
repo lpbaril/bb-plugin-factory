@@ -100,6 +100,18 @@ requested changes the Lead involves the Planner, and after 5 it brings the PR to
 If a PR the factory marked ready stops qualifying, the factory puts it back to draft and marks it
 ready again once that's resolved. Don't merge a draft or mark it ready by hand to get around this.
 
+## Stop reports
+
+If you're a Builder and an acceptance criterion, a rule or a check (a test, the type check, lint,
+a size or performance budget) can't be met after honest attempts, don't work around it: never
+weaken, skip or delete a test, change a threshold, switch off a check, or bend code to pass a
+check. Commit what you have without pushing, post a task comment starting "Factory stop report:"
+with what can't be met, the exact numbers or error output, what you tried and the options you
+see, then run `bb factory block APP-12 --stop-report <comment-id> --reason "<one line>"` and
+stop. That's a valid result, not a failure. If you're the Lead, read the comment, take a conflict
+with the plan, a rule or the criteria to the Planner and a product, scope or budget choice to the
+person, and don't send the Builder back until something has changed.
+
 ## Holdout scenarios
 
 `bb factory holdouts APP` shows whether this factory has them. They're on for new factories.
@@ -206,6 +218,7 @@ skip docs-only changes. PRs stay drafts until every reviewer approves, so
 | `bb factory shadow compare [--now]` | Start the shadow reviewer comparison if its condition is met, or say what it waits for. |
 | `bb factory shadow backfill APP-12` | Add an already-reviewed open PR to the shadow reviewer trial. |
 | `bb factory block APP-12 --reason "..."` | Mark the task Blocked and record why. |
+| `bb factory block APP-12 --stop-report <comment-id> --reason "..."` | Task's latest Builder only: record a stop report, a task comment starting "Factory stop report:", block the task and tell the Lead. |
 | `bb factory unblock APP-12 [--note "..."]` | Clear Blocked. |
 | `bb factory status [APP]` | Print the board, the agents on each task, and each task's branch or PR with its verdicts. |
 

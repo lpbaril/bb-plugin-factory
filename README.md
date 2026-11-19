@@ -114,6 +114,19 @@ Builders receive the canonical comment reference, accessible from their worktree
 This gate does not stop an already-running Builder; the Lead must pause or steer
 it when replanning. Child tasks need explicit references to their parent plan.
 
+### Stop reports
+
+A Builder that can't meet an acceptance criterion, a rule or a check (a test, the type check,
+lint, a size or performance budget) after honest attempts is told to stop, not to work around it.
+It commits what it has without pushing, posts a task comment starting "Factory stop report:" with
+what can't be met, the exact numbers, what it tried and the options it sees, then runs
+`bb factory block APP-12 --stop-report <comment-id> --reason "<one line>"`. Only the task's
+latest Builder can file one. The task goes Blocked, and the factory tells the Lead to take a
+conflict with the plan, a rule or the criteria to the Planner, and a product, scope or budget
+choice to you, and not to send the Builder back until something has changed. A stop report is a
+valid result, so Health counts it apart from failed turns. This applies to every factory. It's a
+rule the Builder is given, not a check: nothing detects a workaround the Builder doesn't report.
+
 ## Tracks and exploration
 
 Each task gets a track that decides its path before the production line. The Lead
@@ -377,7 +390,8 @@ skipped, and the Lead is told.
 Open **Health** on the Factory page, or run `bb factory health APP [--json]`, to see how
 much rework PRs take: review rounds per merged PR, how often changes are requested, time
 from open to ready, tokens per merged task excluding cached input, PRs closed without
-merging, and how many holdout scenarios passed on QA's first run. Each number shows its sample size, because a small history can swing on one PR.
+merging, how many holdout scenarios passed on QA's first run, and how many stop reports
+Builders filed, with how many of those tasks have merged since. Each number shows its sample size, because a small history can swing on one PR.
 PRs from before this view estimate time to ready from their last approval on the head.
 
 To compare before and after a change, such as turning on the evidence contract, count only

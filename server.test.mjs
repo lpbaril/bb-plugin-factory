@@ -6688,3 +6688,126 @@ test('the Scenario writer is left out of status and the run ledger, where agents
   assert.ok(runs.includes('"role":"scenarios"'), 'its turns still count');
   assert.ok(!runs.includes('thr_writer'));
 });
+
+// ----- Builder stop reports -----
+const { computeStopReportHealth, stopReportHealthLine } = await import('./server.ts');
+
+const stopComment = { id: 'stop', kind: 'agent', authorName: 'Builder', threadId: 'thr_builder', createdAt: '', body: 'Factory stop report: the bundle is 12 KB over its 250 KB budget.\n\nTried: code splitting, dropping the date library.\nOptions: raise the budget, or cut the chart.' };
+const stopArgs = ['block', 'TEST-1', '--stop-report', 'stop', '--reason', 'The bundle is 12 KB\n  over its budget '];
+const stopFixture = async (t, initial = {}) => {
+  const updates = [];
+  const posted = [];
+  const fx = await fixture(t, false, initial, { tasksRpc: async ({ method, input }) => {
+    if (method === 'createComment') posted.push(input.body);
+    if (method === 'updateTask') {
+      updates.push(input);
+      return { ok: true, task: { id: 'task_1', key: 'TEST-1', projectId: 'tracker', title: 'Test', description: '', status: 'in_progress', priority: 'none', position: 0, labelIds: input.labelIds ?? [], createdAt: '', updatedAt: '' } };
+    }
+    return undefined;
+  } });
+  return { ...fx, updates, posted };
+};
+
+test('the Builder is given a sanctioned stop, and the Lead\'s brief calls a stop report a valid result', () => {
+  const brief = workerPrompt({ role: 'build', factoryName: 'F', prefix: 'T', task: { key: 'T-1', title: 't', description: 'd' }, instructions: null, builderThreadId: null });
+  assert.match(brief, /Stopping is a valid result/);
+  assert.match(brief, /never weaken, skip or delete a test, change a threshold, switch off a check/);
+  assert.match(brief, /task comment starting "Factory stop report:"/);
+  assert.match(brief, /bb factory block <KEY> --stop-report <comment-id> --reason/);
+  const reminder = workerReminder({ role: 'build', factoryName: 'F', taskKey: 'T-1' });
+  assert.match(reminder, /never work around it/);
+  assert.match(reminder, /--stop-report/);
+  for (const role of ['qa', 'review1', 'plan']) {
+    assert.doesNotMatch(workerPrompt({ role, factoryName: 'F', prefix: 'T', task: { key: 'T-1', title: 't', description: 'd' }, instructions: null, builderThreadId: null, pr: { number: 7, url: 'u' } }), /--stop-report/, role);
+  }
+  const lead = leadPrompt({ factoryName: 'F', prefix: 'T', goal: null });
+  assert.match(lead, /files a stop report and the task goes Blocked\. That's a valid result, not a failure/);
+  assert.match(lead, /Never tell a Builder to get around the obstacle/);
+  // The charter has no room for it under bb's limit: the factory's message carries the routing when a report is filed.
+  const everything = { evidenceContract: true, tracks: true, designReview: true, holdouts: true };
+  assert.ok(workerReminder({ role: 'build', factoryName: 'A factory name of forty characters long', taskKey: 'ABCDEFGH-1234', ...everything }).length < 4096);
+});
+
+test('only the task\'s latest Builder can file a stop report, from its own comment', async t => {
+  const agents = [
+    { threadId: 'thr_old', role: 'build', taskKey: 'TEST-1', providerId: 'codex', createdAt: '', pr: null },
+    { threadId: 'thr_builder', role: 'build', taskKey: 'TEST-1', providerId: 'codex', createdAt: '', pr: null },
+    { threadId: 'thr_qa', role: 'qa', taskKey: 'TEST-1', providerId: 'codex', createdAt: '', pr: null },
+  ];
+  const { bb, harness, comments, updates, messages } = await stopFixture(t, { agents });
+  comments.push(stopComment, { ...stopComment, id: 'plain', body: 'I am stuck on the bundle size.' }, { ...stopComment, id: 'other', threadId: 'thr_qa' });
+  for (const threadId of ['thr_lead', 'thr_old', 'thr_qa', undefined]) {
+    const denied = await harness.behavior.runCli(stopArgs, threadId === undefined ? {} : { threadId });
+    assert.notEqual(denied.exitCode, 0, String(threadId));
+    assert.match(denied.stderr, /Only the latest Builder the factory started for TEST-1 can file a stop report/);
+  }
+  for (const id of ['missing', 'plain', 'other']) {
+    const refused = await harness.behavior.runCli(['block', 'TEST-1', '--stop-report', id, '--reason', 'Over budget'], { threadId: 'thr_builder' });
+    assert.match(refused.stderr, /starts with "Factory stop report:" first/, id);
+  }
+  assert.match((await harness.behavior.runCli(['block', 'TEST-1', '--stop-report', 'stop', '--reason', '  '], { threadId: 'thr_builder' })).stderr, /needs its comment ID and a one-line --reason/);
+  assert.deepEqual(updates, []);
+  assert.deepEqual(messages, []);
+  assert.deepEqual((await createFactoryStorage(bb.storage, value => value).read('TEST')).stopReports ?? [], []);
+});
+
+test('a stop report blocks the task, is recorded once and tells the Lead how to route it', async t => {
+  const { bb, harness, comments, updates, posted, messages } = await stopFixture(t);
+  comments.push(stopComment);
+  const filed = await harness.behavior.runCli(stopArgs, { threadId: 'thr_builder' });
+  assert.equal(filed.exitCode, 0, JSON.stringify(filed));
+  assert.match(filed.stdout, /TEST-1 is Blocked and your stop report is recorded/);
+  assert.deepEqual(updates.map(update => update.labelIds), [['blocked']]);
+  assert.deepEqual(posted, ['**Blocked:** Builder stop report (comment `stop`): The bundle is 12 KB over its budget']);
+  const [report, ...rest] = (await createFactoryStorage(bb.storage, value => value).read('TEST')).stopReports;
+  assert.deepEqual(rest, []);
+  assert.deepEqual({ ...report, at: null }, { taskKey: 'TEST-1', threadId: 'thr_builder', commentId: 'stop', reason: 'The bundle is 12 KB over its budget', at: null });
+  assert.ok(Number.isFinite(Date.parse(report.at)));
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0].threadId, 'thr_lead');
+  const told = messages[0].input[0].text;
+  assert.match(told, /^\[factory\] TEST-1: the Builder filed a stop report \(task comment `stop`\): The bundle is 12 KB over its budget\. The task is Blocked\./);
+  assert.match(told, /valid result, not a failure/);
+  assert.match(told, /to the Planner, and a product, scope or budget choice to the person/);
+  assert.match(told, /bb factory unblock TEST-1 --note/);
+  // Filing the same comment again changes nothing but the label, which the test's task never keeps.
+  assert.equal((await harness.behavior.runCli(stopArgs, { threadId: 'thr_builder' })).exitCode, 0);
+  assert.equal((await createFactoryStorage(bb.storage, value => value).read('TEST')).stopReports.length, 1);
+  assert.equal(messages.length, 1);
+  assert.equal(posted.length, 1);
+  assert.match((await harness.behavior.runCli(['health', 'TEST'])).stdout, /Builder stop reports: 1 on 1 task; 0 of that task merged since/);
+});
+
+test('a plain block needs no Builder and records no stop report', async t => {
+  const { bb, harness, updates, posted, messages } = await stopFixture(t);
+  const blocked = await harness.behavior.runCli(['block', 'TEST-1', '--reason', 'Waiting for the API key'], { threadId: 'thr_lead' });
+  assert.equal(blocked.exitCode, 0, JSON.stringify(blocked));
+  assert.equal(blocked.stdout, 'TEST-1 is Blocked.');
+  assert.deepEqual(updates.map(update => update.labelIds), [['blocked']]);
+  assert.deepEqual(posted, ['**Blocked:** Waiting for the API key']);
+  assert.deepEqual(messages, []);
+  assert.deepEqual((await createFactoryStorage(bb.storage, value => value).read('TEST')).stopReports ?? [], []);
+  assert.match((await harness.behavior.runCli(['health', 'TEST'])).stdout, /Builder stop reports: none/);
+});
+
+test('health: stop reports count in their window, with the tasks that merged since', () => {
+  const report = (taskKey, at) => ({ taskKey, threadId: 'thr', commentId: `c-${at}`, reason: 'r', at });
+  const reports = [report('A', '2026-11-10T10:00:00Z'), report('A', '2026-11-12T10:00:00Z'), report('B', '2026-11-11T10:00:00Z'), report('C', '2026-11-20T10:00:00Z'), report('D', '2026-11-11T12:00:00Z')];
+  const prs = [
+    { taskKey: 'A', state: 'merged', closedAt: '2026-11-13T00:00:00Z' },
+    // Merged before B's Builder stopped: an earlier PR of the task, not what came of the stop.
+    { taskKey: 'B', state: 'merged', closedAt: '2026-11-01T00:00:00Z' },
+    { taskKey: 'C', state: 'open', closedAt: null },
+    { taskKey: 'D', state: 'merged', closedAt: null },
+  ];
+  assert.deepEqual(computeStopReportHealth(reports, prs, null, null), { reports: 5, tasks: 4, mergedSince: 2 });
+  const from = Date.parse('2026-11-11T00:00:00Z');
+  const until = Date.parse('2026-11-15T00:00:00Z');
+  assert.deepEqual(computeStopReportHealth(reports, prs, from, until), { reports: 3, tasks: 3, mergedSince: 2 });
+  assert.deepEqual(computeStopReportHealth(reports, prs, null, Date.parse('2026-11-10T00:00:00Z')), { reports: 0, tasks: 0, mergedSince: 0 });
+  assert.deepEqual(computeStopReportHealth([], prs, null, null), { reports: 0, tasks: 0, mergedSince: 0 });
+  assert.equal(stopReportHealthLine({ reports: 0, tasks: 0, mergedSince: 0 }), 'Builder stop reports: none');
+  assert.equal(stopReportHealthLine({ reports: 1, tasks: 1, mergedSince: 1 }), 'Builder stop reports: 1 on 1 task; 1 of that task merged since');
+  assert.equal(stopReportHealthLine({ reports: 5, tasks: 4, mergedSince: 2 }), 'Builder stop reports: 5 on 4 tasks; 2 of those tasks merged since');
+  assert.deepEqual(computeHealth([], new Map()).stopReports, { reports: 0, tasks: 0, mergedSince: 0 });
+});
