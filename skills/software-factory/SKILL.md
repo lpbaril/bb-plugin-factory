@@ -124,6 +124,17 @@ run at that commit, or while the writer is at work. Report a failure as a sympto
 scenario into a comment, a message or a PR. If you're the Lead or a Builder, don't ask for them
 or look for them.
 
+## Merge risk
+
+`bb factory risk-summary APP` shows whether this factory rates merge risk. It's on for new
+factories. Once a PR is ready, the factory rates Impact, Rollback, Verification and Error
+detection, Low, Medium or High, and shows them on the merge card, as a PR comment and with
+`bb factory risk APP-12`. When the diff touches sensitive paths, migrations, dependencies or
+deploy config, or is large, it starts a Risk reviewer, which records its three ratings with
+`bb factory risk APP-12 --impact <level> --impact-why "..." --rollback <level> --rollback-why "..."
+--errors <level> --errors-why "..."`. It's informational: it doesn't change who may merge. If
+you're the Lead, you don't start or wait for the Risk reviewer.
+
 ## Recurring review findings
 
 Reviewers (not the shadow): when a repository rule would have prevented a blocking
@@ -197,6 +208,8 @@ skip docs-only changes. PRs stay drafts until every reviewer approves, so
 | `bb factory qa APP-12 --verdict pass\|fail --sha <commit> [--pr N]` | Latest QA thread only: record QA's verdict on the task's PR. |
 | `bb factory qa-skip APP-12 --reason "..." [--pr N]` | Lead or person: record why the open PR's current commit doesn't need QA. Only the person can skip QA once it's been assigned on the task. |
 | `bb factory evidence-contract APP [on\|off]` | Show the evidence contract, or set it (person only). |
+| `bb factory risk APP-12 [--pr N]` | Show the PR's merge-risk summary. The Risk reviewer the factory started for the PR's latest commit records its ratings with `--impact`, `--rollback` and `--errors` (each low, medium or high) and a `-why` line for each. |
+| `bb factory risk-summary APP [on\|off]` | Show whether ready PRs get a merge-risk summary, or set it (person only). |
 | `bb factory holdouts APP [on\|off]` | Show whether a Scenario writer drafts holdout scenarios for QA, or set it (person only). |
 | `bb factory scenarios APP-12 [--json]` | The task's latest QA thread, or the person: show its holdout scenarios and QA's latest results. |
 | `bb factory scenarios-set APP-12 --text "..."` | The task's Scenario writer, once, or the person: save the scenarios, each under a `## S1. <title>` heading. A person's save is a new version, and earlier results stop counting. |

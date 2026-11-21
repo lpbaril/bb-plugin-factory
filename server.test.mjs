@@ -10,7 +10,8 @@ registerHooks({ resolve(specifier, context, next) {
   }
   return next(specifier, context);
 } });
-const { default: plugin, computePreset, computeTokenProfile, designRoundLenses, currentDesignReview, asSentence, PAGE_NOTICE_TIMEOUT_MS, leadCompactionDue, leadCompactBackoffMs, LEAD_COMPACT_COOLDOWN_MS, parsePersonQuestions, personQuestionsGate, parseDesignFindings, planSensitivePaths, designRoundState, designGate, trackGate, parseApproaches, exploreAssignment, readRecommendation, sectionText, supervisorAction, turnsFromEvents, creditUsage, mergeBlockers, sortChecks, latestRuns, mergeOverlapNote, migrateQaResults, qaCarryNote, leadMayMerge, rosterWarnings, computeHealth, parseDay, prsOpenedBetween, qaHold, qaNextStep, parseCoverage, changeRounds, fixLoopAdvice, holdoutGate, holdoutSummary, holdoutLine, computeHoldoutHealth, holdoutHealthLine, holdoutWriterLost, HOLDOUT_WRITER_LOST_MS, holdoutQuotes } = await import('./server.ts');
+const { default: plugin, computePreset, computeTokenProfile, designRoundLenses, currentDesignReview, asSentence, PAGE_NOTICE_TIMEOUT_MS, leadCompactionDue, leadCompactBackoffMs, LEAD_COMPACT_COOLDOWN_MS, parsePersonQuestions, personQuestionsGate, parseDesignFindings, planSensitivePaths, designRoundState, designGate, trackGate, parseApproaches, exploreAssignment, readRecommendation, sectionText, supervisorAction, turnsFromEvents, creditUsage, mergeBlockers, sortChecks, latestRuns, mergeOverlapNote, migrateQaResults, qaCarryNote, leadMayMerge, rosterWarnings, computeHealth, parseDay, prsOpenedBetween, qaHold, qaNextStep, parseCoverage, changeRounds, fixLoopAdvice, holdoutGate, holdoutSummary, holdoutLine, computeHoldoutHealth, holdoutHealthLine, holdoutWriterLost, HOLDOUT_WRITER_LOST_MS, holdoutQuotes, computeRiskHealth, riskHealthLine } = await import('./server.ts');
+const { riskFacts, riskFlags, riskSummary, overallRisk, verificationRating, cleanRiskReason, riskComment, RISK_REASON_MAX } = await import('./risk.ts');
 const { shareBarWidth, sharePercent } = await import('./token-profile.ts');
 const { leadCharter, leadPrompt, reReviewMessage, workerPrompt, workerReminder, designReviewPrompt, parseHoldoutScenarios, formatHoldoutScenarios, scenarioWriterPrompt, WORKER_ROLE_IDS } = await import('./roles.ts');
 const { holdoutCounts, holdoutPassRate } = await import('./holdout-text.ts');
@@ -3603,16 +3604,25 @@ async function reopenFixture(t, pr, initial = {}, live = { isDraft: false }) {
 const FULL_A = 'a'.repeat(40);
 const FULL_B = 'b'.repeat(40);
 const readyForPerson = (over = {}) => prRecord({ headSha: FULL_A, isDraft: false, readyRequested: true, readySha: FULL_A, approvedNotifiedSha: FULL_A, reviews: bothApprove(FULL_A), ...over });
-const cardFixture = async (t, { prs = [readyForPerson()], initial = {}, live = null, settings = {}, unlistedState = () => 'OPEN', checks = () => greenChecks, mergeHead = () => FULL_A, mergeable = () => 'MERGEABLE', required = () => null, mergeState = () => 'CLEAN', threads = null, commits = () => [FULL_A] } = {}) => {
+const cardFixture = async (t, { prs = [readyForPerson()], initial = {}, live = null, settings = {}, unlistedState = () => 'OPEN', checks = () => greenChecks, mergeHead = () => FULL_A, mergeable = () => 'MERGEABLE', required = () => null, mergeState = () => 'CLEAN', threads = null, commits = () => [FULL_A], riskFiles = null, threadStatus = null } = {}) => {
   const ghCalls = [];
+  const ghComments = [];
   const sent = [];
   const posted = [];
   const listed = live ?? prs.map(pr => ({ number: pr.number, url: pr.url, headRefName: pr.branch, headRefOid: pr.headSha, isDraft: pr.isDraft }));
   const result = await fixture(t, false, { repo: 'owner/repo', prs, ...initial }, {
-    threads: { list: async () => threads ?? [{ id: 'thr_builder', environmentBranchName: 'build' }, { id: 'thr_builder2', environmentBranchName: 'other' }] },
+    threads: {
+      list: async () => threads ?? [{ id: 'thr_builder', environmentBranchName: 'build' }, { id: 'thr_builder2', environmentBranchName: 'other' }],
+      // Only risk tests read a thread's status; the others keep the fixture's.
+      ...(threadStatus === null ? {} : { get: async ({ threadId }) => ({ ...makeThreadResponse({ id: threadId, environmentId: 'env_builder' }), status: threadStatus(threadId) }) }),
+    },
     hostRpc: async ({ input }) => {
       ghCalls.push(input.args);
+      if (input.args[1] === 'comment') ghComments.push(input.stdin ?? '');
       if (input.args[1] === 'list') return { code: 0, stderr: '', stdout: ghList(typeof listed === 'function' ? listed() : listed) };
+      if (input.args[1] === 'view' && input.args.at(-1) === 'files,headRefOid' && riskFiles !== null) {
+        return { code: 0, stderr: '', stdout: JSON.stringify({ headRefOid: FULL_A, files: riskFiles }) };
+      }
       if (input.args[1] === 'view' && input.args.at(-1) === 'state,isDraft,headRefOid,mergeable,mergeStateStatus,statusCheckRollup') {
         return { code: 0, stderr: '', stdout: JSON.stringify(liveView({ headRefOid: mergeHead(), statusCheckRollup: checks(), mergeStateStatus: mergeState() })) };
       }
@@ -3638,7 +3648,7 @@ const cardFixture = async (t, { prs = [readyForPerson()], initial = {}, live = n
   await result.harness.behavior.setSettings({ prReviews: true, ...settings });
   const cards = () => result.harness.behavior.pendingInteractions.filter(entry => entry.rendererId === 'merge-review');
   const merge = (headSha = FULL_A, options = {}, number = 7) => result.harness.behavior.callRpc('merge_from_card', { prefix: 'TEST', pr: number, headSha }, options);
-  return { ...result, ghCalls, sent, posted, cards, merge, merges: () => ghCalls.filter(args => args[1] === 'merge') };
+  return { ...result, ghCalls, ghComments, sent, posted, cards, merge, merges: () => ghCalls.filter(args => args[1] === 'merge') };
 };
 
 test('a PR ready for the person gets a merge card in the Lead\'s chat, and one notification', async t => {
@@ -5345,7 +5355,7 @@ test('bb factory agents preset previews each seat with why, and only the person 
   assert.match(agent.stderr, /Only the person can change which model an agent runs on/);
   assert.equal((await roles()).qa.reasoningLevel, 'high');
   const applied = await harness.behavior.runCli(['agents', 'preset', 'lower-cost', '--apply']);
-  assert.equal(applied.stdout, 'Applied the Lower cost preset to Lead, Explorer, QA, Design reviewer, Scenario writer.', 'the ticked seats, no reviewer seat');
+  assert.equal(applied.stdout, 'Applied the Lower cost preset to Lead, Explorer, QA, Design reviewer, Scenario writer, Risk reviewer.', 'the ticked seats, no reviewer seat');
   const after = await roles();
   assert.equal(after.qa.reasoningLevel, 'low');
   assert.deepEqual(after.review1, liveRoster().review1, 'a reviewer seat isn\'t applied unless named');
@@ -5851,7 +5861,7 @@ test('roster changes and a factory deleted from the page tell the person', async
   const preview = await fx2.harness.behavior.callRpc('agents_preset_preview', { preset: 'lower-cost' });
   const seats = preview.seats.filter(entry => entry.ticked).map(entry => ({ key: entry.key, proposed: entry.proposed }));
   await fx2.harness.behavior.callRpc('agents_preset_apply', { preset: 'lower-cost', seats });
-  assert.match(notices.at(-1).body, /^The Lower cost preset was applied on the settings page to Lead, Explorer, QA, Design reviewer, Scenario writer\./);
+  assert.match(notices.at(-1).body, /^The Lower cost preset was applied on the settings page to Lead, Explorer, QA, Design reviewer, Scenario writer, Risk reviewer\./);
   const before = notices.length;
   await fx2.harness.behavior.callRpc('factory_delete', { prefix: 'TEST', deleteTasks: false, archiveThreads: false });
   assert.equal(notices.length, before + 1);
@@ -6810,4 +6820,214 @@ test('health: stop reports count in their window, with the tasks that merged sin
   assert.equal(stopReportHealthLine({ reports: 1, tasks: 1, mergedSince: 1 }), 'Builder stop reports: 1 on 1 task; 1 of that task merged since');
   assert.equal(stopReportHealthLine({ reports: 5, tasks: 4, mergedSince: 2 }), 'Builder stop reports: 5 on 4 tasks; 2 of those tasks merged since');
   assert.deepEqual(computeHealth([], new Map()).stopReports, { reports: 0, tasks: 0, mergedSince: 0 });
+});
+
+// ----- Merge risk -----
+
+const riskEvidence = (over = {}) => ({ deep: false, qa: 'pass', qaGate: true, ...over });
+const file = (path, additions = 10, deletions = 2) => ({ path, additions, deletions });
+
+test('risk facts count sensitive, migration, dependency, config and test files', () => {
+  const facts = riskFacts([
+    file('src/auth/session.ts'), file('db/migrations/0012_add.sql'), file('package.json'), file('pnpm-lock.yaml'),
+    file('.github/workflows/ci.yml'), file('src/view.tsx'), file('src/view.test.tsx'), file('docs/guide.md'),
+  ], riskEvidence());
+  assert.equal(facts.files, 8);
+  assert.equal(facts.lines, 96);
+  assert.equal(facts.sensitive, 1, 'migrations and config are counted on their own');
+  assert.equal(facts.migrations, 1);
+  assert.equal(facts.dependencies, 2);
+  assert.equal(facts.config, 1);
+  assert.equal(facts.tests, 1);
+  assert.equal(facts.code, 6, 'tests and docs are not code');
+  assert.deepEqual(riskFlags(facts), ['1 sensitive path', '1 migration or schema file', '2 dependency files', '1 CI, build or infrastructure file']);
+  assert.deepEqual(riskFlags(riskFacts([file('src/view.tsx')], riskEvidence())), [], 'an ordinary change needs no Risk reviewer');
+  assert.deepEqual(riskFlags(riskFacts([file('src/view.tsx')], riskEvidence({ deep: true }))), ['a large diff']);
+});
+
+test('verification comes from QA at this commit and whether code came with tests', () => {
+  const at = (qa, files = [file('src/a.ts'), file('src/a.test.ts')], qaGate = true) => verificationRating(riskFacts(files, riskEvidence({ qa, qaGate })));
+  assert.equal(at('pass').level, 'low');
+  assert.equal(at('pass', [file('src/a.ts')]).level, 'medium', 'code without tests');
+  assert.equal(at('pass', [file('README.md')]).level, 'low', 'no code changed');
+  assert.equal(at('carried').level, 'medium');
+  assert.equal(at('skipped').level, 'medium');
+  assert.equal(at('fail').level, 'high');
+  assert.equal(at('none').level, 'high', 'no QA where QA is the gate');
+  assert.equal(at('none', undefined, false).level, 'medium', 'no QA gate, but tests changed');
+  assert.match(at('pass').reason, /QA passed at this commit; tests changed in 1 file/);
+});
+
+test('the overall level weighs Impact and Verification most, and a High is never Low overall', () => {
+  const line = (category, level) => ({ category, level });
+  assert.equal(overallRisk([line('impact', 'low'), line('rollback', 'low'), line('verification', 'low'), line('errors', null)]), 'low');
+  // (2*2 + 1.5 + 2 + 1) / 6.5 = 1.31
+  assert.equal(overallRisk([line('impact', 'medium'), line('rollback', 'low'), line('verification', 'low'), line('errors', 'low')]), 'low');
+  // (3*2 + 1.5 + 2 + 1) / 6.5 = 1.62
+  assert.equal(overallRisk([line('impact', 'high'), line('rollback', 'low'), line('verification', 'low'), line('errors', 'low')]), 'medium');
+  // Only Rollback high: (2 + 4.5 + 2 + 1) / 6.5 = 1.46, raised to Medium by the floor.
+  assert.equal(overallRisk([line('impact', 'low'), line('rollback', 'high'), line('verification', 'low'), line('errors', 'low')]), 'medium');
+  assert.equal(overallRisk([line('impact', 'high'), line('rollback', 'high'), line('verification', 'medium'), line('errors', 'high')]), 'high');
+});
+
+test('a summary without a review judges Impact and Rollback from the facts and leaves Error detection unjudged', () => {
+  const facts = riskFacts([file('db/migrations/0001.sql'), file('src/a.ts'), file('src/a.test.ts')], riskEvidence());
+  const waiting = riskSummary(facts, null, true);
+  assert.equal(waiting.source, 'unfinished', 'flagged, and no review came back');
+  assert.deepEqual(waiting.lines.map(entry => [entry.category, entry.level]), [['impact', 'medium'], ['rollback', 'high'], ['verification', 'low'], ['errors', null]]);
+  assert.match(waiting.lines[3].reason, /didn't finish in time/);
+  const plain = riskSummary(riskFacts([file('src/a.ts'), file('src/a.test.ts')], riskEvidence()), null, true);
+  assert.equal(plain.source, 'facts');
+  assert.equal(plain.overall, 'low');
+  assert.match(plain.lines[3].reason, /nothing was flagged/);
+  const review = { impact: { level: 'low', reason: 'one view' }, rollback: { level: 'low', reason: 'additive column' }, errors: { level: 'high', reason: 'catch drops the error' } };
+  const reviewed = riskSummary(facts, review, true);
+  assert.equal(reviewed.source, 'review');
+  assert.deepEqual(reviewed.lines.map(entry => entry.level), ['low', 'low', 'low', 'high']);
+  assert.equal(reviewed.overall, 'medium');
+});
+
+test('a Risk reviewer\'s reason is one line, capped, and can\'t mention anyone; the PR comment escapes markdown', () => {
+  assert.equal(cleanRiskReason('ping @owner\n\nnow'), 'ping @​owner now');
+  assert.equal(cleanRiskReason('x'.repeat(500)).length, RISK_REASON_MAX);
+  const summary = riskSummary(riskFacts([file('src/a.ts')], riskEvidence()), { impact: { level: 'low', reason: 'see [link](http://x) `code`' }, rollback: { level: 'low', reason: 'ok' }, errors: { level: 'low', reason: 'ok' } }, true);
+  const comment = riskComment(summary, FULL_A);
+  assert.match(comment, /^\*\*Factory merge risk: (Low|Medium)\*\* at `aaaaaaa`/);
+  assert.match(comment, /see \\\[link\\\]\(http:\/\/x\) \\`code\\`/);
+  assert.match(comment, /doesn't change who may merge/);
+});
+
+test('health counts settled merge-risk summaries in the window', () => {
+  const settled = (overall, source, settledAt) => ({ risk: { overall, source, settledAt } });
+  const health = computeRiskHealth([
+    settled('low', 'facts', '2026-11-20T10:00:00Z'), settled('high', 'review', '2026-11-20T11:00:00Z'), settled('medium', 'unfinished', '2026-11-20T12:00:00Z'),
+    settled('low', 'facts', '2026-11-01T10:00:00Z'), { risk: null }, { risk: { overall: null, source: null, settledAt: null } },
+  ], Date.parse('2026-11-15T00:00:00Z'), null);
+  assert.deepEqual(health, { rated: 3, low: 1, medium: 1, high: 1, reviewed: 1, unfinished: 1 });
+  assert.equal(riskHealthLine(health), 'Merge risk: 3 PR(s) rated, 1 low, 1 medium, 1 high; 1 judged by the Risk reviewer, 1 where it didn\'t finish');
+  assert.equal(riskHealthLine(computeRiskHealth([], null, null)), 'Merge risk: no PRs rated');
+});
+
+test('with nothing flagged, a ready PR gets a facts-only risk summary on its card and one PR comment, and no Risk reviewer', async t => {
+  const { bb, harness, cards, ghComments, spawns } = await cardFixture(t, { initial: { riskSummaryEnabled: true }, riskFiles: [file('src/a.ts', 3, 1), file('src/a.test.ts', 5, 0)], threadStatus: () => 'idle' });
+  await runPasses(harness);
+  assert.equal(spawns.filter(spawn => spawn.pluginMetadata?.role === 'risk').length, 0);
+  assert.equal(cards().length, 1);
+  const risk = cards()[0].payload.risk;
+  assert.equal(risk.source, 'facts');
+  assert.deepEqual(risk.lines.map(entry => entry.label), ['Impact', 'Rollback', 'Verification', 'Error detection']);
+  const stored = (await readPrs(bb))[0].risk;
+  assert.equal(stored.sha, FULL_A);
+  assert.equal(stored.overall, risk.overall);
+  assert.equal(stored.threadId, null);
+  const riskComments = () => ghComments.filter(body => body.startsWith('**Factory merge risk'));
+  assert.equal(riskComments().length, 1);
+  await runPasses(harness);
+  assert.equal(riskComments().length, 1, 'posted once per commit');
+});
+
+test('without the merge-risk summary, the card has no risk and nothing is posted', async t => {
+  const { bb, harness, cards, ghComments } = await cardFixture(t, { riskFiles: [file('src/auth/login.ts')] });
+  await runPasses(harness);
+  assert.equal(cards().length, 1);
+  assert.equal(cards()[0].payload.risk, null);
+  assert.equal((await readPrs(bb))[0].risk ?? null, null);
+  assert.equal(ghComments.filter(body => body.startsWith('**Factory merge risk')).length, 0);
+});
+
+test('a flagged PR starts a Risk reviewer; only its thread can rate, and the card waits for it', async t => {
+  const { bb, harness, cards, ghComments, spawns, messages } = await cardFixture(t, { initial: { riskSummaryEnabled: true }, riskFiles: [file('src/auth/session.ts'), file('src/auth/session.test.ts')], threadStatus: () => 'running' });
+  await runPasses(harness);
+  const reviewer = spawns.find(spawn => spawn.pluginMetadata?.role === 'risk');
+  assert.ok(reviewer, 'a Risk reviewer was started');
+  assert.equal(reviewer.parentNotifications, 'off', 'it reports to nobody');
+  assert.match(reviewer.prompt, /You are the Risk reviewer/);
+  assert.match(reviewer.prompt, /flagged PR #7 at `aaaaaaa` for: 1 sensitive path/);
+  assert.match(reviewer.prompt, /bb factory risk TEST-1 --impact <level>/);
+  assert.equal(reviewer.environment.type, 'reuse', 'in the builder\'s worktree');
+  const threadId = (await readPrs(bb))[0].risk.threadId;
+  assert.match(threadId, /^thr_spawned_/);
+  assert.equal(cards().length, 0, 'the card waits for the rating');
+  const args = ['risk', 'TEST-1', '--impact', 'high', '--impact-why', 'session cookies for every user', '--rollback', 'low', '--rollback-why', 'a revert restores it', '--errors', 'medium', '--errors-why', 'refresh failures are only logged @owner'];
+  const refused = await harness.behavior.runCli(args, { threadId: 'thr_lead' });
+  assert.notEqual(refused.exitCode, 0);
+  assert.match(refused.stderr, /Only the Risk reviewer the factory started/);
+  const missing = await harness.behavior.runCli(['risk', 'TEST-1', '--impact', 'high'], { threadId });
+  assert.notEqual(missing.exitCode, 0);
+  assert.match(missing.stderr, /Give all three ratings/);
+  const recorded = await harness.behavior.runCli(args, { threadId });
+  assert.equal(recorded.exitCode, 0, recorded.stderr);
+  await runPasses(harness);
+  assert.equal(cards().length, 1);
+  const risk = cards()[0].payload.risk;
+  assert.equal(risk.source, 'review');
+  assert.deepEqual(risk.lines.map(entry => entry.level), ['high', 'low', 'medium', 'medium'], 'no QA run here, so Verification is Medium');
+  assert.equal(risk.lines[3].reason, 'refresh failures are only logged @​owner');
+  assert.equal(risk.overall, 'medium');
+  const posted = ghComments.filter(body => body.startsWith('**Factory merge risk'));
+  assert.equal(posted.length, 1);
+  assert.match(posted[0], /\*\*Impact:\*\* High: session cookies for every user/);
+  const again = await harness.behavior.runCli(args, { threadId });
+  assert.notEqual(again.exitCode, 0, 'settled for this commit');
+  assert.match(again.stderr, /already settled/);
+  const shown = await harness.behavior.runCli(['risk', 'TEST-1']);
+  assert.match(shown.stdout, /PR #7 merge risk: Medium/);
+  assert.match(shown.stdout, /Error detection: Medium: refresh failures/);
+  assert.equal(messages.filter(message => /Risk reviewer/.test(message.input?.[0]?.text ?? '')).length, 0, 'the Lead isn\'t told');
+});
+
+test('the card stops waiting when the Risk reviewer runs out of time or ends without rating', async t => {
+  const facts = riskFacts([file('db/migrations/0003.sql')], riskEvidence());
+  const pending = (startedAt) => ({ sha: FULL_A, facts, threadId: 'thr_risk', startedAt, review: null, reviewedAt: null, overall: null, source: null, settledAt: null, commentedAt: null });
+  const late = await cardFixture(t, { prs: [readyForPerson({ risk: pending(new Date(Date.now() - 16 * 60_000).toISOString()) })], initial: { riskSummaryEnabled: true }, threadStatus: () => 'running' });
+  await runPasses(late.harness);
+  assert.equal(late.cards().length, 1);
+  assert.equal(late.cards()[0].payload.risk.source, 'unfinished');
+  assert.equal(late.cards()[0].payload.risk.lines[1].level, 'high', 'a migration is a one-way door on the facts alone');
+  assert.match(late.ghComments.find(body => body.startsWith('**Factory merge risk')), /didn't finish in time/);
+  const ended = await cardFixture(t, { prs: [readyForPerson({ risk: pending(new Date(Date.now() - 2 * 60_000).toISOString()) })], initial: { riskSummaryEnabled: true }, threadStatus: () => 'idle' });
+  await runPasses(ended.harness);
+  assert.equal(ended.cards().length, 1, 'its thread ended without rating');
+  assert.equal(ended.cards()[0].payload.risk.source, 'unfinished');
+  const young = await cardFixture(t, { prs: [readyForPerson({ risk: pending(new Date(Date.now() - 2 * 60_000).toISOString()) })], initial: { riskSummaryEnabled: true }, threadStatus: () => 'running' });
+  await runPasses(young.harness);
+  assert.equal(young.cards().length, 0, 'still inside its time');
+});
+
+test('a new commit gets a new risk summary', async t => {
+  const facts = riskFacts([file('src/a.ts')], riskEvidence());
+  const old = { sha: 'c'.repeat(40), facts, threadId: null, startedAt: '', review: null, reviewedAt: null, overall: 'high', source: 'facts', settledAt: '2026-11-20T00:00:00Z', commentedAt: '2026-11-20T00:00:00Z' };
+  const { bb, harness, ghComments } = await cardFixture(t, { prs: [readyForPerson({ risk: old })], initial: { riskSummaryEnabled: true }, riskFiles: [file('src/a.ts')], threadStatus: () => 'idle' });
+  await runPasses(harness);
+  const risk = (await readPrs(bb))[0].risk;
+  assert.equal(risk.sha, FULL_A);
+  assert.notEqual(risk.overall, null);
+  assert.equal(ghComments.filter(body => body.startsWith('**Factory merge risk')).length, 1);
+});
+
+test('only the person turns the merge-risk summary on or off, from outside an agent thread; the page can only turn it on', async t => {
+  const { bb, harness } = await fixture(t);
+  assert.match((await harness.behavior.runCli(['risk-summary', 'TEST'])).stdout, /merge-risk summary off/);
+  const agent = await harness.behavior.runCli(['risk-summary', 'TEST', 'on'], { threadId: 'thr_lead' });
+  assert.notEqual(agent.exitCode, 0);
+  assert.match(agent.stderr, /Only the person/);
+  assert.equal((await harness.behavior.runCli(['risk-summary', 'TEST', 'on'])).exitCode, 0);
+  const read = () => createFactoryStorage(bb.storage, value => value).read('TEST');
+  assert.equal((await read()).riskSummaryEnabled, true);
+  await assert.rejects(harness.behavior.callRpc('factory_set_option', { prefix: 'TEST', change: { kind: 'riskSummary', enabled: false } }), /risk-summary TEST off/);
+  assert.equal((await harness.behavior.runCli(['risk-summary', 'TEST', 'off'])).exitCode, 0);
+  assert.equal((await read()).riskSummaryEnabled, false);
+});
+
+test('the Risk reviewer brief names its three ratings and leaves verification to the factory', () => {
+  const prompt = workerPrompt({ role: 'risk', factoryName: 'F', prefix: 'TEST', task: { key: 'TEST-1', title: 'T', description: 'D' }, instructions: 'flagged', builderThreadId: null, pr: { number: 7, url: 'https://example.org/7' } });
+  assert.match(prompt, /\*\*Impact:\*\*/);
+  assert.match(prompt, /\*\*Rollback:\*\* can a revert undo it/);
+  assert.match(prompt, /\*\*Error detection:\*\*/);
+  assert.match(prompt, /Don't rate verification/);
+  assert.match(prompt, /doesn't change who may merge/);
+  assert.doesNotMatch(prompt, /bb factory verdict/);
+  const builder = workerPrompt({ role: 'build', factoryName: 'F', prefix: 'TEST', task: { key: 'TEST-1', title: 'T', description: 'D' }, instructions: null, builderThreadId: null });
+  assert.match(builder, /can a revert undo it/);
+  assert.match(builder, /caught and dropped/);
 });

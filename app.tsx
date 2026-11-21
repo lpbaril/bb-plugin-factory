@@ -559,6 +559,14 @@ function PrChips({ pr }: { pr: PrSummary }) {
           Rafter {pr.scan === "running" ? "…" : pr.scan === "failed" ? "✗" : "✓"}{pr.scanOlderSha === null ? "" : ` ${pr.scanOlderSha}`}
         </span>
       )}
+      {pr.risk == null ? null : (
+        <span
+          className={cn("rounded border border-border px-1.5 py-0.5", pr.risk === "high" ? "text-destructive" : pr.risk === "medium" ? "text-amber-600 dark:text-amber-400" : "")}
+          title={`Merge risk: ${RISK_WORDS[pr.risk]}. The full summary is on the PR and the merge card.`}
+        >
+          Risk {RISK_WORDS[pr.risk]}
+        </span>
+      )}
     </div>
   );
 }
@@ -1109,6 +1117,12 @@ function HealthDialog({ open, prefix, onClose }: { open: boolean; prefix: string
             note: `Checks the Builder never saw, so they measure the work better than its own tests.${health.holdouts.invalid === 0 ? "" : ` ${health.holdouts.invalid} marked invalid aren't counted.`} Runs that started in the window.`,
           }]),
           {
+            label: "PRs with a merge-risk summary",
+            value: String(health.risk.rated),
+            sample: `${health.risk.low} low, ${health.risk.medium} medium, ${health.risk.high} high`,
+            note: `${health.risk.reviewed} judged by the Risk reviewer${health.risk.unfinished === 0 ? "" : `, ${health.risk.unfinished} where it didn't finish in time`}. Informational for now: compare it with reverts before it decides anything. Summaries settled in the window.`,
+          },
+          {
             label: "Builder stop reports",
             value: String(health.stopReports.reports),
             sample: `${health.stopReports.tasks} task${health.stopReports.tasks === 1 ? "" : "s"}, ${health.stopReports.mergedSince} merged since`,
@@ -1352,6 +1366,14 @@ function SettingsDialog({
       checked: factory.holdoutsEnabled,
       offCommand: `bb factory holdouts ${factory.prefix} off`,
       change: (next) => ({ kind: "holdouts", enabled: next }),
+    },
+    {
+      id: "riskSummary",
+      label: "Merge-risk summary",
+      note: "Each ready PR gets Impact, Rollback, Verification and Error detection on its merge card and as a PR comment, with a Risk reviewer when something is flagged. It doesn't change who may merge.",
+      checked: factory.riskSummaryEnabled,
+      offCommand: `bb factory risk-summary ${factory.prefix} off`,
+      change: (next) => ({ kind: "riskSummary", enabled: next }),
     },
     {
       id: "reviewsPaused",
@@ -3025,8 +3047,23 @@ function readMergeCard(payload: unknown): MergeCardPayload | null {
     overlap: typeof card.overlap === "string" ? card.overlap : null,
     files: Array.isArray(card.files) ? card.files : [],
     moreFiles: typeof card.moreFiles === "number" ? card.moreFiles : 0,
+    risk: readRisk(card.risk),
   };
 }
+
+const RISK_WORDS = { low: "Low", medium: "Medium", high: "High" } as const;
+type RiskWord = keyof typeof RISK_WORDS;
+const isRiskLevel = (value: unknown): value is RiskWord => value === "low" || value === "medium" || value === "high";
+/** A card shown before the summary existed has none; anything unreadable is left out rather than guessed. */
+function readRisk(value: unknown): MergeCardPayload["risk"] {
+  if (typeof value !== "object" || value === null) return null;
+  const risk = value as Partial<NonNullable<MergeCardPayload["risk"]>>;
+  if (!isRiskLevel(risk.overall) || !Array.isArray(risk.lines)) return null;
+  const lines = risk.lines.filter((line) => typeof line?.label === "string" && typeof line.reason === "string" && (line.level === null || isRiskLevel(line.level)));
+  const source = risk.source === "review" || risk.source === "unfinished" ? risk.source : "facts";
+  return { overall: risk.overall, source, lines };
+}
+const riskTone = (level: RiskWord | null) => (level === "high" ? "bad" : level === "medium" ? "warn" : level === "low" ? "good" : undefined);
 
 function MergeCardRow({ label, children, tone }: { label: string; children: ReactNode; tone?: "good" | "warn" | "bad" }) {
   return (
@@ -3034,6 +3071,40 @@ function MergeCardRow({ label, children, tone }: { label: string; children: Reac
       <span className="w-24 shrink-0 text-muted-foreground">{label}</span>
       <span className={cn("min-w-0", tone === "bad" ? "text-destructive" : tone === "warn" ? "text-amber-600 dark:text-amber-400" : "")}>{children}</span>
     </div>
+  );
+}
+
+/** The level is always a word, so it never rests on colour alone. */
+function MergeCardRisk({ risk }: { risk: NonNullable<MergeCardPayload["risk"]> }) {
+  const tone = riskTone(risk.overall);
+  return (
+    <section aria-label="Merge risk" className="rounded border border-border px-2 py-1.5">
+      <div className="flex items-baseline justify-between gap-3 text-sm">
+        <span className="font-medium">
+          Merge risk:{" "}
+          <span className={cn(tone === "bad" ? "text-destructive" : tone === "warn" ? "text-amber-600 dark:text-amber-400" : "text-green-600 dark:text-green-400")}>
+            {RISK_WORDS[risk.overall]}
+          </span>
+        </span>
+        <span className="text-xs text-muted-foreground">
+          {risk.source === "review" ? "Risk reviewer + evidence" : risk.source === "unfinished" ? "Risk reviewer didn't finish" : "From the diff and evidence"}
+        </span>
+      </div>
+      <dl className="mt-1 space-y-1 text-sm">
+        {risk.lines.map((line) => (
+          <div key={line.label} className="flex items-baseline gap-3">
+            <dt className="w-24 shrink-0 text-muted-foreground">{line.label}</dt>
+            <dd className="min-w-0">
+              <span className={cn("font-medium", riskTone(line.level) === "bad" ? "text-destructive" : riskTone(line.level) === "warn" ? "text-amber-600 dark:text-amber-400" : "")}>
+                {line.level === null ? "Not judged" : RISK_WORDS[line.level]}
+              </span>
+              <span className="text-muted-foreground">: {line.reason.replace(/^not judged: /, "")}</span>
+            </dd>
+          </div>
+        ))}
+      </dl>
+      <div className="mt-1 text-xs text-muted-foreground">Informational: it doesn't change who may merge.</div>
+    </section>
   );
 }
 
@@ -3077,6 +3148,7 @@ function MergeCard({ interaction, submit }: PluginPendingInteractionProps) {
         {card.title === "" ? null : <div className="text-sm text-muted-foreground">{card.title}</div>}
       </div>
       {card.flagged === null ? null : <div className="rounded border border-border px-2 py-1 text-sm">{card.flagged}</div>}
+      {card.risk === null ? null : <MergeCardRisk risk={card.risk} />}
       <div className="divide-y divide-border">
         <MergeCardRow label="Reviewers" tone={allApproved ? "good" : "bad"}>
           {card.approvals.map((entry) => `${entry.label} ${entry.verdict === "approve" ? (entry.atHead ? "✓" : "✓ (older commit)") : entry.verdict}`).join(" · ") || "None recorded"}
