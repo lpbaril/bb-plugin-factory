@@ -208,8 +208,10 @@ const prRiskSchema = z.object({
   overall: z.enum(RISK_LEVELS).nullable(),
   source: z.enum(["review", "facts", "unfinished"]).nullable(),
   settledAt: z.string().nullable(),
-  /** When the summary was posted on the PR, so it's posted once per commit. */
+  /** When the summary was posted on the PR, so it's posted once per commit, and again after a QA change. */
   commentedAt: z.string().nullable(),
+  /** When QA's standing changed after the summary settled, so the next comment says it's an update. */
+  qaRefreshedAt: z.string().nullable().default(null),
 });
 type PrRisk = z.infer<typeof prRiskSchema>;
 
@@ -4237,7 +4239,7 @@ export default async function plugin(bb: BbPluginApi) {
           args.instructions,
           args.candidate === undefined ? null : exploreAssignment(args.candidate, EXPLORE_TIMEBOX_MINUTES),
           openPr === undefined || continuing === null ? null : `PR #${openPr.number} is already open for ${task.key}, on this worktree's branch (\`${openPr.branch}\`). You're continuing it: stay on this branch, commit and push to it, and don't open another PR.`,
-          plan?.commentId == null ? null : `Canonical plan for ${task.key}: task comment ${plan.commentId}. ${(PR_REVIEW_ROLES as readonly string[]).includes(args.role) ? `Read it with bb factory plan ${task.key}, which leaves out other reviewers' verdicts` : `Read it directly with bb tasks show ${task.key} (including comments)`}; preserve its acceptance criteria.`,
+          plan?.commentId == null ? null : `Canonical plan for ${task.key}: task comment ${plan.commentId}. ${(PR_REVIEW_ROLES as readonly string[]).includes(args.role) || args.role === "risk" ? `Read it with bb factory plan ${task.key}, which leaves out other reviewers' verdicts` : `Read it directly with bb tasks show ${task.key} (including comments)`}; preserve its acceptance criteria.`,
         ].filter((part) => part != null).join("\n\n") || null,
         builderThreadId: builder?.threadId ?? null,
         pr,
@@ -5231,6 +5233,9 @@ ${sections.join("\n\n---\n\n")}`;
 
   // ----- Merge risk -----
 
+  /** How long past the Risk reviewer's deadline the card waits for the risk pass to settle it. */
+  const RISK_SETTLE_GRACE_MS = 5 * 60 * 1000;
+
   /** QA's standing on the head commit, as the risk summary reads it. A pass carries through later commits. */
   function riskQaState(pr: Pick<Pr, "qa" | "headSha">): RiskFacts["qa"] {
     const qa = pr.qa;
@@ -5253,13 +5258,17 @@ ${sections.join("\n\n---\n\n")}`;
       if (!factory.riskSummaryEnabled || pr === undefined || pr.state !== "open" || pr.isDraft || !approvalsCover(pr, pr.headSha)) return;
       const risk = pr.risk?.sha === pr.headSha ? pr.risk : await startRiskAssessment(factory, hostId, repo, pr);
       if (risk === null) return;
-      if (risk.overall === null && (await riskSettled(risk))) await settleRisk(prefix, pr.number, risk.sha);
+      // QA can report after the PR went ready, on the same commit: Verification follows it.
+      if (risk.facts.qa !== riskQaState(pr)) await refreshRiskQa(prefix, pr.number, risk.sha, riskQaState(pr));
+      const current = (await findFactory(prefix)).prs.find((candidate) => candidate.number === prNumber)?.risk;
+      if (current?.sha === pr.headSha && current.overall === null && (await riskSettled(current))) await settleRisk(prefix, pr.number, current.sha);
       const settled = (await findFactory(prefix)).prs.find((candidate) => candidate.number === prNumber)?.risk;
       if (settled?.sha === pr.headSha && settled.overall !== null && settled.commentedAt === null) {
-        await prComment(hostId, repo, pr.number, riskComment(riskSummaryOf(settled), settled.sha));
-        await mutateFactory(prefix, (current) => {
-          const target = current.prs.find((candidate) => candidate.number === prNumber);
-          if (target?.risk?.sha === settled.sha) target.risk.commentedAt = new Date().toISOString();
+        // Not prComment, which only logs a failure: an unposted summary is retried on the next pass.
+        await gh(hostId, ["pr", "comment", String(pr.number), "--repo", repo, "--body-file", "-"], riskComment(riskSummaryOf(settled), settled.sha, settled.qaRefreshedAt !== null));
+        await mutateFactory(prefix, (target) => {
+          const record = target.prs.find((candidate) => candidate.number === prNumber)?.risk;
+          if (record?.sha === settled.sha) record.commentedAt = new Date().toISOString();
         });
       }
     } catch (error) {
@@ -5273,7 +5282,7 @@ ${sections.join("\n\n---\n\n")}`;
     const files = (view.files ?? []).map((file) => ({ path: file.path, additions: file.additions ?? 0, deletions: file.deletions ?? 0 }));
     const facts = riskFacts(files, { deep: pr.deep, qa: riskQaState(pr), qaGate: factory.evidenceContract });
     const flags = riskFlags(facts);
-    const record: PrRisk = { sha: pr.headSha, facts, threadId: null, startedAt: new Date().toISOString(), review: null, reviewedAt: null, overall: null, source: null, settledAt: null, commentedAt: null };
+    const record: PrRisk = { sha: pr.headSha, facts, threadId: null, startedAt: new Date().toISOString(), review: null, reviewedAt: null, overall: null, source: null, settledAt: null, commentedAt: null, qaRefreshedAt: null };
     let saved = false;
     await mutateFactory(factory.prefix, (current) => {
       const target = current.prs.find((candidate) => candidate.number === pr.number);
@@ -5296,11 +5305,47 @@ ${sections.join("\n\n---\n\n")}`;
         });
         record.threadId = threadId;
       } catch (error) {
-        // Without a reviewer the summary settles on the facts, and says the review didn't happen.
         bb.log.warn(`could not start the Risk reviewer for PR #${pr.number}: ${String(error)}`);
+        // assign can fail after its thread was spawned and recorded, for one when the task comment
+        // fails. That reviewer is running, so it keeps the right to rate. Without one, the summary
+        // settles on the facts and says no rating came back.
+        const spawned = (await findFactory(factory.prefix)).agents.find((agent) => agent.role === "risk" && agent.taskKey === pr.taskKey && agent.pr === pr.number && agent.createdAt >= record.startedAt);
+        if (spawned !== undefined) {
+          await mutateFactory(factory.prefix, (current) => {
+            const target = current.prs.find((candidate) => candidate.number === pr.number);
+            if (target?.risk?.sha === pr.headSha) target.risk.threadId = spawned.threadId;
+          });
+          record.threadId = spawned.threadId;
+        }
       }
     }
     return record;
+  }
+
+  /**
+   * QA's standing changed on the same commit. A settled summary is worked out again and posted again;
+   * an open merge card for it is taken back, so it comes back with the new one.
+   */
+  async function refreshRiskQa(prefix: string, prNumber: number, sha: string, qa: RiskFacts["qa"]): Promise<void> {
+    let resettled = false;
+    await mutateFactory(prefix, (current) => {
+      const risk = current.prs.find((candidate) => candidate.number === prNumber)?.risk;
+      if (risk == null || risk.sha !== sha || risk.facts.qa === qa) return;
+      risk.facts.qa = qa;
+      if (risk.overall === null) return;
+      const summary = riskSummaryOf(risk);
+      resettled = summary.overall !== risk.overall || risk.commentedAt !== null;
+      risk.overall = summary.overall;
+      risk.source = summary.source;
+      risk.settledAt = new Date().toISOString();
+      risk.qaRefreshedAt = risk.settledAt;
+      risk.commentedAt = null;
+    });
+    const open = openMergeCards.get(prefix);
+    if (resettled && open !== undefined && open.pr === prNumber && open.sha === sha) {
+      open.controller.abort();
+      openMergeCards.delete(prefix);
+    }
   }
 
   /** Reviewed, nothing to review, out of time, or the reviewer ended without recording. */
@@ -5341,7 +5386,7 @@ ${sections.join("\n\n---\n\n")}`;
       });
     }
     if (pr.risk!.overall !== null) {
-      throw new PluginCliError(`PR #${pr.number}'s merge risk at this commit is already settled${pr.risk!.review === null ? ", from the facts alone, because the Risk reviewer's time ran out" : ""}.`, { code: "risk_settled" });
+      throw new PluginCliError(`PR #${pr.number}'s merge risk at this commit is already settled${pr.risk!.review === null ? ", from the facts alone, because no rating came back in time" : ""}.`, { code: "risk_settled" });
     }
     const clean = (rating: RiskReview["impact"]) => ({ level: rating.level, reason: cleanRiskReason(rating.reason) });
     const review: RiskReview = { impact: clean(args.review.impact), rollback: clean(args.review.rollback), errors: clean(args.review.errors) };
@@ -5375,11 +5420,19 @@ ${sections.join("\n\n---\n\n")}`;
   const openMergeCards = new Map<string, { pr: number; sha: string; controller: AbortController }>();
   const MERGE_CARD_TIMEOUT_MS = 7 * 24 * 60 * 60 * 1000;
 
-  /** A Risk reviewer is still rating this head, inside its time: the card waits for it. */
-  function riskPending(factory: Pick<Factory, "riskSummaryEnabled">, pr: Pick<Pr, "risk" | "headSha">): boolean {
+  /**
+   * A Risk reviewer is rating this head and its summary isn't settled: the card waits. It waits until
+   * the risk pass settles it, not on its own clock, so a card never opens between the deadline and the
+   * settling with no risk on it. A grace period past the deadline keeps the card from waiting for good
+   * if that pass keeps failing. A card already showing for this commit stays: turning the summary on
+   * doesn't take back a card the person may be about to tap.
+   */
+  function riskPending(factory: Pick<Factory, "riskSummaryEnabled" | "prefix">, pr: Pick<Pr, "risk" | "headSha" | "number">): boolean {
     const risk = pr.risk;
     if (!factory.riskSummaryEnabled || risk === null || risk.sha !== pr.headSha || risk.overall !== null || risk.threadId === null) return false;
-    return Date.now() - Date.parse(risk.startedAt) < RISK_REVIEW_WAIT_MS;
+    const open = openMergeCards.get(factory.prefix);
+    if (open !== undefined && open.pr === pr.number && open.sha === pr.headSha) return false;
+    return Date.now() - Date.parse(risk.startedAt) < RISK_REVIEW_WAIT_MS + RISK_SETTLE_GRACE_MS;
   }
 
   /** Offered once the factory has told the Lead the PR is ready for the person to merge. */

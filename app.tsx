@@ -3087,7 +3087,7 @@ function MergeCardRisk({ risk }: { risk: NonNullable<MergeCardPayload["risk"]> }
           </span>
         </span>
         <span className="text-xs text-muted-foreground">
-          {risk.source === "review" ? "Risk reviewer + evidence" : risk.source === "unfinished" ? "Risk reviewer didn't finish" : "From the diff and evidence"}
+          {risk.source === "review" ? "Risk reviewer + evidence" : risk.source === "unfinished" ? "No rating from the Risk reviewer" : "From the diff and evidence"}
         </span>
       </div>
       <dl className="mt-1 space-y-1 text-sm">
@@ -3098,7 +3098,7 @@ function MergeCardRisk({ risk }: { risk: NonNullable<MergeCardPayload["risk"]> }
               <span className={cn("font-medium", riskTone(line.level) === "bad" ? "text-destructive" : riskTone(line.level) === "warn" ? "text-amber-600 dark:text-amber-400" : "")}>
                 {line.level === null ? "Not judged" : RISK_WORDS[line.level]}
               </span>
-              <span className="text-muted-foreground">: {line.reason.replace(/^not judged: /, "")}</span>
+              <span className="text-muted-foreground">: {line.reason}</span>
             </dd>
           </div>
         ))}

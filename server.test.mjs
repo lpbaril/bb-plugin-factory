@@ -11,7 +11,7 @@ registerHooks({ resolve(specifier, context, next) {
   return next(specifier, context);
 } });
 const { default: plugin, computePreset, computeTokenProfile, designRoundLenses, currentDesignReview, asSentence, PAGE_NOTICE_TIMEOUT_MS, leadCompactionDue, leadCompactBackoffMs, LEAD_COMPACT_COOLDOWN_MS, parsePersonQuestions, personQuestionsGate, parseDesignFindings, planSensitivePaths, designRoundState, designGate, trackGate, parseApproaches, exploreAssignment, readRecommendation, sectionText, supervisorAction, turnsFromEvents, creditUsage, mergeBlockers, sortChecks, latestRuns, mergeOverlapNote, migrateQaResults, qaCarryNote, leadMayMerge, rosterWarnings, computeHealth, parseDay, prsOpenedBetween, qaHold, qaNextStep, parseCoverage, changeRounds, fixLoopAdvice, holdoutGate, holdoutSummary, holdoutLine, computeHoldoutHealth, holdoutHealthLine, holdoutWriterLost, HOLDOUT_WRITER_LOST_MS, holdoutQuotes, computeRiskHealth, riskHealthLine } = await import('./server.ts');
-const { riskFacts, riskFlags, riskSummary, overallRisk, verificationRating, cleanRiskReason, riskComment, RISK_REASON_MAX } = await import('./risk.ts');
+const { riskFacts, riskFlags, riskSummary, overallRisk, verificationRating, cleanRiskReason, riskComment, isSecurityPath, RISK_REASON_MAX } = await import('./risk.ts');
 const { shareBarWidth, sharePercent } = await import('./token-profile.ts');
 const { leadCharter, leadPrompt, reReviewMessage, workerPrompt, workerReminder, designReviewPrompt, parseHoldoutScenarios, formatHoldoutScenarios, scenarioWriterPrompt, WORKER_ROLE_IDS } = await import('./roles.ts');
 const { holdoutCounts, holdoutPassRate } = await import('./holdout-text.ts');
@@ -3604,7 +3604,7 @@ async function reopenFixture(t, pr, initial = {}, live = { isDraft: false }) {
 const FULL_A = 'a'.repeat(40);
 const FULL_B = 'b'.repeat(40);
 const readyForPerson = (over = {}) => prRecord({ headSha: FULL_A, isDraft: false, readyRequested: true, readySha: FULL_A, approvedNotifiedSha: FULL_A, reviews: bothApprove(FULL_A), ...over });
-const cardFixture = async (t, { prs = [readyForPerson()], initial = {}, live = null, settings = {}, unlistedState = () => 'OPEN', checks = () => greenChecks, mergeHead = () => FULL_A, mergeable = () => 'MERGEABLE', required = () => null, mergeState = () => 'CLEAN', threads = null, commits = () => [FULL_A], riskFiles = null, threadStatus = null } = {}) => {
+const cardFixture = async (t, { prs = [readyForPerson()], initial = {}, live = null, settings = {}, unlistedState = () => 'OPEN', checks = () => greenChecks, mergeHead = () => FULL_A, mergeable = () => 'MERGEABLE', required = () => null, mergeState = () => 'CLEAN', threads = null, commits = () => [FULL_A], riskFiles = null, threadStatus = null, failComment = () => false, ghCommentFails = () => false } = {}) => {
   const ghCalls = [];
   const ghComments = [];
   const sent = [];
@@ -3618,7 +3618,10 @@ const cardFixture = async (t, { prs = [readyForPerson()], initial = {}, live = n
     },
     hostRpc: async ({ input }) => {
       ghCalls.push(input.args);
-      if (input.args[1] === 'comment') ghComments.push(input.stdin ?? '');
+      if (input.args[1] === 'comment') {
+        if (ghCommentFails(input.stdin ?? '')) return { code: 1, stdout: '', stderr: 'HTTP 502' };
+        ghComments.push(input.stdin ?? '');
+      }
       if (input.args[1] === 'list') return { code: 0, stderr: '', stdout: ghList(typeof listed === 'function' ? listed() : listed) };
       if (input.args[1] === 'view' && input.args.at(-1) === 'files,headRefOid' && riskFiles !== null) {
         return { code: 0, stderr: '', stdout: JSON.stringify({ headRefOid: FULL_A, files: riskFiles }) };
@@ -3641,7 +3644,10 @@ const cardFixture = async (t, { prs = [readyForPerson()], initial = {}, live = n
     },
     tasksRpc: async ({ method, input }) => {
       if (method === 'notifications.send') { sent.push(input); return { ok: true, channels: [] }; }
-      if (method === 'createComment') posted.push(input.body);
+      if (method === 'createComment') {
+        if (failComment(input.body)) throw new Error('tasks are unavailable');
+        posted.push(input.body);
+      }
       return undefined;
     },
   });
@@ -6875,7 +6881,7 @@ test('a summary without a review judges Impact and Rollback from the facts and l
   const waiting = riskSummary(facts, null, true);
   assert.equal(waiting.source, 'unfinished', 'flagged, and no review came back');
   assert.deepEqual(waiting.lines.map(entry => [entry.category, entry.level]), [['impact', 'medium'], ['rollback', 'high'], ['verification', 'low'], ['errors', null]]);
-  assert.match(waiting.lines[3].reason, /didn't finish in time/);
+  assert.equal(waiting.lines[3].reason, 'no rating came back from the Risk reviewer');
   const plain = riskSummary(riskFacts([file('src/a.ts'), file('src/a.test.ts')], riskEvidence()), null, true);
   assert.equal(plain.source, 'facts');
   assert.equal(plain.overall, 'low');
@@ -6936,7 +6942,8 @@ test('without the merge-risk summary, the card has no risk and nothing is posted
 });
 
 test('a flagged PR starts a Risk reviewer; only its thread can rate, and the card waits for it', async t => {
-  const { bb, harness, cards, ghComments, spawns, messages } = await cardFixture(t, { initial: { riskSummaryEnabled: true }, riskFiles: [file('src/auth/session.ts'), file('src/auth/session.test.ts')], threadStatus: () => 'running' });
+  const plans = [{ taskKey: 'TEST-1', threadId: 'thr_plan', commentId: 'plan_comment', designRequired: false, reviewedCommentId: null, personQuestions: [], roundNotStarted: null }];
+  const { bb, harness, cards, ghComments, spawns, messages } = await cardFixture(t, { initial: { riskSummaryEnabled: true, plans }, riskFiles: [file('src/auth/session.ts'), file('src/auth/session.test.ts')], threadStatus: () => 'running' });
   await runPasses(harness);
   const reviewer = spawns.find(spawn => spawn.pluginMetadata?.role === 'risk');
   assert.ok(reviewer, 'a Risk reviewer was started');
@@ -6945,6 +6952,10 @@ test('a flagged PR starts a Risk reviewer; only its thread can rate, and the car
   assert.match(reviewer.prompt, /flagged PR #7 at `aaaaaaa` for: 1 sensitive path/);
   assert.match(reviewer.prompt, /bb factory risk TEST-1 --impact <level>/);
   assert.equal(reviewer.environment.type, 'reuse', 'in the builder\'s worktree');
+  assert.match(reviewer.prompt, /### Notes from the factory/);
+  assert.match(reviewer.prompt, /Read it with bb factory plan TEST-1, which leaves out other reviewers' verdicts/);
+  assert.doesNotMatch(reviewer.prompt, /including comments/, 'never sent to the task comments, which hold the reviews');
+  assert.doesNotMatch(reviewer.prompt, /builder's thread/, 'never invited to ask the Builder');
   const threadId = (await readPrs(bb))[0].risk.threadId;
   assert.match(threadId, /^thr_spawned_/);
   assert.equal(cards().length, 0, 'the card waits for the rating');
@@ -6984,7 +6995,7 @@ test('the card stops waiting when the Risk reviewer runs out of time or ends wit
   assert.equal(late.cards().length, 1);
   assert.equal(late.cards()[0].payload.risk.source, 'unfinished');
   assert.equal(late.cards()[0].payload.risk.lines[1].level, 'high', 'a migration is a one-way door on the facts alone');
-  assert.match(late.ghComments.find(body => body.startsWith('**Factory merge risk')), /didn't finish in time/);
+  assert.match(late.ghComments.find(body => body.startsWith('**Factory merge risk')), /no rating came back from the Risk reviewer/);
   const ended = await cardFixture(t, { prs: [readyForPerson({ risk: pending(new Date(Date.now() - 2 * 60_000).toISOString()) })], initial: { riskSummaryEnabled: true }, threadStatus: () => 'idle' });
   await runPasses(ended.harness);
   assert.equal(ended.cards().length, 1, 'its thread ended without rating');
@@ -7030,4 +7041,90 @@ test('the Risk reviewer brief names its three ratings and leaves verification to
   const builder = workerPrompt({ role: 'build', factoryName: 'F', prefix: 'TEST', task: { key: 'TEST-1', title: 'T', description: 'D' }, instructions: null, builderThreadId: null });
   assert.match(builder, /can a revert undo it/);
   assert.match(builder, /caught and dropped/);
+});
+
+test('security paths are whole words of the path; SQL counts as a migration only in a migration folder or a schema dump', () => {
+  for (const path of ['src/auth/session.ts', 'app/login.py', 'lib/accessToken.ts', 'config/api_key.go', 'billing/invoice.ts', 'db/rls_policies.ts', 'src/passwordReset.tsx']) {
+    assert.ok(isSecurityPath(path), path);
+  }
+  for (const path of ['app/urls.py', 'src/author.ts', 'src/tokenizer.ts', 'token-profile.ts', 'src/sessionStorageHint.md'.replace('session', 'sess')]) {
+    assert.ok(!isSecurityPath(path), path);
+  }
+  const migrations = (path) => riskFacts([file(path)], riskEvidence()).migrations;
+  assert.equal(migrations('db/migrations/0012_add.sql'), 1);
+  assert.equal(migrations('db/structure.sql'), 1);
+  assert.equal(migrations('prisma/schema.prisma'), 1);
+  assert.equal(migrations('tests/fixtures/seed.sql'), 0, 'a fixture is not a one-way door');
+  assert.equal(migrations('queries/report.sql'), 0);
+});
+
+test('a facts-only summary says "not judged" once, in the comment and the CLI', async t => {
+  const comment = riskComment(riskSummary(riskFacts([file('src/a.ts')], riskEvidence()), null, true), FULL_A);
+  assert.match(comment, /\*\*Error detection:\*\* not judged: nothing was flagged for a Risk reviewer/);
+  assert.doesNotMatch(comment, /not judged: not judged/);
+  const { harness } = await cardFixture(t, { initial: { riskSummaryEnabled: true }, riskFiles: [file('src/a.ts')], threadStatus: () => 'idle' });
+  await runPasses(harness);
+  const shown = (await harness.behavior.runCli(['risk', 'TEST-1'])).stdout;
+  assert.match(shown, /Error detection: not judged: nothing was flagged/);
+  assert.doesNotMatch(shown, /not judged: not judged/);
+});
+
+test('the Risk reviewer\'s reminder sends it back to the PR, not the task comments', () => {
+  const reminder = workerReminder({ role: 'risk', factoryName: 'F', taskKey: 'TEST-1' });
+  assert.match(reminder, /read the PR again with `gh pr diff`/);
+  assert.doesNotMatch(reminder, /bb tasks show/);
+  assert.match(reminder, /never block the task/);
+});
+
+test('QA reporting after the summary settled updates Verification and posts the summary again', async t => {
+  const facts = riskFacts([file('src/a.ts'), file('src/a.test.ts')], riskEvidence({ qa: 'none', qaGate: true }));
+  const settled = { sha: FULL_A, facts, threadId: null, startedAt: '2026-11-21T00:00:00Z', review: null, reviewedAt: null, overall: 'medium', source: 'facts', settledAt: '2026-11-21T00:00:00Z', commentedAt: '2026-11-21T00:00:00Z', qaRefreshedAt: null };
+  const qa = { verdict: 'pass', threadId: 'thr_qa', sha: FULL_A, at: '2026-11-21T00:05:00Z' };
+  const { bb, harness, cards, ghComments } = await cardFixture(t, { prs: [readyForPerson({ risk: settled, qa })], initial: { riskSummaryEnabled: true }, threadStatus: () => 'idle' });
+  await runPasses(harness);
+  const risk = (await readPrs(bb))[0].risk;
+  assert.equal(risk.facts.qa, 'pass');
+  assert.equal(risk.overall, 'low');
+  assert.notEqual(risk.qaRefreshedAt, null);
+  const posted = ghComments.filter(body => body.startsWith('**Factory merge risk'));
+  assert.equal(posted.length, 1);
+  assert.match(posted[0], /Factory merge risk: Low\*\* at `aaaaaaa`, updated after QA reported on this commit/);
+  assert.match(posted[0], /QA passed at this commit/);
+  assert.equal(cards()[0].payload.risk.lines[2].level, 'low', 'the card shows the new Verification');
+});
+
+test('a Risk reviewer that was spawned before assign failed still gets to rate', async t => {
+  const { bb, harness, spawns } = await cardFixture(t, { initial: { riskSummaryEnabled: true }, riskFiles: [file('src/auth/login.ts')], threadStatus: () => 'running', failComment: body => body.startsWith('Assigned to **Risk reviewer**') });
+  await runPasses(harness);
+  const reviewer = spawns.find(spawn => spawn.pluginMetadata?.role === 'risk');
+  assert.ok(reviewer);
+  const risk = (await readPrs(bb))[0].risk;
+  assert.match(risk.threadId ?? '', /^thr_spawned_/, 'the running reviewer is recorded');
+  assert.equal(risk.overall, null, 'not settled as unfinished');
+  const recorded = await harness.behavior.runCli(['risk', 'TEST-1', '--impact', 'medium', '--impact-why', 'login form', '--rollback', 'low', '--rollback-why', 'revert', '--errors', 'low', '--errors-why', 'errors shown'], { threadId: risk.threadId });
+  assert.equal(recorded.exitCode, 0, recorded.stderr);
+});
+
+test('a risk comment that fails to post is retried on the next pass', async t => {
+  let failures = 1;
+  const { bb, harness, ghComments } = await cardFixture(t, { initial: { riskSummaryEnabled: true }, riskFiles: [file('src/a.ts')], threadStatus: () => 'idle', ghCommentFails: body => body.startsWith('**Factory merge risk') && failures-- > 0 });
+  await runPasses(harness);
+  assert.equal((await readPrs(bb))[0].risk.commentedAt, null, 'not marked posted');
+  assert.equal(ghComments.filter(body => body.startsWith('**Factory merge risk')).length, 0);
+  await runPasses(harness);
+  assert.equal(ghComments.filter(body => body.startsWith('**Factory merge risk')).length, 1);
+  assert.notEqual((await readPrs(bb))[0].risk.commentedAt, null);
+});
+
+test('turning the summary on doesn\'t take back a merge card that is already showing', async t => {
+  const { bb, harness, cards, spawns } = await cardFixture(t, { riskFiles: [file('src/auth/login.ts')], threadStatus: () => 'running' });
+  await runPasses(harness);
+  assert.equal(cards().length, 1);
+  const shown = cards()[0].id;
+  assert.equal((await harness.behavior.runCli(['risk-summary', 'TEST', 'on'])).exitCode, 0);
+  await runPasses(harness);
+  assert.ok(spawns.some(spawn => spawn.pluginMetadata?.role === 'risk'), 'the PR still gets its Risk reviewer');
+  assert.equal(cards().length, 1);
+  assert.equal(cards()[0].id, shown, 'the same card stays');
+  assert.notEqual((await readPrs(bb))[0].risk, null);
 });

@@ -437,7 +437,8 @@ export function workerReminder(args: { role: WorkerRoleId; factoryName: string; 
   const offTask = args.role === "designreview" || args.role === "scenarios" || args.role === "risk";
   return `# Standing role: ${ROLES[args.role].label} in the "${args.factoryName}" software factory, on task ${args.taskKey}
 
-Your first message has your full brief. ${args.role === "scenarios" ? "If it is no longer in your context, stop and say so in your final message: don't re-read the task, whose comments hold the plan." : `If it is no longer in your context, re-read the task with \`bb tasks show ${args.taskKey}\`.`} ${offTask ? "If you can't finish, say why in your final message; never block the task, which others are working on." : `If you cannot continue, run \`bb factory block ${args.taskKey} --reason "<what you need>"\` instead of stalling.`} Don't move the task to Done. ${NO_PAGE_CALLS} ${FINAL_MESSAGE_ROLES.includes(args.role) ? `${FINAL_MESSAGE} ` : ""}${WORKER_RULES[args.role]}${track === undefined ? "" : ` ${track}`}${args.evidenceContract ? ` ${EVIDENCE_REMINDERS[args.role]}` : ""}`;
+Your first message has your full brief. ${args.role === "scenarios" ? "If it is no longer in your context, stop and say so in your final message: don't re-read the task, whose comments hold the plan."
+    : args.role === "risk" ? "If it is no longer in your context, read the PR again with `gh pr diff` and `gh pr view`; don't read the task's comments, which hold the other reviews." : `If it is no longer in your context, re-read the task with \`bb tasks show ${args.taskKey}\`.`} ${offTask ? "If you can't finish, say why in your final message; never block the task, which others are working on." : `If you cannot continue, run \`bb factory block ${args.taskKey} --reason "<what you need>"\` instead of stalling.`} Don't move the task to Done. ${NO_PAGE_CALLS} ${FINAL_MESSAGE_ROLES.includes(args.role) ? `${FINAL_MESSAGE} ` : ""}${WORKER_RULES[args.role]}${track === undefined ? "" : ` ${track}`}${args.evidenceContract ? ` ${EVIDENCE_REMINDERS[args.role]}` : ""}`;
 }
 
 const WORKER_CONTRACTS: Record<WorkerRoleId, string> = {
@@ -703,7 +704,7 @@ ${trackerCommands(args.prefix)}
 ## Your task: ${args.task.key} · ${args.task.title}
 
 ${description}
-${args.instructions === null ? "" : `\n### Notes from the ${args.role === "risk" ? "factory" : "Lead"}\n\n${args.instructions}\n`}${args.builderThreadId === null ? "" : `\nThe builder's thread is \`${args.builderThreadId}\`; you can ask it questions with \`bb thread tell\`.\n`}${findings}
+${args.instructions === null ? "" : `\n### Notes from the ${args.role === "risk" ? "factory" : "Lead"}\n\n${args.instructions}\n`}${args.builderThreadId === null || args.role === "risk" ? "" : `\nThe builder's thread is \`${args.builderThreadId}\`; you can ask it questions with \`bb thread tell\`.\n`}${findings}
 ${protocol}`;
 }
 
