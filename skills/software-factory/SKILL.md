@@ -135,6 +135,14 @@ deploy config, or is large, it starts a Risk reviewer, which records its three r
 --errors <level> --errors-why "..."`. It's informational: it doesn't change who may merge. If
 you're the Lead, you don't start or wait for the Risk reviewer.
 
+## Outcome signals
+
+`bb factory outcomes APP` shows whether the factory watches merged PRs. For 14 days after a
+merge, a revert opens a Backlog task ("Find out why PR #N was reverted") and CI failing on
+the base branch at the merge commit is noted on the task. If you're the Lead, treat such a
+Backlog task like any other: the person decides when it moves to To do. Only the person
+records outcomes, with `bb factory outcome APP-12 --kind bug|incident|revert --note "..."`.
+
 ## Recurring review findings
 
 Reviewers (not the shadow): when a repository rule would have prevented a blocking
@@ -209,6 +217,8 @@ skip docs-only changes. PRs stay drafts until every reviewer approves, so
 | `bb factory qa-skip APP-12 --reason "..." [--pr N]` | Lead or person: record why the open PR's current commit doesn't need QA. Only the person can skip QA once it's been assigned on the task. |
 | `bb factory evidence-contract APP [on\|off]` | Show the evidence contract, or set it (person only). |
 | `bb factory risk APP-12 [--pr N]` | Show the PR's merge-risk summary. The Risk reviewer the factory started for the PR's latest commit records its ratings with `--impact`, `--rollback` and `--errors` (each low, medium or high) and a `-why` line for each. |
+| `bb factory outcome APP-12 --kind bug\|incident\|revert --note "..." [--pr N]` | The person only: record what happened after the task's PR merged. |
+| `bb factory outcomes APP [on\|off]` | Show whether merged PRs are watched for reverts and post-merge CI failures, or set it (person only). |
 | `bb factory risk-summary APP [on\|off]` | Show whether ready PRs get a merge-risk summary, or set it (person only). |
 | `bb factory holdouts APP [on\|off]` | Show whether a Scenario writer drafts holdout scenarios for QA, or set it (person only). |
 | `bb factory scenarios APP-12 [--json]` | The task's latest QA thread, or the person: show its holdout scenarios and QA's latest results. |

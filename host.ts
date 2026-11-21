@@ -6,7 +6,7 @@ import { mkdir, readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { experimental_defineHostEntry } from "@get-bb/plugin-sdk";
-import { GH_ALLOWED, hostContract, isDisposableBranch, type RepoInspection } from "./host-contract";
+import { GH_ALLOWED, hostContract, isDisposableBranch, runListArgsAllowed, type RepoInspection } from "./host-contract";
 
 function git(cwd: string, args: string[], signal?: AbortSignal): Promise<{ code: number; stderr: string }> {
   return new Promise((resolvePromise) => {
@@ -328,6 +328,9 @@ export default experimental_defineHostEntry({
       const allowed = GH_ALLOWED.some(([group, command]) => args[0] === group && args[1] === command);
       if (!allowed) {
         return { code: 126, stdout: "", stderr: `gh ${args.slice(0, 2).join(" ")} is not allowed` };
+      }
+      if (args[0] === "run" && !runListArgsAllowed(args)) {
+        return { code: 126, stdout: "", stderr: "gh run list is allowed only as: --repo <owner/name> --commit <sha> --json <fields> --limit <n>" };
       }
       return new Promise((resolvePromise) => {
         const child = execFile(

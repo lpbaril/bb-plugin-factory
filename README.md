@@ -388,6 +388,31 @@ The Builder is also asked, before it reports done, whether a revert would undo i
 and whether a failure would be noticed, and to fix what's cheap, such as an error that's
 caught and dropped.
 
+## Outcome signals
+
+The merge-risk summary is a judgment. Outcome signals check it against what happened: for
+14 days after a factory PR merges, the factory looks for three things.
+
+- **A revert:** a merged PR whose body says `Reverts owner/repo#12`, as GitHub's Revert
+  button writes it, or titled `Revert "APP-12: …"`. The factory opens a Backlog task to find
+  out why, comments on the reverted task and sends you a notification. Nothing from the
+  revert's text reaches an agent, and the task stays in Backlog until you move it.
+- **CI failing on the base branch** at the PR's merge commit. Only the latest run of each
+  workflow counts, so a rerun that passes clears it. You get a notification and the task
+  gets a comment, but no task is opened, since base-branch CI can be flaky.
+- **A problem you record:** `bb factory outcome APP-12 --kind bug|incident|revert --note "…"`,
+  from your own terminal only, so an agent can't write the record its work is judged by.
+
+Health shows, for each merge-risk level, how many merged PRs had one of these within 14
+days: High should go wrong more often than Low. Until it does, the rating stays
+informational. Reverts and CI are read every 10 minutes at most. CI is read with a
+read-only `gh run list`, which the host worker allows only for one commit's runs, as JSON.
+A revert pushed straight to the base branch, without a PR, isn't seen; record it yourself.
+
+Outcome signals are on for new factories. Existing factories turn them on with
+`bb factory outcomes APP on`, or from **Settings** on the Factory page; PRs merged in the
+last 14 days are included. Turning them off is from your own terminal only.
+
 ## Evidence contract
 
 New factories run with a stricter contract for what counts as done. Existing factories
@@ -437,7 +462,8 @@ much rework PRs take: review rounds per merged PR, how often changes are request
 from open to ready, tokens per merged task excluding cached input, PRs closed without
 merging, how many holdout scenarios passed on QA's first run, how many stop reports
 Builders filed, with how many of those tasks have merged since, and how many PRs got a
-merge-risk summary, by level. Each number shows its sample size, because a small history can swing on one PR.
+merge-risk summary, by level. With outcome signals on, it also shows how many merged PRs
+had a revert, a CI failure on the base branch or a recorded problem within 14 days, by merge risk. Each number shows its sample size, because a small history can swing on one PR.
 PRs from before this view estimate time to ready from their last approval on the head.
 
 To compare before and after a change, such as turning on the evidence contract, count only
