@@ -308,7 +308,7 @@ too under either policy, or merge on GitHub yourself.
 
 **Merge card.** When a PR is ready for you to merge, with its required checks passing and no conflict on GitHub, the factory shows a card in the
 Lead's chat and sends a notification to your phone and desktop. The card lists the
-reviewers' approvals, QA, CI, the final scan, any overlap with other open PRs, and
+merge risk (see below), the reviewers' approvals, QA, CI, the final scan, any overlap with other open PRs, and
 the changed files, with a link to the full diff on GitHub. Tap **Merge** to run the
 same checks as `bb factory merge` for that exact commit, or **Not now** to close it.
 While the card waits, it takes the place of the chat's message box. One card shows at
@@ -342,6 +342,48 @@ Merges, answers, decisions, track changes and dismissals made there are recorded
 the Factory page", not as yours, and that's how the Planner hears about them. Every agent
 is told never to use `bb plugin rpc` on the factory. That stops one following an
 instruction planted in a PR or an issue, not one determined to get round it.
+
+## Merge risk
+
+Reviewers say whether a PR is correct. The merge-risk summary tells you what merging it
+risks, so you can tell a quick merge from one to read line by line. Adapted from Warp's
+merge-risk skill, with one difference: the Builder doesn't grade its own PR.
+
+Once a PR is ready, with every approval on its head, the factory rates four things, each
+Low, Medium or High with one line why:
+
+- **Impact:** the blast radius, and whether it touches auth, permissions, payments,
+  secrets, a migration, dependencies or deploy config.
+- **Rollback:** whether a revert undoes it (a two-way door) or not (a one-way door: a
+  migration that rewrites data, a changed stored format, an API others rely on).
+- **Verification:** from the factory's evidence only: QA at this commit, and whether code
+  came with tests.
+- **Error detection:** whether a failure in production would be noticed, or swallowed.
+
+Facts come from the diff: sensitive paths, migration and schema files, dependency files,
+CI, build and infrastructure files, and size. When any is flagged, the factory starts a
+**Risk reviewer** on a provider other than the Builder's (Codex by default, its own seat
+in Agents). It reads the diff and records Impact, Rollback and Error detection with
+`bb factory risk APP-12 --impact … --impact-why "…"`. Only that thread can record them,
+for that commit. With nothing flagged, the facts are enough and Error detection reads
+"not judged".
+
+The overall level weighs Impact and Verification 2, Rollback 1.5 and Error detection 1,
+and a High anywhere makes it at least Medium. It's shown:
+
+- at the top of the **merge card**, which waits up to 15 minutes for the Risk reviewer,
+  then shows the facts alone and says the review didn't finish;
+- as one **PR comment** per approved commit, from the factory;
+- as a **Risk** badge on the board, and with `bb factory risk APP-12`;
+- in **Health**, counted by level, so the ratings can later be checked against reverts.
+
+It's informational: it doesn't change who may merge, under either merge policy. It's on
+for new factories. Existing factories turn it on with `bb factory risk-summary APP on`, or
+from **Settings** on the Factory page; turning it off is from your own terminal only.
+
+The Builder is also asked, before it reports done, whether a revert would undo its change
+and whether a failure would be noticed, and to fix what's cheap, such as an error that's
+caught and dropped.
 
 ## Evidence contract
 
@@ -390,8 +432,9 @@ skipped, and the Lead is told.
 Open **Health** on the Factory page, or run `bb factory health APP [--json]`, to see how
 much rework PRs take: review rounds per merged PR, how often changes are requested, time
 from open to ready, tokens per merged task excluding cached input, PRs closed without
-merging, how many holdout scenarios passed on QA's first run, and how many stop reports
-Builders filed, with how many of those tasks have merged since. Each number shows its sample size, because a small history can swing on one PR.
+merging, how many holdout scenarios passed on QA's first run, how many stop reports
+Builders filed, with how many of those tasks have merged since, and how many PRs got a
+merge-risk summary, by level. Each number shows its sample size, because a small history can swing on one PR.
 PRs from before this view estimate time to ready from their last approval on the head.
 
 To compare before and after a change, such as turning on the evidence contract, count only

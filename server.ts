@@ -38,6 +38,7 @@ import {
 } from "./roster";
 export { computePreset, rosterWarnings, ROSTER_PRESETS, ROSTER_PRESET_LABELS };
 import { holdoutHealthLine, holdoutLine, type HoldoutHealth, type HoldoutSummary } from "./holdout-text";
+import { cleanRiskReason, riskComment, riskFacts, riskFlags, riskLevelWord, riskSummary, RISK_LEVELS, RISK_REVIEW_WAIT_MS, type RiskFacts, type RiskLevel, type RiskReview, type RiskSummary } from "./risk";
 export { holdoutHealthLine, holdoutLine, type HoldoutHealth, type HoldoutSummary };
 import { TOKEN_OUTCOMES, TOKEN_OUTCOME_LABELS, compactTokens, computeTokenProfile, sharePercent, type TokenProfile } from "./token-profile";
 export { computeTokenProfile };
@@ -185,6 +186,33 @@ const qaResultSchema = z.object({
 });
 type QaResult = z.infer<typeof qaResultSchema>;
 
+const riskRatingSchema = z.object({ level: z.enum(RISK_LEVELS), reason: z.string() });
+/**
+ * The merge-risk summary for one head commit. Facts come from the diff and the factory's evidence; a
+ * Risk reviewer, started only when a fact is flagged, judges Impact, Rollback and Error detection.
+ * Informational: it doesn't change who may merge.
+ */
+const prRiskSchema = z.object({
+  sha: z.string(),
+  facts: z.object({
+    files: z.number(), lines: z.number(), sensitive: z.number(), migrations: z.number(), dependencies: z.number(),
+    config: z.number(), tests: z.number(), code: z.number(), deep: z.boolean(),
+    qa: z.enum(["pass", "carried", "skipped", "fail", "none"]), qaGate: z.boolean(),
+  }) satisfies z.ZodType<RiskFacts>,
+  /** The Risk reviewer's thread, or null when nothing was flagged or it couldn't start. */
+  threadId: z.string().nullable(),
+  startedAt: z.string(),
+  review: z.object({ impact: riskRatingSchema, rollback: riskRatingSchema, errors: riskRatingSchema }).nullable(),
+  reviewedAt: z.string().nullable(),
+  /** Set once the summary is final for this commit: reviewed, nothing flagged, or the reviewer ran out of time or ended. */
+  overall: z.enum(RISK_LEVELS).nullable(),
+  source: z.enum(["review", "facts", "unfinished"]).nullable(),
+  settledAt: z.string().nullable(),
+  /** When the summary was posted on the PR, so it's posted once per commit. */
+  commentedAt: z.string().nullable(),
+});
+type PrRisk = z.infer<typeof prRiskSchema>;
+
 const prSchema = z.object({
   number: z.number(),
   url: z.string(),
@@ -236,6 +264,8 @@ const prSchema = z.object({
   roundNotifiedSha: z.string().nullable().default(null),
   /** Set when `bb factory merge` merged this PR; a merge on GitHub leaves it null. */
   merge: z.object({ by: z.enum(["lead", "person", "page"]), threadId: z.string().nullable(), sha: z.string(), policy: z.enum(MERGE_POLICIES), at: z.string(), via: z.enum(["command", "card"]).default("command") }).nullable().default(null),
+  /** The merge-risk summary for the latest head that reached ready, with the merge-risk summary on. */
+  risk: prRiskSchema.nullable().default(null),
 });
 type Pr = z.infer<typeof prSchema>;
 
@@ -888,6 +918,8 @@ export type MergeCardPayload = {
   overlap: string | null;
   files: { path: string; additions: number; deletions: number }[];
   moreFiles: number;
+  /** The merge-risk summary for this commit, once settled. Informational: it doesn't change who may merge. */
+  risk: RiskSummary | null;
 };
 export const MERGE_CARD_RENDERER = "merge-review";
 
@@ -1086,7 +1118,36 @@ export function computeHealth(prs: readonly Pr[], tokensByTask: ReadonlyMap<stri
     tokenProfile: null,
     holdouts: null,
     stopReports: { reports: 0, tasks: 0, mergedSince: 0 },
+    risk: { rated: 0, low: 0, medium: 0, high: 0, reviewed: 0, unfinished: 0 },
   };
+}
+
+/** Merge-risk summaries settled in a window, by level and by who judged them. */
+export type RiskHealth = { rated: number; low: number; medium: number; high: number; reviewed: number; unfinished: number };
+
+/**
+ * One summary per PR: its latest head's. Counted when it was settled in [from, until), so ratings can
+ * later be compared with what became of the PRs (reverts, CI failures) before any of it gates a merge.
+ */
+export function computeRiskHealth(prs: readonly Pick<Pr, "risk">[], from: number | null, until: number | null): RiskHealth {
+  const health: RiskHealth = { rated: 0, low: 0, medium: 0, high: 0, reviewed: 0, unfinished: 0 };
+  for (const pr of prs) {
+    const risk = pr.risk;
+    if (risk == null || risk.overall === null || risk.settledAt === null) continue;
+    const at = Date.parse(risk.settledAt);
+    if ((from !== null && !(at >= from)) || (until !== null && !(at < until))) continue;
+    health.rated += 1;
+    health[risk.overall] += 1;
+    if (risk.source === "review") health.reviewed += 1;
+    if (risk.source === "unfinished") health.unfinished += 1;
+  }
+  return health;
+}
+
+/** Health's line for merge risk. */
+export function riskHealthLine(health: RiskHealth): string {
+  if (health.rated === 0) return "Merge risk: no PRs rated";
+  return `Merge risk: ${health.rated} PR(s) rated, ${health.low} low, ${health.medium} medium, ${health.high} high; ${health.reviewed} judged by the Risk reviewer${health.unfinished === 0 ? "" : `, ${health.unfinished} where it didn't finish`}`;
 }
 
 /** Builder stop reports filed in a window, and how many of their tasks have merged a PR since the stop. */
@@ -1323,6 +1384,8 @@ const factorySchema = z.object({
   holdoutsEnabled: z.boolean().default(false),
   /** Stored as rows, one per task, and never part of a factory summary. */
   holdouts: z.array(holdoutSetSchema).default([]),
+  /** A merge-risk summary on the merge card and the PR: on for new factories, and a person's choice for existing ones. */
+  riskSummaryEnabled: z.boolean().default(false),
   /** A Planner's or Explorer's advice to close a task, which only the person can act on. */
   closeAdvice: z.record(z.string(), z.object({ role: z.enum(["plan", "explore"]), threadId: z.string(), commentId: z.string(), at: z.string() })).default({}),
   /** Each time a Builder stopped and reported instead of working around a rule, a check or a criterion. */
@@ -1339,6 +1402,8 @@ const prSummarySchema = z.object({
   scan: z.enum(["running", "completed", "failed"]).nullable(),
   /** The commit that scan ran on, if it isn't the PR's latest. */
   scanOlderSha: z.string().nullable().default(null),
+  /** The merge-risk level of the latest head, once it's settled; null without one. */
+  risk: z.enum(RISK_LEVELS).nullable().default(null),
 });
 export type PrSummary = z.infer<typeof prSummarySchema>;
 
@@ -1435,6 +1500,8 @@ const factoryHealthSchema = z.object({
   holdouts: holdoutHealthSchema.nullable().default(null),
   /** Builder stop reports filed in the window. */
   stopReports: z.object({ reports: z.number(), tasks: z.number(), mergedSince: z.number() }).default({ reports: 0, tasks: 0, mergedSince: 0 }),
+  /** Merge-risk summaries settled in the window. */
+  risk: z.object({ rated: z.number(), low: z.number(), medium: z.number(), high: z.number(), reviewed: z.number(), unfinished: z.number() }).default({ rated: 0, low: 0, medium: 0, high: 0, reviewed: 0, unfinished: 0 }),
 });
 export type FactoryHealth = z.infer<typeof factoryHealthSchema>;
 
@@ -1523,6 +1590,8 @@ const DEFAULT_PROVIDERS: Record<AgentKey, string> = {
   designreview: "codex",
   // QA's default: it writes the checks QA runs, from the same product view.
   scenarios: "codex",
+  // A provider other than the Builder's: it judges what the Builder's change could break.
+  risk: "codex",
   comparison: "claude-code",
 };
 /** Published when an agent's provider, model or reasoning level changes. */
@@ -1803,6 +1872,7 @@ export const rpcContract = defineRpcContract({
         z.object({ kind: z.literal("designReview"), enabled: z.boolean() }),
         z.object({ kind: z.literal("evidenceContract"), enabled: z.boolean() }),
         z.object({ kind: z.literal("holdouts"), enabled: z.boolean() }),
+        z.object({ kind: z.literal("riskSummary"), enabled: z.boolean() }),
         z.object({ kind: z.literal("mergePolicy"), policy: z.enum(MERGE_POLICIES) }),
         z.object({ kind: z.literal("reviewsPaused"), paused: z.boolean() }),
       ]),
@@ -1812,7 +1882,7 @@ export const rpcContract = defineRpcContract({
 });
 
 export type FactoryOptionChange =
-  | { kind: "tracks" | "designReview" | "evidenceContract" | "holdouts"; enabled: boolean }
+  | { kind: "tracks" | "designReview" | "evidenceContract" | "holdouts" | "riskSummary"; enabled: boolean }
   | { kind: "mergePolicy"; policy: (typeof MERGE_POLICIES)[number] }
   | { kind: "reviewsPaused"; paused: boolean };
 /**
@@ -1824,6 +1894,7 @@ export function factoryOptionLoosens(change: FactoryOptionChange): { what: strin
   if (change.kind === "evidenceContract" && !change.enabled) return { what: "Turning the evidence contract off", command: (prefix) => `evidence-contract ${prefix} off` };
   if (change.kind === "designReview" && !change.enabled) return { what: "Turning design review off", command: (prefix) => `design-review ${prefix} off` };
   if (change.kind === "holdouts" && !change.enabled) return { what: "Turning holdout scenarios off", command: (prefix) => `holdouts ${prefix} off` };
+  if (change.kind === "riskSummary" && !change.enabled) return { what: "Turning the merge-risk summary off", command: (prefix) => `risk-summary ${prefix} off` };
   return null;
 }
 
@@ -1968,7 +2039,7 @@ const LEGACY_REASONING = ["default", "low", "medium", "high", "xhigh", "max"];
  */
 const LEGACY_AGENT_SETTINGS = {
   ...Object.fromEntries(
-    ROLE_IDS.filter((role) => role !== "shadow" && role !== "explore" && role !== "designreview" && role !== "scenarios").map((role) => [
+    ROLE_IDS.filter((role) => role !== "shadow" && role !== "explore" && role !== "designreview" && role !== "scenarios" && role !== "risk").map((role) => [
       `${role}Provider`,
       // What these settings have always defaulted to, so an unset value on an old install reads as what it ran on.
       { type: "select", label: `${ROLES[role].label} runs on (moving to Agents)`, options: LEGACY_PROVIDERS, default: role === "review1" ? "claude-code" : DEFAULT_PROVIDERS[role] },
@@ -1977,7 +2048,7 @@ const LEGACY_AGENT_SETTINGS = {
   shadowProvider: { type: "select", label: "Shadow security reviewer runs on (moving to Agents)", options: LEGACY_PROVIDERS, default: "acp-cursor" },
   shadowModel: { type: "string", label: "Shadow security reviewer model (moving to Agents)", default: "gemini-4-argon-high" },
   ...Object.fromEntries(
-    AGENT_KEYS.filter((key) => key !== "explore" && key !== "designreview" && key !== "scenarios").map((key) => [
+    AGENT_KEYS.filter((key) => key !== "explore" && key !== "designreview" && key !== "scenarios" && key !== "risk").map((key) => [
       `${key}Reasoning`,
       { type: "select", label: `${AGENT_LABELS[key]} reasoning level (moving to Agents)`, options: LEGACY_REASONING, default: "default" },
     ]),
@@ -2513,6 +2584,7 @@ export default async function plugin(bb: BbPluginApi) {
       }),
       scan: scan?.status ?? null,
       scanOlderSha: scan === null || scan.sha === pr.headSha ? null : scan.sha.slice(0, 7),
+      risk: pr.risk?.sha === pr.headSha ? pr.risk.overall : null,
     };
   }
   async function comment(taskId: string, body: string): Promise<void> {
@@ -2656,6 +2728,7 @@ export default async function plugin(bb: BbPluginApi) {
       designDepth: {},
       holdoutsEnabled: true,
       holdouts: [],
+      riskSummaryEnabled: true,
       leadThreadId: null,
       agents: [],
       createdAt: new Date().toISOString(),
@@ -4137,7 +4210,9 @@ export default async function plugin(bb: BbPluginApi) {
     const execution = await executionFor(args.role);
     const { providerId } = execution;
     const pr = args.pr ?? null;
-    const isShadow = args.role === "shadow";
+    // The shadow and the Risk reviewer report to nobody: the shadow's findings must not reach the Lead or
+    // the gate, and the risk goes to the person on the card and the PR.
+    const isShadow = args.role === "shadow" || args.role === "risk";
     const base = {
       projectId: factory.bbProjectId,
       ...execution,
@@ -4758,6 +4833,7 @@ ${sections.join("\n\n---\n\n")}`;
         shadow,
         shadowStallNotifiedAt: null,
         roundNotifiedSha: null,
+        risk: null,
       });
       delete current.qaResults[taskKey];
     });
@@ -5153,16 +5229,163 @@ ${sections.join("\n\n---\n\n")}`;
     });
   }
 
+  // ----- Merge risk -----
+
+  /** QA's standing on the head commit, as the risk summary reads it. A pass carries through later commits. */
+  function riskQaState(pr: Pick<Pr, "qa" | "headSha">): RiskFacts["qa"] {
+    const qa = pr.qa;
+    if (qa == null) return "none";
+    if (qa.verdict === "fail") return "fail";
+    if (qa.verdict === "skipped") return qa.sha === pr.headSha ? "skipped" : "none";
+    return qa.sha === pr.headSha ? "pass" : "carried";
+  }
+
+  /**
+   * Once a PR is out of draft, with every approval on its head: work out the facts, and start a Risk reviewer
+   * when one is flagged. When the summary is settled, post it on the PR once per commit. It runs before
+   * the merge card, which waits a bounded time for it. Never throws: the card must not depend on it.
+   */
+  async function maybeAssessRisk(prefix: string, hostId: string, repo: string, prNumber: number): Promise<void> {
+    try {
+      const factory = await findFactory(prefix);
+      const pr = factory.prs.find((candidate) => candidate.number === prNumber);
+      // Marked ready by the factory or by hand: either way every approval is on this head.
+      if (!factory.riskSummaryEnabled || pr === undefined || pr.state !== "open" || pr.isDraft || !approvalsCover(pr, pr.headSha)) return;
+      const risk = pr.risk?.sha === pr.headSha ? pr.risk : await startRiskAssessment(factory, hostId, repo, pr);
+      if (risk === null) return;
+      if (risk.overall === null && (await riskSettled(risk))) await settleRisk(prefix, pr.number, risk.sha);
+      const settled = (await findFactory(prefix)).prs.find((candidate) => candidate.number === prNumber)?.risk;
+      if (settled?.sha === pr.headSha && settled.overall !== null && settled.commentedAt === null) {
+        await prComment(hostId, repo, pr.number, riskComment(riskSummaryOf(settled), settled.sha));
+        await mutateFactory(prefix, (current) => {
+          const target = current.prs.find((candidate) => candidate.number === prNumber);
+          if (target?.risk?.sha === settled.sha) target.risk.commentedAt = new Date().toISOString();
+        });
+      }
+    } catch (error) {
+      bb.log.warn(`could not assess the merge risk of ${prefix} PR #${prNumber}: ${String(error)}`);
+    }
+  }
+
+  async function startRiskAssessment(factory: Factory, hostId: string, repo: string, pr: Pr): Promise<PrRisk | null> {
+    const view = JSON.parse(await gh(hostId, ["pr", "view", String(pr.number), "--repo", repo, "--json", "files,headRefOid"])) as { files?: { path: string; additions?: number; deletions?: number }[]; headRefOid?: string };
+    if (view.headRefOid !== undefined && view.headRefOid !== pr.headSha) return null;
+    const files = (view.files ?? []).map((file) => ({ path: file.path, additions: file.additions ?? 0, deletions: file.deletions ?? 0 }));
+    const facts = riskFacts(files, { deep: pr.deep, qa: riskQaState(pr), qaGate: factory.evidenceContract });
+    const flags = riskFlags(facts);
+    const record: PrRisk = { sha: pr.headSha, facts, threadId: null, startedAt: new Date().toISOString(), review: null, reviewedAt: null, overall: null, source: null, settledAt: null, commentedAt: null };
+    let saved = false;
+    await mutateFactory(factory.prefix, (current) => {
+      const target = current.prs.find((candidate) => candidate.number === pr.number);
+      if (target === undefined || target.headSha !== pr.headSha || target.risk?.sha === pr.headSha) return;
+      target.risk = record;
+      saved = true;
+    });
+    if (!saved) return null;
+    if (flags.length > 0) {
+      try {
+        const threadId = await assign({
+          taskKey: pr.taskKey,
+          role: "risk",
+          pr: { number: pr.number, url: pr.url },
+          instructions: `The factory flagged PR #${pr.number} at \`${pr.headSha.slice(0, 7)}\` for: ${flags.join(", ")}. The diff has ${facts.files} file(s) and ${facts.lines} changed lines. Rate the commit \`${pr.headSha.slice(0, 7)}\` only.`,
+        });
+        await mutateFactory(factory.prefix, (current) => {
+          const target = current.prs.find((candidate) => candidate.number === pr.number);
+          if (target?.risk?.sha === pr.headSha) target.risk.threadId = threadId;
+        });
+        record.threadId = threadId;
+      } catch (error) {
+        // Without a reviewer the summary settles on the facts, and says the review didn't happen.
+        bb.log.warn(`could not start the Risk reviewer for PR #${pr.number}: ${String(error)}`);
+      }
+    }
+    return record;
+  }
+
+  /** Reviewed, nothing to review, out of time, or the reviewer ended without recording. */
+  async function riskSettled(risk: PrRisk): Promise<boolean> {
+    if (risk.review !== null || risk.threadId === null) return true;
+    const age = Date.now() - Date.parse(risk.startedAt);
+    if (!(age < RISK_REVIEW_WAIT_MS)) return true;
+    // A thread that was just spawned may not have started its turn yet.
+    return age > 60_000 && (await threadDone(risk.threadId));
+  }
+
+  function riskSummaryOf(risk: PrRisk): RiskSummary {
+    return riskSummary(risk.facts, risk.review, true);
+  }
+
+  async function settleRisk(prefix: string, prNumber: number, sha: string): Promise<void> {
+    await mutateFactory(prefix, (current) => {
+      const target = current.prs.find((candidate) => candidate.number === prNumber);
+      const risk = target?.risk;
+      if (risk == null || risk.sha !== sha || risk.overall !== null) return;
+      const summary = riskSummaryOf(risk);
+      risk.overall = summary.overall;
+      risk.source = summary.source;
+      risk.settledAt = new Date().toISOString();
+    });
+  }
+
+  /** The Risk reviewer's ratings, from the thread the factory started for the PR's current head only. */
+  async function recordRisk(args: { taskKey: string; review: RiskReview; pr: number | null; threadId: string | null }): Promise<Pr> {
+    const task = await getTaskByKey(args.taskKey);
+    const factory = await factoryForTaskKey(task.key);
+    const open = factory.prs.filter((candidate) => candidate.taskKey === task.key && candidate.state === "open" && (args.pr === null || candidate.number === args.pr));
+    const pr = open.find((candidate) => candidate.risk?.sha === candidate.headSha && candidate.risk.threadId !== null && candidate.risk.threadId === args.threadId);
+    if (args.threadId === null || pr === undefined) {
+      throw new PluginCliError(`Only the Risk reviewer the factory started for ${task.key}'s latest commit can record its merge risk.`, {
+        code: "not_the_risk_reviewer",
+        hint: "The factory starts one when a ready PR has something flagged. To see a PR's merge risk, run the command without ratings.",
+      });
+    }
+    if (pr.risk!.overall !== null) {
+      throw new PluginCliError(`PR #${pr.number}'s merge risk at this commit is already settled${pr.risk!.review === null ? ", from the facts alone, because the Risk reviewer's time ran out" : ""}.`, { code: "risk_settled" });
+    }
+    const clean = (rating: RiskReview["impact"]) => ({ level: rating.level, reason: cleanRiskReason(rating.reason) });
+    const review: RiskReview = { impact: clean(args.review.impact), rollback: clean(args.review.rollback), errors: clean(args.review.errors) };
+    let updated: Pr | undefined;
+    await mutateFactory(factory.prefix, (current) => {
+      const target = current.prs.find((candidate) => candidate.number === pr.number);
+      if (target?.risk?.sha !== pr.headSha || target.headSha !== pr.headSha) return;
+      if (target.risk.overall !== null) return;
+      target.risk.review = review;
+      target.risk.reviewedAt = new Date().toISOString();
+      updated = target;
+    });
+    if (updated === undefined) throw new PluginCliError(`PR #${pr.number} has a new commit, or its merge risk was settled meanwhile, so this rating wasn't recorded.`, { code: "risk_stale" });
+    wakePrWatch();
+    return updated;
+  }
+
+  /** The merge risk as text, for `bb factory risk` without ratings. */
+  function riskText(pr: Pr): string {
+    const risk = pr.risk;
+    if (risk === null) return `PR #${pr.number} has no merge-risk summary yet: it's made once the PR is ready.`;
+    const stale = risk.sha === pr.headSha ? "" : ` That was at \`${risk.sha.slice(0, 7)}\`; the PR has newer commits.`;
+    if (risk.overall === null) return `PR #${pr.number}'s merge risk is waiting for the Risk reviewer.${stale}`;
+    const summary = riskSummaryOf(risk);
+    return [`PR #${pr.number} merge risk: ${riskLevelWord(summary.overall)}.${stale}`, ...summary.lines.map((line) => `  ${line.label}: ${line.level === null ? "not judged" : riskLevelWord(line.level)}: ${line.reason}`)].join("\n");
+  }
+
   // ----- Merge card -----
 
   /** One card per factory, because a card takes over the Lead chat's message box while it waits. */
   const openMergeCards = new Map<string, { pr: number; sha: string; controller: AbortController }>();
   const MERGE_CARD_TIMEOUT_MS = 7 * 24 * 60 * 60 * 1000;
 
+  /** A Risk reviewer is still rating this head, inside its time: the card waits for it. */
+  function riskPending(factory: Pick<Factory, "riskSummaryEnabled">, pr: Pick<Pr, "risk" | "headSha">): boolean {
+    const risk = pr.risk;
+    if (!factory.riskSummaryEnabled || risk === null || risk.sha !== pr.headSha || risk.overall !== null || risk.threadId === null) return false;
+    return Date.now() - Date.parse(risk.startedAt) < RISK_REVIEW_WAIT_MS;
+  }
+
   /** Offered once the factory has told the Lead the PR is ready for the person to merge. */
   function mergeCardDue(factory: Factory, pr: Pr): boolean {
     return factory.leadThreadId !== null && pr.state === "open" && !pr.isDraft && pr.merge === null && !leadMayMerge(factory, pr)
-      && pr.approvedNotifiedSha === pr.headSha && pr.mergeCardDismissedSha !== pr.headSha;
+      && pr.approvedNotifiedSha === pr.headSha && pr.mergeCardDismissedSha !== pr.headSha && !riskPending(factory, pr);
   }
 
   /**
@@ -5243,6 +5466,7 @@ ${sections.join("\n\n---\n\n")}`;
       overlap: overlaps.length === 0 ? null : `Shares files with ${overlaps.map((overlap) => `#${overlap.number} (${overlap.taskKey})`).join(" and ")}, so merging either first may conflict with the other.`,
       files: files.slice(0, 60),
       moreFiles: Math.max(0, files.length - 60),
+      risk: factory.riskSummaryEnabled && pr.risk?.sha === pr.headSha && pr.risk.overall !== null ? riskSummaryOf(pr.risk) : null,
     } };
   }
 
@@ -5733,6 +5957,7 @@ ${sections.join("\n\n---\n\n")}`;
         if (await maybeReturnToDraft(factory, hostId, repo, pr)) return;
         await maybeAnnounceReapproval(factory, hostId, repo, pr);
         await maybeMarkReady(factory, hostId, repo, pr);
+        await maybeAssessRisk(prefix, hostId, repo, pr.number);
         await maybeOfferMergeCard(prefix, hostId, repo, pr.number);
       });
     }
@@ -6275,14 +6500,15 @@ ${findings}`;
       }
       bb.log.info(`supervisor retried ${event.threadId} (${why})`);
       // The writer reports to nobody, so the Lead has no result to wait for.
-      if (agent.role !== "lead" && agent.role !== "shadow" && agent.role !== "scenarios") {
+      if (agent.role !== "lead" && agent.role !== "shadow" && agent.role !== "scenarios" && agent.role !== "risk") {
         await tellLead(factory, `[factory] ${who} stopped: ${why}. The factory retried it once; wait for its result before reassigning the task.`);
       }
       return;
     }
     // The Lead in error already reaches the person through core and push
     // notifications; the shadow reports to nobody.
-    if (agent.role === "lead" || agent.role === "shadow" || agent.taskKey === null) {
+    // The Risk reviewer is bounded: the merge card stops waiting for it, and says so.
+    if (agent.role === "lead" || agent.role === "shadow" || agent.role === "risk" || agent.taskKey === null) {
       bb.log.warn(`supervisor: ${who} failed and was not retried (${why})`);
       return;
     }
@@ -6419,6 +6645,7 @@ ${findings}`;
       tokenProfile: computeTokenProfile(factoryStorage.tokenTurns(factory.prefix, from, until), factory.prs),
       holdouts: computeHoldoutHealth(factory.holdouts, from, until),
       stopReports: computeStopReportHealth(factory.stopReports, factory.prs, from, until),
+      risk: computeRiskHealth(factory.prs, from, until),
     };
   }
 
@@ -6437,6 +6664,7 @@ ${findings}`;
       ...(health.undated === 0 ? [] : [`  Left out: ${health.undated} PR(s) with no open date, which can't be placed in the window.`]),
       ...(health.holdouts === null ? [] : [`  ${holdoutHealthLine(health.holdouts)}`]),
       `  ${stopReportHealthLine(health.stopReports)}`,
+      `  ${riskHealthLine(health.risk)}`,
       ...(health.tokenProfile === null ? [] : ["", ...formatTokenProfile(health.tokenProfile, window)]),
     ].join("\n");
   }
@@ -6650,6 +6878,10 @@ ${findings}`;
             break;
           case "holdouts":
             await mutateFactory(factory.prefix, (current) => { current.holdoutsEnabled = change.enabled; });
+            break;
+          case "riskSummary":
+            await mutateFactory(factory.prefix, (current) => { current.riskSummaryEnabled = change.enabled; });
+            wakePrWatch();
             break;
           case "mergePolicy":
             await mutateFactory(factory.prefix, (current) => { current.mergePolicy = change.policy; });
@@ -7357,6 +7589,67 @@ ${findings}`;
               threadId: ctx.threadId ?? null,
             });
             return { exitCode: 0, stdout: `Recorded ${input.options.verdict} from ${ROLES[input.options.role as PrReviewRole].label} on PR #${pr.number}.${unlisted > 0 ? ` GitHub didn't list ${unlisted} of its files, so your coverage couldn't check them. Say so under "Not checked:".` : ""}` };
+          },
+        }),
+        risk: cliCommand({
+          summary: "Show the merge risk of the task's pull request, or, as the Risk reviewer the factory started, record your ratings",
+          positionals: [{ name: "task", description: "Task key, such as APP-12", required: true }],
+          options: {
+            impact: { type: "enum", values: RISK_LEVELS, description: "low, medium or high: the blast radius" },
+            "impact-why": { type: "string", description: "One line on why" },
+            rollback: { type: "enum", values: RISK_LEVELS, description: "low, medium or high: can a revert undo it" },
+            "rollback-why": { type: "string", description: "One line on why" },
+            errors: { type: "enum", values: RISK_LEVELS, description: "low, medium or high: would a failure in production go unnoticed" },
+            "errors-why": { type: "string", description: "One line on why" },
+            pr: { type: "integer", min: 1, max: 10_000_000, description: "PR number; defaults to the task's open PR" },
+          },
+          async run(input, ctx) {
+            const { options } = input;
+            const ratings = [options.impact, options["impact-why"], options.rollback, options["rollback-why"], options.errors, options["errors-why"]];
+            if (ratings.every((value) => value === undefined)) {
+              const task = await getTaskByKey(input.positionals.task);
+              const factory = await factoryForTaskKey(task.key);
+              const pr = options.pr === undefined ? latestPr(factory, task.key) : factory.prs.find((candidate) => candidate.number === options.pr && candidate.taskKey === task.key) ?? null;
+              if (pr === null) return { exitCode: 0, stdout: `${task.key} has no pull request yet.` };
+              return { exitCode: 0, stdout: factory.riskSummaryEnabled ? riskText(pr) : `${factory.prefix} has the merge-risk summary off. ${riskText(pr)}` };
+            }
+            const rating = (level: string | undefined, why: string | undefined, flag: string) => {
+              if (level === undefined || why === undefined || why.trim() === "") {
+                throw new PluginCliError("Give all three ratings, each with its reason: --impact, --rollback and --errors, with --impact-why, --rollback-why and --errors-why.", { code: "risk_input", hint: `${flag} is missing or empty.` });
+              }
+              return { level: level as RiskLevel, reason: why };
+            };
+            const pr = await recordRisk({
+              taskKey: input.positionals.task,
+              review: {
+                impact: rating(options.impact, options["impact-why"], "--impact"),
+                rollback: rating(options.rollback, options["rollback-why"], "--rollback"),
+                errors: rating(options.errors, options["errors-why"], "--errors"),
+              },
+              pr: options.pr ?? null,
+              threadId: ctx.threadId ?? null,
+            });
+            return { exitCode: 0, stdout: `Recorded the merge risk of PR #${pr.number}. The factory posts it on the PR and the merge card. You're done.` };
+          },
+        }),
+        "risk-summary": cliCommand({
+          summary: "Show or set whether ready PRs get a merge-risk summary on the merge card and the PR: on or off (setting it is for the person only)",
+          positionals: [
+            { name: "factory", description: "Factory prefix", required: true },
+            { name: "state", description: "on or off; omit to show it" },
+          ],
+          async run(input, ctx) {
+            const factory = await findFactory(input.positionals.factory);
+            const requested = input.positionals.state;
+            if (requested === undefined) return { exitCode: 0, stdout: `${factory.prefix}: merge-risk summary ${factory.riskSummaryEnabled ? "on" : "off"}` };
+            if (requested !== "on" && requested !== "off") throw new PluginCliError("The state is on or off.", { code: "risk_summary_input" });
+            if (ctx.threadId != null) throw new PluginCliError("Only the person can change this, from outside an agent thread.", { code: "risk_summary_person_only" });
+            await mutateFactory(factory.prefix, (current) => { current.riskSummaryEnabled = requested === "on"; });
+            bb.realtime.publish(BOARD_CHANGED, { prefix: factory.prefix });
+            wakePrWatch();
+            return { exitCode: 0, stdout: requested === "on"
+              ? `${factory.prefix}: merge-risk summary on. Each PR that's ready from now on gets one on its merge card and as a PR comment, with a Risk reviewer when something is flagged. It doesn't change who may merge.`
+              : `${factory.prefix}: merge-risk summary off. No new summaries or Risk reviewers; ones already posted stay on their PRs.` };
           },
         }),
         merge: cliCommand({

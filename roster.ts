@@ -79,11 +79,11 @@ export const ROSTER_PRESET_NOTES: Record<RosterPreset, string> = {
   "max-depth": "Balanced, with more reasoning where judgment matters and a third provider for Reviewer 2",
 };
 /** The trial seats keep what the person set up for the trial. */
-export const PRESET_SEATS = ["lead", "plan", "explore", "build", "qa", "design", "review1", "review2", "security", "designreview", "scenarios"] as const;
+export const PRESET_SEATS = ["lead", "plan", "explore", "build", "qa", "design", "review1", "review2", "security", "designreview", "scenarios", "risk"] as const;
 /** Reviewer seats stay the person's choice: proposed, but applied only when ticked. */
 const PRESET_REVIEWER_SEATS: readonly string[] = ["review1", "review2", "security"];
 /** Seats that read more than they write, where Lower cost lowers reasoning. */
-const PRESET_READING_SEATS: readonly string[] = ["lead", "qa", "explore", "designreview", "scenarios"];
+const PRESET_READING_SEATS: readonly string[] = ["lead", "qa", "explore", "designreview", "scenarios", "risk"];
 /** Seats where Maximum depth raises reasoning. */
 const PRESET_DEPTH_SEATS: readonly string[] = ["plan", "designreview", "review1", "review2", "security"];
 /** Levels a preset may pick. none, ultra and ultracode are special modes: kept when set, never picked. */
@@ -130,7 +130,7 @@ export function computePreset(preset: RosterPreset, roles: Readonly<Record<strin
     if (current === undefined) continue;
     const why: string[] = [];
     let avoid: string[] = [];
-    if (key === "review1") avoid = of("build");
+    if (key === "review1" || key === "risk") avoid = of("build");
     if (key === "designreview") avoid = of("plan");
     if (key === "review2" && preset === "max-depth") avoid = [...of("build"), ...of("review1")];
     let providerId = pick(current.providerId, avoid);
@@ -153,6 +153,7 @@ export function computePreset(preset: RosterPreset, roles: Readonly<Record<strin
     else if (fallback === "alone") why.push("No other provider is available here, so it can't be independent");
     else if (moved) {
       why.push(key === "review1" ? `Moved to ${providerId}: Reviewer 1 checks the Builder's work, so it runs on another provider`
+        : key === "risk" ? `Moved to ${providerId}: the Risk reviewer judges what the Builder's change could break, so it runs on another provider`
         : key === "designreview" ? `Moved to ${providerId}: design reviewers read the plan fresh, so they run on a provider other than the Planner's`
         : key === "review2" ? `Moved to ${providerId}: at maximum depth, Reviewer 2 adds a third provider`
         : `Moved to ${providerId}`);
