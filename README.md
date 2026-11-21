@@ -397,14 +397,19 @@ The merge-risk summary is a judgment. Outcome signals check it against what happ
   button writes it, or titled `Revert "APP-12: …"`. The factory opens a Backlog task to find
   out why, comments on the reverted task and sends you a notification. Nothing from the
   revert's text reaches an agent, and the task stays in Backlog until you move it.
-- **CI failing on the base branch** at the PR's merge commit. Only the latest run of each
-  workflow counts, so a rerun that passes clears it. You get a notification and the task
+- **CI failing on the base branch** at the PR's merge commit. Only push runs on the base
+  branch count, not a tag, release or schedule run at the same commit, and only the latest
+  run of each workflow, so a rerun that passes clears it. A run waiting for approval is
+  pending, and a workflow that never finishes doesn't hide another's failure. You get a notification and the task
   gets a comment, but no task is opened, since base-branch CI can be flaky.
 - **A problem you record:** `bb factory outcome APP-12 --kind bug|incident|revert --note "…"`,
   from your own terminal only, so an agent can't write the record its work is judged by.
 
 Health shows, for each merge-risk level, how many merged PRs had one of these within 14
-days: High should go wrong more often than Low. Until it does, the rating stays
+days: High should go wrong more often than Low. Only PRs the factory watched after merging
+count, plus any you recorded something on, so a PR merged while signals were off doesn't
+read as a clean merge. Turning signals off stops reading GitHub; what's recorded stays in
+Health. One revert is counted per PR, whether you or the factory recorded it. Until it does, the rating stays
 informational. Reverts and CI are read every 10 minutes at most. CI is read with a
 read-only `gh run list`, which the host worker allows only for one commit's runs, as JSON.
 A revert pushed straight to the base branch, without a PR, isn't seen; record it yourself.

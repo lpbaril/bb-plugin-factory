@@ -7152,7 +7152,7 @@ test('CI at a merge commit counts only the latest run of each workflow', () => {
 
 test('health counts problems within 14 days of merge, by merge risk, and leaves out cleared CI failures', () => {
   const now = Date.parse('2026-11-30T00:00:00Z');
-  const pr = (riskLevel, mergedAt, signals = []) => ({ state: 'merged', mergedAt, riskLevel, signals });
+  const pr = (riskLevel, mergedAt, signals = [], watched = true) => ({ state: 'merged', watched, mergedAt, riskLevel, signals });
   const signal = (kind, at, clearedAt = null) => ({ kind, at, clearedAt });
   const health = computeOutcomeHealth([
     pr('low', '2026-11-10T00:00:00Z'),
@@ -7160,8 +7160,10 @@ test('health counts problems within 14 days of merge, by merge risk, and leaves 
     pr('high', '2026-11-10T00:00:00Z', [signal('revert', '2026-11-12T00:00:00Z')]),
     pr('high', '2026-11-01T00:00:00Z', [signal('bug', '2026-11-25T00:00:00Z')]),
     pr(null, '2026-11-25T00:00:00Z', [signal('ci-failure', '2026-11-25T01:00:00Z')]),
-    { state: 'closed', mergedAt: null, riskLevel: 'medium', signals: [] },
+    { state: 'closed', watched: true, mergedAt: null, riskLevel: 'medium', signals: [] },
+    pr('medium', '2026-11-10T00:00:00Z', [], false),
   ], null, null, now);
+  assert.deepEqual(health.byRisk.medium, { merged: 0, withOutcome: 0 }, 'a PR nobody watched, with nothing recorded, is not a clean merge');
   assert.deepEqual(health.byRisk.low, { merged: 2, withOutcome: 0 }, 'a cleared failure does not count');
   assert.deepEqual(health.byRisk.high, { merged: 2, withOutcome: 1 }, 'a bug 24 days later is outside the window');
   assert.deepEqual(health.byRisk.unrated, { merged: 1, withOutcome: 1 });
@@ -7180,6 +7182,7 @@ const outcomeFixture = async (t, { prs = [mergedPr()], initial = {}, runs = () =
   const sent = [];
   const posted = [];
   const created = [];
+  const methods = [];
   const result = await fixture(t, false, { repo: 'owner/repo', prs, outcomesEnabled: true, ...initial }, {
     threads: { list: async () => [{ id: 'thr_builder', environmentBranchName: 'build' }] },
     hostRpc: async ({ input }) => {
@@ -7187,12 +7190,13 @@ const outcomeFixture = async (t, { prs = [mergedPr()], initial = {}, runs = () =
       const [group, command] = input.args;
       if (group === 'pr' && command === 'list' && input.args.includes('merged')) return { code: 0, stderr: '', stdout: JSON.stringify(reverts()) };
       if (group === 'pr' && command === 'list') return { code: 0, stderr: '', stdout: '[]' };
-      if (group === 'pr' && command === 'view' && input.args.at(-1) === 'mergeCommit,mergedAt') return { code: 0, stderr: '', stdout: JSON.stringify({ mergeCommit: { oid: mergeCommit }, mergedAt: mergedAt() }) };
+      if (group === 'pr' && command === 'view' && input.args.at(-1) === 'mergeCommit,mergedAt,baseRefName') return { code: 0, stderr: '', stdout: JSON.stringify({ mergeCommit: { oid: mergeCommit }, mergedAt: mergedAt(), baseRefName: 'main' }) };
       if (group === 'pr' && command === 'view') return { code: 0, stderr: '', stdout: JSON.stringify({ state: 'MERGED', number: 7, url: 'https://example.org/7', title: 't', headRefName: 'build', headRefOid: FULL_A, isDraft: false, additions: 1, deletions: 1 }) };
       if (group === 'run' && command === 'list') return { code: 0, stderr: '', stdout: JSON.stringify(runs()) };
       return { code: 0, stdout: '', stderr: '' };
     },
     tasksRpc: async ({ method, input }) => {
+      methods.push(method);
       if (method === 'notifications.send') { sent.push(input); return { ok: true, channels: [] }; }
       if (method === 'createComment') posted.push(input.body);
       if (method === 'createTask') {
@@ -7203,14 +7207,14 @@ const outcomeFixture = async (t, { prs = [mergedPr()], initial = {}, runs = () =
     },
   });
   await result.harness.behavior.setSettings({ prReviews: true });
-  return { ...result, ghCalls, sent, posted, created, runCalls: () => ghCalls.filter(args => args[0] === 'run') };
+  return { ...result, ghCalls, sent, posted, created, methods, runCalls: () => ghCalls.filter(args => args[0] === 'run') };
 };
-const ciRun = (conclusion, createdAt = '2026-11-21T10:00:00Z', status = 'completed') => ({ name: 'ci', workflowName: 'CI', status, conclusion, createdAt, databaseId: 1 });
+const ciRun = (conclusion, createdAt = '2026-11-21T10:00:00Z', status = 'completed', over = {}) => ({ name: 'ci', workflowName: 'CI', status, conclusion, createdAt, databaseId: 1, headBranch: 'main', event: 'push', ...over });
 
 test('a CI failure on the base branch at the merge commit notifies the person, opens no task, and counts in Health', async t => {
   const { bb, harness, sent, created, posted, runCalls } = await outcomeFixture(t, { prs: [mergedPr({ risk: { sha: FULL_A, facts: riskFacts([file('src/a.ts')], riskEvidence()), threadId: null, startedAt: '', review: null, reviewedAt: null, overall: 'low', source: 'facts', settledAt: '', commentedAt: '' } })], runs: () => [ciRun('failure')] });
   await runPasses(harness);
-  assert.deepEqual(runCalls()[0], ['run', 'list', '--repo', 'owner/repo', '--commit', MERGE_SHA, '--json', 'name,workflowName,status,conclusion,createdAt,databaseId', '--limit', '50']);
+  assert.deepEqual(runCalls()[0], ['run', 'list', '--repo', 'owner/repo', '--commit', MERGE_SHA, '--json', 'name,workflowName,status,conclusion,createdAt,databaseId,headBranch,event', '--limit', '50']);
   const pr = (await readPrs(bb))[0];
   assert.equal(pr.mergeSha, MERGE_SHA);
   assert.deepEqual(pr.outcomes.map(signal => [signal.kind, signal.ref]), [['ci-failure', 'CI']]);
@@ -7284,7 +7288,7 @@ test('a revert of a PR merged more than 14 days earlier is not counted', async t
 test('with outcome signals off, nothing after merge is read', async t => {
   const { harness, ghCalls } = await outcomeFixture(t, { initial: { outcomesEnabled: false }, runs: () => [ciRun('failure')] });
   await runPasses(harness);
-  assert.equal(ghCalls.filter(args => args[0] === 'run' || args.includes('mergeCommit,mergedAt')).length, 0);
+  assert.equal(ghCalls.filter(args => args[0] === 'run' || args.includes('mergeCommit,mergedAt,baseRefName')).length, 0);
 });
 
 test('only the person records an outcome, on the task\'s latest merged PR', async t => {
@@ -7305,4 +7309,60 @@ test('only the person turns outcome signals on or off; the page can only turn th
   assert.equal((await harness.behavior.runCli(['outcomes', 'TEST', 'on'])).exitCode, 0);
   assert.equal((await createFactoryStorage(bb.storage, value => value).read('TEST')).outcomesEnabled, true);
   await assert.rejects(harness.behavior.callRpc('factory_set_option', { prefix: 'TEST', change: { kind: 'outcomes', enabled: false } }), /outcomes TEST off/);
+});
+
+test('a CI failure shows even while another workflow is still waiting; approval and other events don\'t count', () => {
+  const run = (workflowName, conclusion, status = 'completed', over = {}) => ({ workflowName, name: workflowName, status, conclusion, createdAt: '2026-11-21T10:00:00Z', headBranch: 'main', event: 'push', ...over });
+  assert.deepEqual(ciVerdict([run('CI', 'failure'), run('Deploy', null, 'waiting')], 'main'), { state: 'failed', workflows: ['CI'] }, 'a stuck workflow cannot hide a failure');
+  assert.deepEqual(ciVerdict([run('CI', 'action_required')], 'main'), { state: 'running' }, 'waiting for approval is pending, not failed');
+  assert.deepEqual(ciVerdict([run('Release', 'failure', 'completed', { event: 'release' }), run('CI', 'success')], 'main'), { state: 'passed' }, 'a release run does not count');
+  assert.deepEqual(ciVerdict([run('Nightly', 'failure', 'completed', { event: 'schedule' })], 'main'), { state: 'none' });
+  assert.deepEqual(ciVerdict([run('CI', 'failure', 'completed', { headBranch: 'v1.2.0' })], 'main'), { state: 'none' }, 'a tag or another branch at the same commit');
+  assert.deepEqual(ciVerdict([run('CI', 'failure', 'completed', { headBranch: 'v1.2.0' })], null), { state: 'failed', workflows: ['CI'] }, 'without a known base branch, push runs on any branch count');
+});
+
+test('turning outcome signals off keeps what was recorded in Health, and a person\'s entry still counts', async t => {
+  const { harness } = await outcomeFixture(t, { runs: () => [ciRun('failure')] });
+  await runPasses(harness);
+  assert.equal((await harness.behavior.runCli(['outcomes', 'TEST', 'off'])).exitCode, 0);
+  const health = JSON.parse((await harness.behavior.runCli(['health', 'TEST', '--json'])).stdout);
+  assert.deepEqual(health.outcomes.byRisk.unrated, { merged: 1, withOutcome: 1 });
+  assert.match((await harness.behavior.runCli(['health', 'TEST'])).stdout, /Outcomes within 14 days of merge/);
+});
+
+test('an outcome recorded on a PR nobody watched still counts; a PR merged with signals off and nothing recorded does not', async t => {
+  const { harness } = await outcomeFixture(t, { initial: { outcomesEnabled: false } });
+  assert.equal(JSON.parse((await harness.behavior.runCli(['health', 'TEST', '--json'])).stdout).outcomes, null, 'nothing watched, nothing recorded');
+  assert.equal((await harness.behavior.runCli(['outcome', 'TEST-1', '--kind', 'bug', '--note', 'broke'])).exitCode, 0);
+  const health = JSON.parse((await harness.behavior.runCli(['health', 'TEST', '--json'])).stdout);
+  assert.deepEqual(health.outcomes.byRisk.unrated, { merged: 1, withOutcome: 1 });
+});
+
+test('one revert per PR: the person\'s and the factory\'s aren\'t counted twice', async t => {
+  const reverts = () => [{ number: 12, title: 'Revert "x"', body: 'Reverts owner/repo#7', mergedAt: new Date().toISOString(), url: 'https://example.org/12' }];
+  const { bb, harness, created, sent } = await outcomeFixture(t, { initial: { outcomesEnabled: false }, runs: () => [ciRun('success')], reverts });
+  assert.equal((await harness.behavior.runCli(['outcome', 'TEST-1', '--kind', 'revert', '--note', 'reverted by hand'])).exitCode, 0);
+  const twice = await harness.behavior.runCli(['outcome', 'TEST-1', '--kind', 'revert', '--note', 'again']);
+  assert.notEqual(twice.exitCode, 0);
+  assert.match(twice.stderr, /already has a revert recorded, by you/);
+  await harness.behavior.runCli(['outcomes', 'TEST', 'on']);
+  await runPasses(harness);
+  assert.equal((await readPrs(bb))[0].outcomes.filter(signal => signal.kind === 'revert').length, 1);
+  assert.equal(created.length, 0);
+  assert.equal(sent.length, 0);
+});
+
+test('an outcome recorded more than 14 days after the merge is kept, and the person is told Health won\'t count it', async t => {
+  const old = new Date(Date.now() - 20 * 24 * 60 * 60_000).toISOString();
+  const { harness } = await outcomeFixture(t, { prs: [mergedPr({ closedAt: old, mergedAt: old })], initial: { outcomesEnabled: false } });
+  const recorded = await harness.behavior.runCli(['outcome', 'TEST-1', '--kind', 'bug', '--note', 'late']);
+  assert.equal(recorded.exitCode, 0);
+  assert.match(recorded.stdout, /more than 14 days after the merge, so it's kept on the PR but Health doesn't count it/);
+});
+
+test('CI checks that find nothing new make no Tasks call', async t => {
+  const { harness, methods, runCalls } = await outcomeFixture(t, { runs: () => [ciRun(null, '2026-11-21T10:00:00Z', 'in_progress')] });
+  await runPasses(harness);
+  assert.equal(runCalls().length, 1, 'CI was read');
+  assert.equal(methods.filter(method => method === 'getTaskByKey' || method === 'createComment').length, 0);
 });

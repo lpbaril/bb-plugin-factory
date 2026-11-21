@@ -15,7 +15,7 @@ export const GH_ALLOWED = [
 ] as const;
 
 /** The fields `gh run list` may ask for: enough to tell a failed run from a passing one. */
-export const RUN_LIST_FIELDS = ["name", "workflowName", "status", "conclusion", "headSha", "createdAt", "databaseId", "event"] as const;
+export const RUN_LIST_FIELDS = ["name", "workflowName", "status", "conclusion", "headSha", "headBranch", "createdAt", "databaseId", "event"] as const;
 /**
  * `gh run list` is read-only, but only one form is allowed: the runs of one commit, as JSON, with
  * named fields and a limit. `--repo`, `--commit`, `--json` and `--limit` each once, nothing else.
