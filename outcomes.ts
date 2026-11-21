@@ -36,16 +36,23 @@ export function revertedPrNumbers(revert: Pick<MergedPr, "title" | "body">, repo
   return [...found];
 }
 
-/** A workflow run, as `gh run list --json name,workflowName,status,conclusion,createdAt,databaseId` gives it. */
-export type CiRun = { name?: string | null; workflowName?: string | null; status?: string | null; conclusion?: string | null; createdAt?: string | null; databaseId?: number | null };
-const FAILED = ["failure", "timed_out", "startup_failure", "action_required"];
+/** A workflow run, as `gh run list --json name,workflowName,status,conclusion,createdAt,databaseId,headBranch,event` gives it. */
+export type CiRun = { name?: string | null; workflowName?: string | null; status?: string | null; conclusion?: string | null; createdAt?: string | null; databaseId?: number | null; headBranch?: string | null; event?: string | null };
+const FAILED = ["failure", "timed_out", "startup_failure"];
+/** Finished, but waiting for someone to approve it: still pending, not a failure. */
+const WAITING = ["action_required"];
 
 /**
- * What CI says about a merge commit: still running, no runs at all, green, or the workflows whose
- * latest run failed. Only the latest run of each workflow counts, so a rerun that passes clears a
- * failure, as on GitHub. A cancelled or skipped run isn't a failure.
+ * What CI on the base branch says about a merge commit: the workflows whose latest run failed, still
+ * running, no runs at all, or green. Only push runs on the base branch count, not a tag, a schedule
+ * or another branch at the same commit; without a known base branch, push runs on any branch do.
+ * Only the latest run of each workflow counts, so a rerun that passes clears a failure, as on GitHub.
+ * A failure is reported even while another workflow is still going, so one that never finishes
+ * can't hide it. A cancelled or skipped run isn't a failure, and one waiting for approval is pending.
  */
-export function ciVerdict(runs: readonly CiRun[]): { state: "running" | "none" | "passed" } | { state: "failed"; workflows: string[] } {
+export function ciVerdict(allRuns: readonly CiRun[], baseBranch: string | null = null): { state: "running" | "none" | "passed" } | { state: "failed"; workflows: string[] } {
+  // Runs listed before these fields were asked for carry neither, and count as before.
+  const runs = allRuns.filter((run) => (run.event == null || run.event === "push") && (baseBranch === null || run.headBranch == null || run.headBranch === baseBranch));
   if (runs.length === 0) return { state: "none" };
   const latest = new Map<string, CiRun>();
   for (const run of runs) {
@@ -55,10 +62,11 @@ export function ciVerdict(runs: readonly CiRun[]): { state: "running" | "none" |
     if (previous === undefined || at(run) > at(previous) || (at(run) === at(previous) && (run.databaseId ?? 0) > (previous.databaseId ?? 0))) latest.set(key, run);
   }
   const current = [...latest.values()];
-  if (current.some((run) => (run.status ?? "").toLowerCase() !== "completed")) return { state: "running" };
-  const failed = current.filter((run) => FAILED.includes((run.conclusion ?? "").toLowerCase()));
-  if (failed.length === 0) return { state: "passed" };
-  return { state: "failed", workflows: [...new Set(failed.map((run) => (run.workflowName ?? run.name ?? "unnamed").slice(0, 100)))] };
+  const completed = (run: CiRun) => (run.status ?? "").toLowerCase() === "completed";
+  const failed = current.filter((run) => completed(run) && FAILED.includes((run.conclusion ?? "").toLowerCase()));
+  if (failed.length > 0) return { state: "failed", workflows: [...new Set(failed.map((run) => (run.workflowName ?? run.name ?? "unnamed").slice(0, 100)))] };
+  if (current.some((run) => !completed(run) || WAITING.includes((run.conclusion ?? "").toLowerCase()))) return { state: "running" };
+  return { state: "passed" };
 }
 
 /** A note from the person: one line, capped. */
@@ -70,6 +78,8 @@ export function cleanOutcomeNote(text: string): string {
 export type OutcomeSignal = { kind: OutcomeKind; at: string; clearedAt: string | null };
 export type OutcomePr = {
   state: string;
+  /** Whether the factory watched it after merging. A PR nobody watched and with nothing recorded isn't counted. */
+  watched: boolean;
   mergedAt: string | null;
   riskLevel: "low" | "medium" | "high" | null;
   signals: readonly OutcomeSignal[];
@@ -87,7 +97,8 @@ export type OutcomeHealth = {
 /**
  * The calibration: of the PRs rated low, medium or high, how many had a revert, a CI failure on
  * their merge commit or a recorded problem within 14 days of merging. A CI failure a passing rerun
- * cleared doesn't count. PRs are counted by when they merged, in [from, until).
+ * cleared doesn't count. PRs are counted by when they merged, in [from, until). A PR merged while
+ * signals were off, and with nothing recorded, isn't counted: a zero there means nobody looked.
  */
 export function computeOutcomeHealth(prs: readonly OutcomePr[], from: number | null, until: number | null, now = Date.now()): OutcomeHealth {
   const bucket = (): OutcomeBucket => ({ merged: 0, withOutcome: 0 });
@@ -97,7 +108,7 @@ export function computeOutcomeHealth(prs: readonly OutcomePr[], from: number | n
     watching: 0,
   };
   for (const pr of prs) {
-    if (pr.state !== "merged" || pr.mergedAt === null) continue;
+    if (pr.state !== "merged" || pr.mergedAt === null || (!pr.watched && pr.signals.length === 0)) continue;
     const merged = Date.parse(pr.mergedAt);
     if (!Number.isFinite(merged) || (from !== null && !(merged >= from)) || (until !== null && !(merged < until))) continue;
     const counted = pr.signals.filter((signal) => signal.clearedAt === null && Date.parse(signal.at) - merged <= OUTCOME_WINDOW_MS);

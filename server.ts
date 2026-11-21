@@ -286,6 +286,8 @@ const prSchema = z.object({
   /** The commit the merge made on the base branch, and when, read from GitHub once the PR merged. */
   mergeSha: z.string().nullable().default(null),
   mergedAt: z.string().nullable().default(null),
+  /** The branch it merged into, so only that branch's CI counts. */
+  baseBranch: z.string().nullable().default(null),
   /** CI on the base branch at the merge commit, checked with outcome signals on. settledAt: no more checks. */
   postMergeCi: z.object({ state: z.enum(["running", "none", "passed", "failed"]), checkedAt: z.string(), failedAt: z.string().nullable(), settledAt: z.string().nullable() }).nullable().default(null),
   outcomes: z.array(outcomeSignalSchema).default([]),
@@ -4871,6 +4873,7 @@ ${sections.join("\n\n---\n\n")}`;
         risk: null,
         mergeSha: null,
         mergedAt: null,
+        baseBranch: null,
         postMergeCi: null,
         outcomes: [],
       });
@@ -5281,15 +5284,22 @@ ${sections.join("\n\n---\n\n")}`;
 
   /** A notification to the person's phone and desktop, opening the Lead's chat. Nothing goes to the Lead. */
   async function notifyPerson(factory: Factory, title: string, body: string): Promise<void> {
+    // Bounded, as page notices are: it runs inside the PR pass, which a hung call would stall.
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      await bb.sdk.plugins.callRpc({
-        pluginId: "push-notifications",
-        method: "notifications.send",
-        input: { title, body, ...(factory.leadThreadId === null ? {} : { threadId: factory.leadThreadId }) } as never,
-        outputSchema: z.unknown(),
-      });
+      await Promise.race([
+        bb.sdk.plugins.callRpc({
+          pluginId: "push-notifications",
+          method: "notifications.send",
+          input: { title, body, ...(factory.leadThreadId === null ? {} : { threadId: factory.leadThreadId }) } as never,
+          outputSchema: z.unknown(),
+        }),
+        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`no answer in ${PAGE_NOTICE_TIMEOUT_MS / 1000}s`)), PAGE_NOTICE_TIMEOUT_MS); }),
+      ]);
     } catch (error) {
       bb.log.warn(`could not send the notification "${title}": ${String(error)}`);
+    } finally {
+      clearTimeout(timer);
     }
   }
 
@@ -5323,7 +5333,7 @@ ${sections.join("\n\n---\n\n")}`;
     let pr = (await findFactory(prefix)).prs.find((candidate) => candidate.number === prNumber);
     if (pr === undefined || pr.postMergeCi?.settledAt != null) return;
     if (pr.mergeSha === null) {
-      const view = JSON.parse(await gh(hostId, ["pr", "view", String(prNumber), "--repo", repo, "--json", "mergeCommit,mergedAt"])) as { mergeCommit?: { oid?: string } | null; mergedAt?: string | null };
+      const view = JSON.parse(await gh(hostId, ["pr", "view", String(prNumber), "--repo", repo, "--json", "mergeCommit,mergedAt,baseRefName"])) as { mergeCommit?: { oid?: string } | null; mergedAt?: string | null; baseRefName?: string | null };
       const oid = view.mergeCommit?.oid ?? null;
       if (oid === null || !/^[0-9a-f]{40}$/.test(oid)) return;
       pr = await mutateFactory(prefix, (current) => {
@@ -5331,14 +5341,15 @@ ${sections.join("\n\n---\n\n")}`;
         if (target !== undefined) {
           target.mergeSha = oid;
           target.mergedAt = view.mergedAt ?? target.mergedAt;
+          target.baseBranch = typeof view.baseRefName === "string" && view.baseRefName !== "" ? view.baseRefName : null;
         }
         return current;
       }).then((current) => current.prs.find((candidate) => candidate.number === prNumber));
       if (pr === undefined || pr.mergeSha === null) return;
     }
     const sha = pr.mergeSha!;
-    const runs = JSON.parse(await gh(hostId, ["run", "list", "--repo", repo, "--commit", sha, "--json", "name,workflowName,status,conclusion,createdAt,databaseId", "--limit", "50"])) as CiRun[];
-    const verdict = ciVerdict(Array.isArray(runs) ? runs : []);
+    const runs = JSON.parse(await gh(hostId, ["run", "list", "--repo", repo, "--commit", sha, "--json", "name,workflowName,status,conclusion,createdAt,databaseId,headBranch,event", "--limit", "50"])) as CiRun[];
+    const verdict = ciVerdict(Array.isArray(runs) ? runs : [], pr.baseBranch);
     const now = new Date().toISOString();
     const merged = mergedTime(pr);
     let failedNow: string[] | null = null;
@@ -5372,6 +5383,7 @@ ${sections.join("\n\n---\n\n")}`;
       }
       target.postMergeCi = { state: "running", checkedAt: now, failedAt: previous?.failedAt ?? null, settledAt: null };
     });
+    if (failedNow === null && !cleared) return;
     const factory = await findFactory(prefix);
     const task = await getTaskByKey(pr.taskKey).catch(() => null);
     if (failedNow !== null) {
@@ -5401,13 +5413,14 @@ ${sections.join("\n\n---\n\n")}`;
       for (const number of reverted) {
         const pr = factory.prs.find((candidate) => candidate.number === number && candidate.state === "merged");
         const ref = `#${revert.number}`;
-        if (pr === undefined || number === revert.number || pr.outcomes.some((signal) => signal.kind === "revert" && signal.ref === ref)) continue;
+        // One revert per PR: the person may already have recorded the one the factory finds now.
+        if (pr === undefined || number === revert.number || pr.outcomes.some((signal) => signal.kind === "revert")) continue;
         const at = revert.mergedAt ?? new Date().toISOString();
         if (Date.parse(at) - mergedTime(pr) > OUTCOME_WINDOW_MS) continue;
         let added = false;
         factory = await mutateFactory(prefix, (current) => {
           const target = current.prs.find((candidate) => candidate.number === number);
-          if (target === undefined || target.outcomes.some((signal) => signal.kind === "revert" && signal.ref === ref)) return current;
+          if (target === undefined || target.outcomes.some((signal) => signal.kind === "revert")) return current;
           target.outcomes.push({ kind: "revert", at, ref, note: null, clearedAt: null, taskKey: null });
           added = true;
           return current;
@@ -5445,7 +5458,7 @@ ${sections.join("\n\n---\n\n")}`;
   }
 
   /** The person records what happened after a merge: a bug, an incident, or a revert the factory missed. */
-  async function recordOutcome(args: { taskKey: string; kind: (typeof MANUAL_OUTCOME_KINDS)[number]; note: string; pr: number | null }): Promise<Pr> {
+  async function recordOutcome(args: { taskKey: string; kind: (typeof MANUAL_OUTCOME_KINDS)[number]; note: string; pr: number | null }): Promise<{ pr: Pr; counted: boolean }> {
     const task = await getTaskByKey(args.taskKey);
     const factory = await factoryForTaskKey(task.key);
     const merged = factory.prs.filter((pr) => pr.taskKey === task.key && pr.state === "merged" && (args.pr === null || pr.number === args.pr));
@@ -5455,15 +5468,22 @@ ${sections.join("\n\n---\n\n")}`;
     }
     const note = cleanOutcomeNote(args.note);
     if (note === "") throw new PluginCliError("Say what happened with --note.", { code: "outcome_input" });
+    const recorded = pr.outcomes.find((signal) => signal.kind === "revert");
+    if (args.kind === "revert" && recorded !== undefined) {
+      throw new PluginCliError(`PR #${pr.number} already has a revert recorded${recorded.ref === "person" ? ", by you" : `, from PR ${recorded.ref}`}.`, { code: "outcome_revert_recorded" });
+    }
+    const at = new Date().toISOString();
     let updated: Pr | undefined;
     await mutateFactory(factory.prefix, (current) => {
       const target = current.prs.find((candidate) => candidate.number === pr.number);
       if (target === undefined) return;
-      target.outcomes.push({ kind: args.kind, at: new Date().toISOString(), ref: "person", note, clearedAt: null, taskKey: null });
+      target.outcomes.push({ kind: args.kind, at, ref: "person", note, clearedAt: null, taskKey: null });
       updated = target;
     });
     await comment(task.id, `**Outcome recorded by the person:** ${args.kind} after [PR #${pr.number}](${pr.url}) merged: ${note}`).catch(() => undefined);
-    return updated!;
+    // Health counts what happened within 14 days of the merge; a later one is kept, but not counted.
+    const mergedMs = mergedTime(pr);
+    return { pr: updated!, counted: !Number.isFinite(mergedMs) || Date.parse(at) - mergedMs <= OUTCOME_WINDOW_MS };
   }
 
   // ----- Merge risk -----
@@ -6935,21 +6955,26 @@ ${findings}`;
       holdouts: computeHoldoutHealth(factory.holdouts, from, until),
       stopReports: computeStopReportHealth(factory.stopReports, factory.prs, from, until),
       risk: computeRiskHealth(factory.prs, from, until),
-      outcomes: factory.outcomesEnabled ? outcomeHealthFor(factory, from, until) : null,
+      // From what's stored, whether or not signals are on now: the switch only stops reading GitHub.
+      outcomes: outcomeHealthFor(factory, from, until),
     };
   }
 
   /** Merged PRs by merge time, each with the level of its last risk summary and its signals. */
-  function outcomeHealthFor(factory: Factory, from: number | null, until: number | null): OutcomeHealth {
-    return computeOutcomeHealth(factory.prs.map((pr) => {
+  /** Null when no merged PR was watched or has anything recorded. */
+  function outcomeHealthFor(factory: Factory, from: number | null, until: number | null): OutcomeHealth | null {
+    const health = computeOutcomeHealth(factory.prs.map((pr) => {
       const merged = mergedTime(pr);
       return {
         state: pr.state,
+        // Watched: the factory read CI after it merged, which it does only with signals on.
+        watched: pr.postMergeCi !== null,
         mergedAt: Number.isFinite(merged) ? new Date(merged).toISOString() : null,
         riskLevel: pr.risk?.overall ?? null,
         signals: pr.outcomes,
       };
     }), from, until);
+    return Object.values(health.byRisk).some((entry) => entry.merged > 0) ? health : null;
   }
 
   function formatHealth(prefix: string, health: FactoryHealth): string {
@@ -7952,8 +7977,10 @@ ${findings}`;
           async run(input, ctx) {
             // An agent mustn't be able to write the record its own work is judged by.
             if (ctx.threadId != null) throw new PluginCliError("Only the person can record an outcome, from outside an agent thread.", { code: "outcome_person_only" });
-            const pr = await recordOutcome({ taskKey: input.positionals.task, kind: input.options.kind as (typeof MANUAL_OUTCOME_KINDS)[number], note: input.options.note, pr: input.options.pr ?? null });
-            return { exitCode: 0, stdout: `Recorded a ${input.options.kind} after PR #${pr.number} merged. Health counts it against the PR's merge risk.` };
+            const { pr, counted } = await recordOutcome({ taskKey: input.positionals.task, kind: input.options.kind as (typeof MANUAL_OUTCOME_KINDS)[number], note: input.options.note, pr: input.options.pr ?? null });
+            return { exitCode: 0, stdout: counted
+              ? `Recorded a ${input.options.kind} after PR #${pr.number} merged. Health counts it against the PR's merge risk.`
+              : `Recorded a ${input.options.kind} after PR #${pr.number} merged. It's more than ${OUTCOME_WINDOW_DAYS} days after the merge, so it's kept on the PR but Health doesn't count it.` };
           },
         }),
         outcomes: cliCommand({
