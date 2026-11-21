@@ -372,8 +372,11 @@ The overall level weighs Impact and Verification 2, Rollback 1.5 and Error detec
 and a High anywhere makes it at least Medium. It's shown:
 
 - at the top of the **merge card**, which waits up to 15 minutes for the Risk reviewer,
-  then shows the facts alone and says the review didn't finish;
-- as one **PR comment** per approved commit, from the factory;
+  then shows the facts alone and says no rating came back. A card already showing when
+  the summary is turned on stays;
+- as one **PR comment** per approved commit, from the factory. If QA reports on that
+  commit after the summary was posted, Verification is worked out again and posted as an
+  update, and an open card comes back with it;
 - as a **Risk** badge on the board, and with `bb factory risk APP-12`;
 - in **Health**, counted by level, so the ratings can later be checked against reverts.
 

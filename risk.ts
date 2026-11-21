@@ -21,10 +21,33 @@ export const RISK_REVIEW_WAIT_MS = 15 * 60 * 1000;
 /** The longest reason kept from a Risk reviewer: it's shown on a phone and posted on GitHub. */
 export const RISK_REASON_MAX = 200;
 
-/** Security-sensitive paths: auth, secrets, permissions, payments. Migrations and config are counted on their own. */
-const SECURITY_PATH = /(auth|login|session|token|secret|crypt|password|permission|rbac|rls|payment|billing|stripe|credential|oauth|jwt)/i;
-/** Paths whose changes are hard to undo once merged: a schema or data migration. */
-const MIGRATION_PATH = /(^|\/)(migrations?|alembic|migrate|db\/schema)(\/|$)|\.sql$|(^|\/)schema\.(prisma|rb)$|(^|\/)drizzle\//i;
+/**
+ * Words that make a path security-sensitive: auth, secrets, permissions, payments. They're matched as
+ * whole words of the path, so `urls.py`, `author.ts` and `tokenizer.ts` aren't. Migrations and config
+ * are counted on their own.
+ */
+const SECURITY_WORDS = new Set([
+  "auth", "authn", "authz", "authenticate", "authentication", "authorize", "authorization", "oauth", "oidc", "sso", "saml",
+  "login", "logout", "signin", "session", "sessions", "secret", "secrets", "credential", "credentials", "password", "passwords",
+  "passwd", "crypto", "encrypt", "encryption", "decrypt", "permission", "permissions", "rbac", "acl", "rls", "jwt",
+  "payment", "payments", "billing", "stripe", "apikey",
+]);
+/** Two-word names that are sensitive although each word alone isn't, like `accessToken` or `api_key`. */
+const SECURITY_PAIRS = new Set(["access token", "refresh token", "auth token", "id token", "api key", "api token", "private key", "sign in"]);
+
+/** A path's words: split on punctuation and camelCase, lower case. */
+function pathWords(path: string): string[] {
+  return path.replace(/([a-z0-9])([A-Z])/g, "$1 $2").toLowerCase().split(/[^a-z0-9]+/).filter((word) => word !== "");
+}
+export function isSecurityPath(path: string): boolean {
+  const words = pathWords(path);
+  return words.some((word, index) => SECURITY_WORDS.has(word) || (index > 0 && SECURITY_PAIRS.has(`${words[index - 1]} ${word}`)));
+}
+/**
+ * Paths whose changes are hard to undo once merged: a schema or data migration. SQL counts only in a
+ * migration folder or as a schema dump, not as a seed, a query or a test fixture.
+ */
+const MIGRATION_PATH = /(^|\/)(migrations?|alembic|migrate|db\/schema)(\/|$)|(^|\/)(schema|structure)\.(sql|prisma|rb)$|(^|\/)drizzle\//i;
 /** Dependency manifests and lock files. */
 const DEPENDENCY_PATH = /(^|\/)(package\.json|package-lock\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?|requirements[^/]*\.txt|pyproject\.toml|poetry\.lock|uv\.lock|Pipfile(\.lock)?|Cargo\.(toml|lock)|go\.(mod|sum)|Gemfile(\.lock)?|composer\.(json|lock)|Podfile(\.lock)?|build\.gradle(\.kts)?|pom\.xml)$/i;
 /** CI, build, deploy and infrastructure configuration. */
@@ -64,7 +87,7 @@ export function riskFacts(files: readonly RiskFile[], evidence: RiskEvidence): R
     files: files.length,
     lines: files.reduce((total, file) => total + file.additions + file.deletions, 0),
     // A test of auth code isn't itself sensitive.
-    sensitive: files.filter((file) => SECURITY_PATH.test(file.path) && !TEST_PATH.test(file.path)).length,
+    sensitive: files.filter((file) => isSecurityPath(file.path) && !TEST_PATH.test(file.path)).length,
     migrations: count(MIGRATION_PATH),
     dependencies: count(DEPENDENCY_PATH),
     config: count(CONFIG_PATH),
@@ -98,7 +121,7 @@ export type RiskLine = { category: RiskCategory; label: string; level: RiskLevel
 export type RiskSummary = {
   overall: RiskLevel;
   lines: RiskLine[];
-  /** review: a Risk reviewer judged it. facts: nothing was flagged. unfinished: flagged, but no review came back in time. */
+  /** review: a Risk reviewer judged it. facts: nothing was flagged. unfinished: flagged, but no rating came back: it ran out of time, ended without one, or couldn't start. */
   source: "review" | "facts" | "unfinished";
 };
 
@@ -156,7 +179,8 @@ export function riskSummary(facts: RiskFacts, review: RiskReview | null, waited:
       category: "errors",
       label: RISK_CATEGORY_LABELS.errors,
       level: errors?.level ?? null,
-      reason: errors?.reason ?? (source === "unfinished" ? "not judged: the Risk reviewer didn't finish in time" : "not judged: nothing was flagged for a Risk reviewer"),
+      // With no level, every view prints "not judged" before the reason, so it isn't stored here.
+      reason: errors?.reason ?? (source === "unfinished" ? "no rating came back from the Risk reviewer" : "nothing was flagged for a Risk reviewer"),
     },
   ];
   return { overall: overallRisk(lines), lines, source };
@@ -190,12 +214,12 @@ export function riskLevelWord(level: RiskLevel): string {
 }
 
 /** The PR comment. Reasons are plain text inside a list, so no markdown in them is needed. */
-export function riskComment(summary: RiskSummary, sha: string): string {
+export function riskComment(summary: RiskSummary, sha: string, updated = false): string {
   const lines = summary.lines.map((line) => `- **${line.label}:** ${line.level === null ? "not judged" : LEVEL_WORDS[line.level]}: ${escapeMarkdown(line.reason)}`);
   const source = summary.source === "review" ? "The Risk reviewer judged Impact, Rollback and Error detection; Verification comes from the factory's evidence."
-    : summary.source === "unfinished" ? "Something was flagged, but the Risk reviewer didn't finish in time, so this is from the diff and the evidence alone."
+    : summary.source === "unfinished" ? "Something was flagged, but no rating came back from the Risk reviewer in time, so this is from the diff and the evidence alone."
     : "Nothing was flagged, so this is from the diff and the evidence alone.";
-  return `**Factory merge risk: ${LEVEL_WORDS[summary.overall]}** at \`${sha.slice(0, 7)}\`\n\n${lines.join("\n")}\n\n${source} It's informational: it doesn't change who may merge.`;
+  return `**Factory merge risk: ${LEVEL_WORDS[summary.overall]}** at \`${sha.slice(0, 7)}\`${updated ? ", updated after QA reported on this commit" : ""}\n\n${lines.join("\n")}\n\n${source} It's informational: it doesn't change who may merge.`;
 }
 
 function escapeMarkdown(text: string): string {
