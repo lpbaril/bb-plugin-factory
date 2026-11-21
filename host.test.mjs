@@ -91,3 +91,22 @@ test('the host worker deletes only an Explorer\'s branch, and not one still chec
   assert.deepEqual([notRepo.deleted, notRepo.missing], [false, false]);
   assert.ok(notRepo.error !== null);
 });
+
+test('gh run list is allowed only for one commit\'s runs, as JSON with named fields and a limit', async () => {
+  const { runListArgsAllowed } = await import('./host-contract.ts');
+  const sha = 'a'.repeat(40);
+  const ok = ['run', 'list', '--repo', 'owner/repo', '--commit', sha, '--json', 'name,workflowName,status,conclusion,createdAt,databaseId', '--limit', '50'];
+  assert.ok(runListArgsAllowed(ok));
+  assert.ok(runListArgsAllowed(['run', 'list', '--limit', '5', '--json', 'conclusion', '--commit', sha, '--repo', 'o/r']), 'in any order');
+  assert.ok(!runListArgsAllowed(['run', 'view', '--repo', 'o/r', '--commit', sha, '--json', 'name', '--limit', '5']));
+  assert.ok(!runListArgsAllowed(['run', 'list', '--repo', 'o/r', '--commit', sha, '--json', 'name', '--limit', '5', '--web', 'x']), 'no other flag');
+  assert.ok(!runListArgsAllowed(['run', 'list', '--repo', 'o/r', '--commit', 'main', '--json', 'name', '--limit', '5']), 'a full commit SHA only');
+  assert.ok(!runListArgsAllowed(['run', 'list', '--repo', 'o/r', '--commit', sha, '--json', 'name,jobs', '--limit', '5']), 'named fields only');
+  assert.ok(!runListArgsAllowed(['run', 'list', '--repo', 'o/r', '--commit', sha, '--json', 'name', '--limit', '500']));
+  assert.ok(!runListArgsAllowed(['run', 'list', '--repo', 'o/r', '--repo', 'o/r', '--json', 'name', '--limit', '5']), 'each flag once');
+  const refused = await hostEntry.handlers.gh({ args: ['run', 'list', '--repo', 'o/r', '--branch', 'main', '--json', 'name', '--limit', '5'], stdin: null }, { signal: new AbortController().signal });
+  assert.equal(refused.code, 126);
+  assert.match(refused.stderr, /allowed only as/);
+  const other = await hostEntry.handlers.gh({ args: ['run', 'rerun', '123'], stdin: null }, { signal: new AbortController().signal });
+  assert.equal(other.code, 126);
+});

@@ -11,7 +11,36 @@ export const GH_ALLOWED = [
   ["pr", "comment"],
   ["pr", "merge"],
   ["pr", "checks"],
+  ["run", "list"],
 ] as const;
+
+/** The fields `gh run list` may ask for: enough to tell a failed run from a passing one. */
+export const RUN_LIST_FIELDS = ["name", "workflowName", "status", "conclusion", "headSha", "createdAt", "databaseId", "event"] as const;
+/**
+ * `gh run list` is read-only, but only one form is allowed: the runs of one commit, as JSON, with
+ * named fields and a limit. `--repo`, `--commit`, `--json` and `--limit` each once, nothing else.
+ */
+export function runListArgsAllowed(args: readonly string[]): boolean {
+  if (args[0] !== "run" || args[1] !== "list") return false;
+  const rest = args.slice(2);
+  if (rest.length !== 8) return false;
+  const seen = new Map<string, string>();
+  for (let index = 0; index < rest.length; index += 2) {
+    const flag = rest[index]!;
+    const value = rest[index + 1]!;
+    if (seen.has(flag)) return false;
+    seen.set(flag, value);
+  }
+  const repo = seen.get("--repo");
+  const commit = seen.get("--commit");
+  const json = seen.get("--json");
+  const limit = seen.get("--limit");
+  if (seen.size !== 4 || repo === undefined || commit === undefined || json === undefined || limit === undefined) return false;
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) return false;
+  if (!/^[0-9a-f]{40}$/.test(commit)) return false;
+  if (!/^[1-9][0-9]?$/.test(limit)) return false;
+  return json.split(",").every((field) => (RUN_LIST_FIELDS as readonly string[]).includes(field));
+}
 
 /**
  * The only branches the host worker will delete: an Explorer's or a design reviewer's,

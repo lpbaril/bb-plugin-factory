@@ -38,6 +38,7 @@ import {
 } from "./roster";
 export { computePreset, rosterWarnings, ROSTER_PRESETS, ROSTER_PRESET_LABELS };
 import { holdoutHealthLine, holdoutLine, type HoldoutHealth, type HoldoutSummary } from "./holdout-text";
+import { ciVerdict, cleanOutcomeNote, computeOutcomeHealth, outcomeHealthLine, revertedPrNumbers, CI_NO_RUNS_MS, CI_RERUN_WATCH_MS, MANUAL_OUTCOME_KINDS, OUTCOME_KINDS, OUTCOME_WINDOW_DAYS, OUTCOME_WINDOW_MS, type CiRun, type MergedPr, type OutcomeHealth } from "./outcomes";
 import { cleanRiskReason, riskComment, riskFacts, riskFlags, riskLevelWord, riskSummary, RISK_LEVELS, RISK_REVIEW_WAIT_MS, type RiskFacts, type RiskLevel, type RiskReview, type RiskSummary } from "./risk";
 export { holdoutHealthLine, holdoutLine, type HoldoutHealth, type HoldoutSummary };
 import { TOKEN_OUTCOMES, TOKEN_OUTCOME_LABELS, compactTokens, computeTokenProfile, sharePercent, type TokenProfile } from "./token-profile";
@@ -215,6 +216,20 @@ const prRiskSchema = z.object({
 });
 type PrRisk = z.infer<typeof prRiskSchema>;
 
+/** Something that happened after a PR merged: see outcomes.ts. */
+const outcomeSignalSchema = z.object({
+  kind: z.enum(OUTCOME_KINDS),
+  at: z.string(),
+  /** The revert PR ("#12"), the failed workflows, or "person". */
+  ref: z.string(),
+  note: z.string().nullable(),
+  /** A CI failure that a passing rerun cleared. */
+  clearedAt: z.string().nullable().default(null),
+  /** The Backlog task opened for it, for a revert. */
+  taskKey: z.string().nullable().default(null),
+});
+type OutcomeSignal = z.infer<typeof outcomeSignalSchema>;
+
 const prSchema = z.object({
   number: z.number(),
   url: z.string(),
@@ -268,6 +283,12 @@ const prSchema = z.object({
   merge: z.object({ by: z.enum(["lead", "person", "page"]), threadId: z.string().nullable(), sha: z.string(), policy: z.enum(MERGE_POLICIES), at: z.string(), via: z.enum(["command", "card"]).default("command") }).nullable().default(null),
   /** The merge-risk summary for the latest head that reached ready, with the merge-risk summary on. */
   risk: prRiskSchema.nullable().default(null),
+  /** The commit the merge made on the base branch, and when, read from GitHub once the PR merged. */
+  mergeSha: z.string().nullable().default(null),
+  mergedAt: z.string().nullable().default(null),
+  /** CI on the base branch at the merge commit, checked with outcome signals on. settledAt: no more checks. */
+  postMergeCi: z.object({ state: z.enum(["running", "none", "passed", "failed"]), checkedAt: z.string(), failedAt: z.string().nullable(), settledAt: z.string().nullable() }).nullable().default(null),
+  outcomes: z.array(outcomeSignalSchema).default([]),
 });
 type Pr = z.infer<typeof prSchema>;
 
@@ -1121,6 +1142,7 @@ export function computeHealth(prs: readonly Pr[], tokensByTask: ReadonlyMap<stri
     holdouts: null,
     stopReports: { reports: 0, tasks: 0, mergedSince: 0 },
     risk: { rated: 0, low: 0, medium: 0, high: 0, reviewed: 0, unfinished: 0 },
+    outcomes: null,
   };
 }
 
@@ -1388,6 +1410,8 @@ const factorySchema = z.object({
   holdouts: z.array(holdoutSetSchema).default([]),
   /** A merge-risk summary on the merge card and the PR: on for new factories, and a person's choice for existing ones. */
   riskSummaryEnabled: z.boolean().default(false),
+  /** Outcome signals after merge (reverts, post-merge CI): on for new factories, and a person's choice for existing ones. */
+  outcomesEnabled: z.boolean().default(false),
   /** A Planner's or Explorer's advice to close a task, which only the person can act on. */
   closeAdvice: z.record(z.string(), z.object({ role: z.enum(["plan", "explore"]), threadId: z.string(), commentId: z.string(), at: z.string() })).default({}),
   /** Each time a Builder stopped and reported instead of working around a rule, a check or a criterion. */
@@ -1504,6 +1528,12 @@ const factoryHealthSchema = z.object({
   stopReports: z.object({ reports: z.number(), tasks: z.number(), mergedSince: z.number() }).default({ reports: 0, tasks: 0, mergedSince: 0 }),
   /** Merge-risk summaries settled in the window. */
   risk: z.object({ rated: z.number(), low: z.number(), medium: z.number(), high: z.number(), reviewed: z.number(), unfinished: z.number() }).default({ rated: 0, low: 0, medium: 0, high: 0, reviewed: 0, unfinished: 0 }),
+  /** What became of PRs merged in the window, by merge risk; null with outcome signals off. */
+  outcomes: z.object({
+    byRisk: z.object(Object.fromEntries(["low", "medium", "high", "unrated"].map((level) => [level, z.object({ merged: z.number(), withOutcome: z.number() })])) as Record<"low" | "medium" | "high" | "unrated", z.ZodObject<{ merged: z.ZodNumber; withOutcome: z.ZodNumber }>>),
+    kinds: z.object(Object.fromEntries(OUTCOME_KINDS.map((kind) => [kind, z.number()])) as Record<(typeof OUTCOME_KINDS)[number], z.ZodNumber>),
+    watching: z.number(),
+  }).nullable().default(null),
 });
 export type FactoryHealth = z.infer<typeof factoryHealthSchema>;
 
@@ -1875,6 +1905,7 @@ export const rpcContract = defineRpcContract({
         z.object({ kind: z.literal("evidenceContract"), enabled: z.boolean() }),
         z.object({ kind: z.literal("holdouts"), enabled: z.boolean() }),
         z.object({ kind: z.literal("riskSummary"), enabled: z.boolean() }),
+        z.object({ kind: z.literal("outcomes"), enabled: z.boolean() }),
         z.object({ kind: z.literal("mergePolicy"), policy: z.enum(MERGE_POLICIES) }),
         z.object({ kind: z.literal("reviewsPaused"), paused: z.boolean() }),
       ]),
@@ -1884,7 +1915,7 @@ export const rpcContract = defineRpcContract({
 });
 
 export type FactoryOptionChange =
-  | { kind: "tracks" | "designReview" | "evidenceContract" | "holdouts" | "riskSummary"; enabled: boolean }
+  | { kind: "tracks" | "designReview" | "evidenceContract" | "holdouts" | "riskSummary" | "outcomes"; enabled: boolean }
   | { kind: "mergePolicy"; policy: (typeof MERGE_POLICIES)[number] }
   | { kind: "reviewsPaused"; paused: boolean };
 /**
@@ -1897,6 +1928,7 @@ export function factoryOptionLoosens(change: FactoryOptionChange): { what: strin
   if (change.kind === "designReview" && !change.enabled) return { what: "Turning design review off", command: (prefix) => `design-review ${prefix} off` };
   if (change.kind === "holdouts" && !change.enabled) return { what: "Turning holdout scenarios off", command: (prefix) => `holdouts ${prefix} off` };
   if (change.kind === "riskSummary" && !change.enabled) return { what: "Turning the merge-risk summary off", command: (prefix) => `risk-summary ${prefix} off` };
+  if (change.kind === "outcomes" && !change.enabled) return { what: "Turning outcome signals off", command: (prefix) => `outcomes ${prefix} off` };
   return null;
 }
 
@@ -2731,6 +2763,7 @@ export default async function plugin(bb: BbPluginApi) {
       holdoutsEnabled: true,
       holdouts: [],
       riskSummaryEnabled: true,
+      outcomesEnabled: true,
       leadThreadId: null,
       agents: [],
       createdAt: new Date().toISOString(),
@@ -4836,6 +4869,10 @@ ${sections.join("\n\n---\n\n")}`;
         shadowStallNotifiedAt: null,
         roundNotifiedSha: null,
         risk: null,
+        mergeSha: null,
+        mergedAt: null,
+        postMergeCi: null,
+        outcomes: [],
       });
       delete current.qaResults[taskKey];
     });
@@ -5229,6 +5266,204 @@ ${sections.join("\n\n---\n\n")}`;
     await deliverThenMark(factory, pr.number, `[factory] QA failed on PR #${pr.number} (${pr.taskKey})${sha === null ? "" : ` at \`${sha.slice(0, 7)}\``}. ${qaNextStep(factory, pr)}`, (target) => {
       target.qaFailureNotifiedAt = at;
     });
+  }
+
+  // ----- Outcome signals -----
+
+  /** Reverts and post-merge CI are read at most this often per factory: they change slowly. */
+  const OUTCOME_CHECK_MS = 10 * 60 * 1000;
+  const outcomeChecks = new Map<string, number>();
+
+  /** When a PR merged, as GitHub said, or else when the factory saw it merged. */
+  function mergedTime(pr: Pick<Pr, "mergedAt" | "closedAt" | "merge">): number {
+    return Date.parse(pr.mergedAt ?? pr.merge?.at ?? pr.closedAt ?? "");
+  }
+
+  /** A notification to the person's phone and desktop, opening the Lead's chat. Nothing goes to the Lead. */
+  async function notifyPerson(factory: Factory, title: string, body: string): Promise<void> {
+    try {
+      await bb.sdk.plugins.callRpc({
+        pluginId: "push-notifications",
+        method: "notifications.send",
+        input: { title, body, ...(factory.leadThreadId === null ? {} : { threadId: factory.leadThreadId }) } as never,
+        outputSchema: z.unknown(),
+      });
+    } catch (error) {
+      bb.log.warn(`could not send the notification "${title}": ${String(error)}`);
+    }
+  }
+
+  /**
+   * After a PR merges: read its merge commit, then CI on the base branch at that commit, and look for
+   * PRs that revert it, for 14 days. Reverts open a Backlog task and notify the person; a CI failure
+   * only notifies, since base-branch CI can be flaky. Never throws: it mustn't hold up PR handling.
+   */
+  async function watchOutcomes(prefix: string, hostId: string, repo: string): Promise<void> {
+    try {
+      const factory = await findFactory(prefix);
+      if (!factory.outcomesEnabled || factory.archivedAt !== null) return;
+      const last = outcomeChecks.get(prefix);
+      if (last !== undefined && Date.now() - last < OUTCOME_CHECK_MS) return;
+      outcomeChecks.set(prefix, Date.now());
+      const recent = factory.prs.filter((pr) => pr.state === "merged" && Date.now() - mergedTime(pr) < OUTCOME_WINDOW_MS);
+      for (const pr of recent) {
+        try {
+          await checkPostMergeCi(prefix, hostId, repo, pr.number);
+        } catch (error) {
+          bb.log.warn(`could not check CI after ${prefix} PR #${pr.number} merged: ${String(error)}`);
+        }
+      }
+      if (recent.length > 0) await checkReverts(prefix, hostId, repo);
+    } catch (error) {
+      bb.log.warn(`could not check outcomes for ${prefix}: ${String(error)}`);
+    }
+  }
+
+  async function checkPostMergeCi(prefix: string, hostId: string, repo: string, prNumber: number): Promise<void> {
+    let pr = (await findFactory(prefix)).prs.find((candidate) => candidate.number === prNumber);
+    if (pr === undefined || pr.postMergeCi?.settledAt != null) return;
+    if (pr.mergeSha === null) {
+      const view = JSON.parse(await gh(hostId, ["pr", "view", String(prNumber), "--repo", repo, "--json", "mergeCommit,mergedAt"])) as { mergeCommit?: { oid?: string } | null; mergedAt?: string | null };
+      const oid = view.mergeCommit?.oid ?? null;
+      if (oid === null || !/^[0-9a-f]{40}$/.test(oid)) return;
+      pr = await mutateFactory(prefix, (current) => {
+        const target = current.prs.find((candidate) => candidate.number === prNumber);
+        if (target !== undefined) {
+          target.mergeSha = oid;
+          target.mergedAt = view.mergedAt ?? target.mergedAt;
+        }
+        return current;
+      }).then((current) => current.prs.find((candidate) => candidate.number === prNumber));
+      if (pr === undefined || pr.mergeSha === null) return;
+    }
+    const sha = pr.mergeSha!;
+    const runs = JSON.parse(await gh(hostId, ["run", "list", "--repo", repo, "--commit", sha, "--json", "name,workflowName,status,conclusion,createdAt,databaseId", "--limit", "50"])) as CiRun[];
+    const verdict = ciVerdict(Array.isArray(runs) ? runs : []);
+    const now = new Date().toISOString();
+    const merged = mergedTime(pr);
+    let failedNow: string[] | null = null;
+    let cleared = false;
+    await mutateFactory(prefix, (current) => {
+      const target = current.prs.find((candidate) => candidate.number === prNumber);
+      if (target === undefined || target.mergeSha !== sha) return;
+      const previous = target.postMergeCi;
+      const open = target.outcomes.find((signal) => signal.kind === "ci-failure" && signal.clearedAt === null);
+      if (verdict.state === "failed") {
+        if (open === undefined) {
+          target.outcomes.push({ kind: "ci-failure", at: now, ref: verdict.workflows.join(", "), note: null, clearedAt: null, taskKey: null });
+          failedNow = verdict.workflows;
+        }
+        const failedAt = previous?.failedAt ?? now;
+        // Watched for a passing rerun, then it stands.
+        target.postMergeCi = { state: "failed", checkedAt: now, failedAt, settledAt: Date.now() - Date.parse(failedAt) >= CI_RERUN_WATCH_MS ? now : null };
+        return;
+      }
+      if (verdict.state === "passed") {
+        if (open !== undefined) {
+          open.clearedAt = now;
+          cleared = true;
+        }
+        target.postMergeCi = { state: "passed", checkedAt: now, failedAt: previous?.failedAt ?? null, settledAt: now };
+        return;
+      }
+      if (verdict.state === "none") {
+        target.postMergeCi = { state: "none", checkedAt: now, failedAt: null, settledAt: Date.now() - merged >= CI_NO_RUNS_MS ? now : null };
+        return;
+      }
+      target.postMergeCi = { state: "running", checkedAt: now, failedAt: previous?.failedAt ?? null, settledAt: null };
+    });
+    const factory = await findFactory(prefix);
+    const task = await getTaskByKey(pr.taskKey).catch(() => null);
+    if (failedNow !== null) {
+      const names = (failedNow as string[]).join(", ");
+      await notifyPerson(factory, `${pr.taskKey}: CI failed after PR #${pr.number} merged`, `${names} failed on the base branch at ${sha.slice(0, 7)} in ${factory.name}. A rerun that passes clears it.`);
+      if (task !== null) await comment(task.id, `**Outcome:** after [PR #${pr.number}](${pr.url}) merged, CI failed on the base branch at \`${sha.slice(0, 7)}\`: ${names}. It's counted in Health against the PR's merge risk.`).catch(() => undefined);
+    } else if (cleared && task !== null) {
+      await comment(task.id, `**Outcome:** CI on the base branch at \`${sha.slice(0, 7)}\` passed on a rerun, so the failure after [PR #${pr.number}](${pr.url}) no longer counts.`).catch(() => undefined);
+    }
+  }
+
+  /**
+   * Merged PRs that revert a factory PR merged in the last 14 days. Only numbers are read from a
+   * revert's body and title, and nothing from it reaches an agent. Each revert is recorded once.
+   */
+  async function checkReverts(prefix: string, hostId: string, repo: string): Promise<void> {
+    const listed = JSON.parse(await gh(hostId, ["pr", "list", "--repo", repo, "--state", "merged", "--search", "revert in:title", "--limit", "30", "--json", "number,title,body,mergedAt,url"])) as MergedPr[];
+    let factory = await findFactory(prefix);
+    for (const revert of Array.isArray(listed) ? listed : []) {
+      const reverted = revertedPrNumbers(revert, repo, (quoted) => {
+        // `Revert "APP-12: title"`: the latest merged PR of that task, merged before the revert.
+        const key = /^([A-Z][A-Z0-9]*-\d+):/.exec(quoted)?.[1];
+        const candidates = factory.prs.filter((pr) => pr.taskKey === key && pr.state === "merged" && !(mergedTime(pr) > Date.parse(revert.mergedAt ?? "")));
+        const latest = candidates.sort((a, b) => mergedTime(b) - mergedTime(a))[0];
+        return latest === undefined ? [] : [latest.number];
+      });
+      for (const number of reverted) {
+        const pr = factory.prs.find((candidate) => candidate.number === number && candidate.state === "merged");
+        const ref = `#${revert.number}`;
+        if (pr === undefined || number === revert.number || pr.outcomes.some((signal) => signal.kind === "revert" && signal.ref === ref)) continue;
+        const at = revert.mergedAt ?? new Date().toISOString();
+        if (Date.parse(at) - mergedTime(pr) > OUTCOME_WINDOW_MS) continue;
+        let added = false;
+        factory = await mutateFactory(prefix, (current) => {
+          const target = current.prs.find((candidate) => candidate.number === number);
+          if (target === undefined || target.outcomes.some((signal) => signal.kind === "revert" && signal.ref === ref)) return current;
+          target.outcomes.push({ kind: "revert", at, ref, note: null, clearedAt: null, taskKey: null });
+          added = true;
+          return current;
+        });
+        if (!added) continue;
+        await onRevert(factory, pr, { number: revert.number, url: revert.url });
+        factory = await findFactory(prefix);
+      }
+    }
+  }
+
+  /** A Backlog task for the person to promote, a comment on the reverted PR's task, and a notification. */
+  async function onRevert(factory: Factory, pr: Pr, revert: { number: number; url: string }): Promise<void> {
+    const ref = `#${revert.number}`;
+    let opened: string | null = null;
+    try {
+      const created = unwrap(await tasksRpc("createTask", {
+        projectId: factory.trackerProjectId,
+        title: `Find out why PR #${pr.number} (${pr.taskKey}) was reverted`,
+        description: `[PR #${pr.number}](${pr.url}) for ${pr.taskKey} was reverted by [PR #${revert.number}](${revert.url}). Find what broke and whether the work should come back.\n\nOpened by the factory's outcome signals. It stays in Backlog until the person moves it.`,
+        status: "backlog",
+      }, taskResultSchema));
+      opened = created.key;
+      await mutateFactory(factory.prefix, (current) => {
+        const signal = current.prs.find((candidate) => candidate.number === pr.number)?.outcomes.find((entry) => entry.kind === "revert" && entry.ref === ref);
+        if (signal !== undefined) signal.taskKey = created.key;
+      });
+      bb.realtime.publish(BOARD_CHANGED, { prefix: factory.prefix });
+    } catch (error) {
+      bb.log.warn(`could not open a task for the revert of PR #${pr.number}: ${String(error)}`);
+    }
+    const task = await getTaskByKey(pr.taskKey).catch(() => null);
+    if (task !== null) await comment(task.id, `**Outcome:** [PR #${pr.number}](${pr.url}) was reverted by [PR #${revert.number}](${revert.url}).${opened === null ? "" : ` ${opened} is in Backlog to find out why.`}`).catch(() => undefined);
+    await notifyPerson(factory, `${pr.taskKey}: PR #${pr.number} was reverted`, `Reverted by PR #${revert.number} in ${factory.name}.${opened === null ? "" : ` ${opened} is in Backlog to find out why.`}`);
+  }
+
+  /** The person records what happened after a merge: a bug, an incident, or a revert the factory missed. */
+  async function recordOutcome(args: { taskKey: string; kind: (typeof MANUAL_OUTCOME_KINDS)[number]; note: string; pr: number | null }): Promise<Pr> {
+    const task = await getTaskByKey(args.taskKey);
+    const factory = await factoryForTaskKey(task.key);
+    const merged = factory.prs.filter((pr) => pr.taskKey === task.key && pr.state === "merged" && (args.pr === null || pr.number === args.pr));
+    const pr = merged.sort((a, b) => mergedTime(b) - mergedTime(a))[0];
+    if (pr === undefined) {
+      throw new PluginCliError(`${task.key} has no merged pull request${args.pr === null ? "" : ` #${args.pr}`} to record an outcome on.`, { code: "outcome_no_pr" });
+    }
+    const note = cleanOutcomeNote(args.note);
+    if (note === "") throw new PluginCliError("Say what happened with --note.", { code: "outcome_input" });
+    let updated: Pr | undefined;
+    await mutateFactory(factory.prefix, (current) => {
+      const target = current.prs.find((candidate) => candidate.number === pr.number);
+      if (target === undefined) return;
+      target.outcomes.push({ kind: args.kind, at: new Date().toISOString(), ref: "person", note, clearedAt: null, taskKey: null });
+      updated = target;
+    });
+    await comment(task.id, `**Outcome recorded by the person:** ${args.kind} after [PR #${pr.number}](${pr.url}) merged: ${note}`).catch(() => undefined);
+    return updated!;
   }
 
   // ----- Merge risk -----
@@ -6015,6 +6250,7 @@ ${sections.join("\n\n---\n\n")}`;
       });
     }
     await withdrawStaleMergeCard(prefix);
+    await watchOutcomes(prefix, hostId, repo);
 
     const tracked = new Set([...sameRepo.map((gp) => gp.number), ...factory.prs.map((pr) => pr.number)]);
     for (const number of tracked) {
@@ -6699,7 +6935,21 @@ ${findings}`;
       holdouts: computeHoldoutHealth(factory.holdouts, from, until),
       stopReports: computeStopReportHealth(factory.stopReports, factory.prs, from, until),
       risk: computeRiskHealth(factory.prs, from, until),
+      outcomes: factory.outcomesEnabled ? outcomeHealthFor(factory, from, until) : null,
     };
+  }
+
+  /** Merged PRs by merge time, each with the level of its last risk summary and its signals. */
+  function outcomeHealthFor(factory: Factory, from: number | null, until: number | null): OutcomeHealth {
+    return computeOutcomeHealth(factory.prs.map((pr) => {
+      const merged = mergedTime(pr);
+      return {
+        state: pr.state,
+        mergedAt: Number.isFinite(merged) ? new Date(merged).toISOString() : null,
+        riskLevel: pr.risk?.overall ?? null,
+        signals: pr.outcomes,
+      };
+    }), from, until);
   }
 
   function formatHealth(prefix: string, health: FactoryHealth): string {
@@ -6718,6 +6968,7 @@ ${findings}`;
       ...(health.holdouts === null ? [] : [`  ${holdoutHealthLine(health.holdouts)}`]),
       `  ${stopReportHealthLine(health.stopReports)}`,
       `  ${riskHealthLine(health.risk)}`,
+      ...(health.outcomes === null ? [] : [`  ${outcomeHealthLine(health.outcomes)}`]),
       ...(health.tokenProfile === null ? [] : ["", ...formatTokenProfile(health.tokenProfile, window)]),
     ].join("\n");
   }
@@ -6934,6 +7185,11 @@ ${findings}`;
             break;
           case "riskSummary":
             await mutateFactory(factory.prefix, (current) => { current.riskSummaryEnabled = change.enabled; });
+            wakePrWatch();
+            break;
+          case "outcomes":
+            await mutateFactory(factory.prefix, (current) => { current.outcomesEnabled = change.enabled; });
+            outcomeChecks.delete(factory.prefix);
             wakePrWatch();
             break;
           case "mergePolicy":
@@ -7683,6 +7939,42 @@ ${findings}`;
               threadId: ctx.threadId ?? null,
             });
             return { exitCode: 0, stdout: `Recorded the merge risk of PR #${pr.number}. The factory posts it on the PR and the merge card. You're done.` };
+          },
+        }),
+        outcome: cliCommand({
+          summary: "Record what happened after a task's PR merged: a bug, an incident, or a revert the factory missed (the person only)",
+          positionals: [{ name: "task", description: "Task key, such as APP-12", required: true }],
+          options: {
+            kind: { type: "enum", values: MANUAL_OUTCOME_KINDS, required: true, description: "bug, incident or revert" },
+            note: { type: "string", required: true, description: "One line on what happened" },
+            pr: { type: "integer", min: 1, max: 10_000_000, description: "PR number; defaults to the task's latest merged PR" },
+          },
+          async run(input, ctx) {
+            // An agent mustn't be able to write the record its own work is judged by.
+            if (ctx.threadId != null) throw new PluginCliError("Only the person can record an outcome, from outside an agent thread.", { code: "outcome_person_only" });
+            const pr = await recordOutcome({ taskKey: input.positionals.task, kind: input.options.kind as (typeof MANUAL_OUTCOME_KINDS)[number], note: input.options.note, pr: input.options.pr ?? null });
+            return { exitCode: 0, stdout: `Recorded a ${input.options.kind} after PR #${pr.number} merged. Health counts it against the PR's merge risk.` };
+          },
+        }),
+        outcomes: cliCommand({
+          summary: "Show or set whether the factory watches merged PRs for reverts and CI failures on the base branch: on or off (setting it is for the person only)",
+          positionals: [
+            { name: "factory", description: "Factory prefix", required: true },
+            { name: "state", description: "on or off; omit to show it" },
+          ],
+          async run(input, ctx) {
+            const factory = await findFactory(input.positionals.factory);
+            const requested = input.positionals.state;
+            if (requested === undefined) return { exitCode: 0, stdout: `${factory.prefix}: outcome signals ${factory.outcomesEnabled ? "on" : "off"}` };
+            if (requested !== "on" && requested !== "off") throw new PluginCliError("The state is on or off.", { code: "outcomes_input" });
+            if (ctx.threadId != null) throw new PluginCliError("Only the person can change this, from outside an agent thread.", { code: "outcomes_person_only" });
+            await mutateFactory(factory.prefix, (current) => { current.outcomesEnabled = requested === "on"; });
+            outcomeChecks.delete(factory.prefix);
+            bb.realtime.publish(BOARD_CHANGED, { prefix: factory.prefix });
+            wakePrWatch();
+            return { exitCode: 0, stdout: requested === "on"
+              ? `${factory.prefix}: outcome signals on. For ${OUTCOME_WINDOW_DAYS} days after each merge, the factory looks for a revert and checks CI on the base branch at the merge commit. A revert opens a Backlog task and notifies you; a CI failure only notifies you. PRs merged in the last ${OUTCOME_WINDOW_DAYS} days are included.`
+              : `${factory.prefix}: outcome signals off. Nothing new is checked; signals already recorded stay in Health.` };
           },
         }),
         "risk-summary": cliCommand({

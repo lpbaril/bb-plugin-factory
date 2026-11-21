@@ -1122,6 +1122,16 @@ function HealthDialog({ open, prefix, onClose }: { open: boolean; prefix: string
             sample: `${health.risk.low} low, ${health.risk.medium} medium, ${health.risk.high} high`,
             note: `${health.risk.reviewed} judged by the Risk reviewer${health.risk.unfinished === 0 ? "" : `, ${health.risk.unfinished} where it didn't finish in time`}. Informational for now: compare it with reverts before it decides anything. Summaries settled in the window.`,
           },
+          ...(health.outcomes === null ? [] : [{
+            label: "Merged PRs with a problem after merge",
+            value: (() => {
+              const all = Object.values(health.outcomes.byRisk);
+              const merged = all.reduce((total, entry) => total + entry.merged, 0);
+              return merged === 0 ? "—" : `${all.reduce((total, entry) => total + entry.withOutcome, 0)} of ${merged}`;
+            })(),
+            sample: (["low", "medium", "high", "unrated"] as const).filter((level) => health.outcomes!.byRisk[level].merged > 0).map((level) => `${level} ${health.outcomes!.byRisk[level].withOutcome}/${health.outcomes!.byRisk[level].merged}`).join(", ") || "no merged PRs",
+            note: `A revert, CI failing on the base branch at the merge commit, or a problem you recorded, within 14 days of merging, by the PR's merge risk. This is how to check the risk rating: High should fail more often than Low.${health.outcomes.watching === 0 ? "" : ` ${health.outcomes.watching} PR${health.outcomes.watching === 1 ? " is" : "s are"} still inside their 14 days.`} PRs merged in the window.`,
+          }]),
           {
             label: "Builder stop reports",
             value: String(health.stopReports.reports),
@@ -1374,6 +1384,14 @@ function SettingsDialog({
       checked: factory.riskSummaryEnabled,
       offCommand: `bb factory risk-summary ${factory.prefix} off`,
       change: (next) => ({ kind: "riskSummary", enabled: next }),
+    },
+    {
+      id: "outcomes",
+      label: "Outcome signals",
+      note: "For 14 days after each merge, the factory looks for a revert and checks CI on the base branch. A revert opens a Backlog task and notifies you; a CI failure only notifies you. Health counts them by merge risk.",
+      checked: factory.outcomesEnabled,
+      offCommand: `bb factory outcomes ${factory.prefix} off`,
+      change: (next) => ({ kind: "outcomes", enabled: next }),
     },
     {
       id: "reviewsPaused",
