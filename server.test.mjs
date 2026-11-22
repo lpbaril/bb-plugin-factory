@@ -7404,7 +7404,7 @@ test('only the latest QA records a screenshot, and only an image attached to thi
   assert.notEqual(other.exitCode, 0);
   assert.match(other.stderr, /isn't attached to TEST-1/);
   const log = await proof(['--attachment', 'att_log', '--caption', 'x']);
-  assert.match(log.stderr, /isn't an image/);
+  assert.match(log.stderr, /isn't a PNG, JPEG, GIF or WebP image/);
   const noCaption = await proof(['--attachment', 'att_1']);
   assert.match(noCaption.stderr, /--caption/);
   assert.equal((await proof(['--attachment', 'att_1', '--caption', 'the new View menu\nwith both items'])).exitCode, 0);
@@ -7412,6 +7412,14 @@ test('only the latest QA records a screenshot, and only an image attached to thi
   assert.equal((await proof(['--attachment', 'att_1', '--caption', 'the new View menu with both items'])).exitCode, 0, 'the same image twice is recorded once');
   const shots = (await stored()).shots;
   assert.deepEqual(shots.map(shot => [shot.attachmentId, shot.caption, shot.sha]), [['att_1', 'the new View menu with both items', SHA_A], ['att_c', 'on a comment', SHA_A]]);
+});
+
+test('an SVG, which can carry script, is refused as proof even though it is an image', async t => {
+  const { proof, stored } = await proofFixture(t, { attachments: [proofAttachment({ id: 'att_svg', fileName: 'shot.svg', mime: 'image/svg+xml', isImage: true })] });
+  const refused = await proof(['--attachment', 'att_svg', '--caption', 'x']);
+  assert.notEqual(refused.exitCode, 0);
+  assert.match(refused.stderr, /isn't a PNG, JPEG, GIF or WebP image/);
+  assert.equal(await stored(), undefined);
 });
 
 test('QA can record why there is no screenshot, and a later screenshot replaces it', async t => {

@@ -5314,6 +5314,8 @@ ${sections.join("\n\n---\n\n")}`;
   /** Where the bb app serves a task attachment; the Tasks plugin's own page uses the same path. */
   const attachmentUrl = (id: string) => `/api/v1/plugins/tasks/http/attachments/download?attachmentId=${encodeURIComponent(id)}`;
   const PROOF_TEXT_MAX = 200;
+  /** The only formats proof accepts: raster images, which can't run script when opened. */
+  const PROOF_MIME_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
   const cleanProofText = (text: string) => {
     const line = text.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim();
     return line.length > PROOF_TEXT_MAX ? `${line.slice(0, PROOF_TEXT_MAX - 1)}…` : line;
@@ -5477,7 +5479,10 @@ ${sections.join("\n\n---\n\n")}`;
       if (attachment === undefined) {
         throw new PluginCliError(`${args.attachmentId} isn't attached to ${task.key}.`, { code: "proof_not_attached", hint: `Attach it first: bb tasks attachment add ${task.key} --file <screenshot> --json, then pass the id it prints.` });
       }
-      if (!attachment.isImage) throw new PluginCliError(`${attachment.fileName} isn't an image. Visual proof is a screenshot (PNG, JPEG, GIF or WebP).`, { code: "proof_not_image" });
+      // Raster images only: an SVG can carry script, and the card opens attachments same-origin.
+      if (!attachment.isImage || !PROOF_MIME_TYPES.has(attachment.mime.toLowerCase())) {
+        throw new PluginCliError(`${attachment.fileName} isn't a PNG, JPEG, GIF or WebP image. Visual proof is a screenshot in one of those formats.`, { code: "proof_not_image" });
+      }
       let count = 0;
       let already = false;
       let updatedCaption = false;
