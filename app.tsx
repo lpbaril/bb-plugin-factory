@@ -1386,6 +1386,14 @@ function SettingsDialog({
       change: (next) => ({ kind: "riskSummary", enabled: next }),
     },
     {
+      id: "visualProof",
+      label: "Visual proof",
+      note: "QA screenshots UI changes and attaches them to the task. The merge card shows them, and asks you to confirm before merging a UI change without any. It never blocks QA.",
+      checked: factory.visualProofEnabled,
+      offCommand: `bb factory visual-proof ${factory.prefix} off`,
+      change: (next) => ({ kind: "visualProof", enabled: next }),
+    },
+    {
       id: "outcomes",
       label: "Outcome signals",
       note: "For 14 days after each merge, the factory looks for a revert and checks CI on the base branch. A revert opens a Backlog task and notifies you; a CI failure only notifies you. Health counts them by merge risk.",
@@ -3066,7 +3074,65 @@ function readMergeCard(payload: unknown): MergeCardPayload | null {
     files: Array.isArray(card.files) ? card.files : [],
     moreFiles: typeof card.moreFiles === "number" ? card.moreFiles : 0,
     risk: readRisk(card.risk),
+    proof: readProof(card.proof),
   };
+}
+
+/** Screenshots come from the Tasks plugin's own attachment route, and nowhere else. */
+// The id is URI-encoded, which leaves . ~ ! * ' ( ) as they are.
+const ATTACHMENT_URL = /^\/api\/v1\/plugins\/tasks\/http\/attachments\/download\?attachmentId=[A-Za-z0-9%_.~!*'()-]+$/;
+function readProof(value: unknown): MergeCardPayload["proof"] {
+  if (typeof value !== "object" || value === null) return null;
+  const proof = value as Partial<NonNullable<MergeCardPayload["proof"]>>;
+  const shots = Array.isArray(proof.shots)
+    ? proof.shots.filter((shot) => typeof shot?.url === "string" && ATTACHMENT_URL.test(shot.url) && typeof shot.caption === "string").slice(0, 8)
+    : [];
+  return {
+    ui: typeof proof.ui === "number" ? proof.ui : 0,
+    uiUnknown: proof.uiUnknown === true,
+    shots: shots.map((shot) => ({ url: shot.url, caption: shot.caption, fileName: typeof shot.fileName === "string" ? shot.fileName : "" })),
+    sha: typeof proof.sha === "string" ? proof.sha : null,
+    atHead: proof.atHead === true,
+    none: typeof proof.none === "string" ? proof.none : null,
+  };
+}
+
+/** QA's screenshots, as fixed-size thumbnails so the card doesn't jump while they load. Each opens full size. */
+function MergeCardProof({ proof, open }: { proof: NonNullable<MergeCardPayload["proof"]>; open: (url: string) => void }) {
+  if (proof.shots.length === 0) {
+    return (
+      <div className="rounded border border-border px-2 py-1.5 text-sm">
+        <span className="font-medium text-amber-600 dark:text-amber-400">No visual proof</span>
+        <span className="text-muted-foreground">
+          {": "}{proof.uiUnknown ? "the changed files couldn't be read, so this may be a UI change, and QA recorded no screenshots" : `QA recorded no screenshots of this UI change (${proof.ui} file${proof.ui === 1 ? "" : "s"} a person sees)`}{proof.none === null ? "." : `. QA's reason: ${proof.none}`}
+        </span>
+      </div>
+    );
+  }
+  return (
+    <section aria-label="Visual proof" className="rounded border border-border px-2 py-1.5">
+      <div className="mb-1 flex items-baseline justify-between gap-3 text-sm">
+        <span className="font-medium">Visual proof</span>
+        <span className="text-xs text-muted-foreground">{proof.atHead ? `at this commit, ${proof.sha}` : `at ${proof.sha}, another commit`}</span>
+      </div>
+      {proof.atHead || proof.none === null ? null : (
+        <p className="mb-1 text-sm text-muted-foreground">
+          <span className="font-medium text-amber-600 dark:text-amber-400">None of this commit</span>: QA's reason: {proof.none}
+        </p>
+      )}
+      <ul className="grid grid-cols-2 gap-2">
+        {proof.shots.map((shot, index) => (
+          <li key={shot.url} className="min-w-0">
+            {/* Opened like every other link in the app, which works in the phone and desktop hosts. */}
+            <button type="button" onClick={() => open(new URL(shot.url, window.location.origin).toString())} aria-label={`Open screenshot full size: ${shot.caption}`} className="block w-full overflow-hidden rounded border border-border">
+              <img src={shot.url} alt={shot.caption} width={320} height={200} loading={index === 0 ? "eager" : "lazy"} decoding="async" className="aspect-[8/5] h-auto w-full object-cover" />
+            </button>
+            <div className="mt-0.5 text-xs text-muted-foreground">{shot.caption}</div>
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
 }
 
 const RISK_WORDS = { low: "Low", medium: "Medium", high: "High" } as const;
@@ -3132,6 +3198,8 @@ function MergeCard({ interaction, submit }: PluginPendingInteractionProps) {
   const card = readMergeCard(interaction.payload);
   const [busy, setBusy] = useState<"merge" | "dismiss" | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // A UI change with no screenshots takes a second tap, so merging it unseen is a choice.
+  const [confirmUnseen, setConfirmUnseen] = useState(false);
   if (card === null) {
     return (
       <div className="p-3 text-sm">
@@ -3141,6 +3209,9 @@ function MergeCard({ interaction, submit }: PluginPendingInteractionProps) {
     );
   }
   const allApproved = card.approvals.length > 0 && card.approvals.every((entry) => entry.verdict === "approve" && entry.atHead);
+  // No screenshots of this commit: none at all, or only of an earlier one, of a change that is (or may be) UI.
+  const unseen = card.proof !== null && (card.proof.ui > 0 || card.proof.uiUnknown) && !card.proof.atHead;
+  const unseenLabel = card.proof !== null && card.proof.shots.length > 0 ? "Merge without proof of this commit" : "Merge without visual proof";
   const optionalFailing = card.ci.optionalFailing;
   const merge = async () => {
     setBusy("merge");
@@ -3167,6 +3238,7 @@ function MergeCard({ interaction, submit }: PluginPendingInteractionProps) {
       </div>
       {card.flagged === null ? null : <div className="rounded border border-border px-2 py-1 text-sm">{card.flagged}</div>}
       {card.risk === null ? null : <MergeCardRisk risk={card.risk} />}
+      {card.proof === null ? null : <MergeCardProof proof={card.proof} open={(url) => navigate.openUrl(url)} />}
       <div className="divide-y divide-border">
         <MergeCardRow label="Reviewers" tone={allApproved ? "good" : "bad"}>
           {card.approvals.map((entry) => `${entry.label} ${entry.verdict === "approve" ? (entry.atHead ? "✓" : "✓ (older commit)") : entry.verdict}`).join(" · ") || "None recorded"}
@@ -3218,8 +3290,18 @@ function MergeCard({ interaction, submit }: PluginPendingInteractionProps) {
         >
           Not now
         </Button>
-        <Button disabled={busy !== null} onClick={() => void merge()}>
-          {busy === "merge" ? "Merging…" : "Merge"}
+        <Button
+          disabled={busy !== null}
+          variant={unseen && confirmUnseen ? "destructive" : "default"}
+          onClick={() => {
+            if (unseen && !confirmUnseen) {
+              setConfirmUnseen(true);
+              return;
+            }
+            void merge();
+          }}
+        >
+          {busy === "merge" ? "Merging…" : unseen ? (confirmUnseen ? "Tap again to merge unseen" : unseenLabel) : "Merge"}
         </Button>
       </div>
       <div className="text-xs text-muted-foreground">

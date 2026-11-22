@@ -388,6 +388,46 @@ The Builder is also asked, before it reports done, whether a revert would undo i
 and whether a failure would be noticed, and to fix what's cheap, such as an error that's
 caught and dropped.
 
+## Visual proof
+
+Reviewers read the diff; for a UI change, you want to see it. With visual proof on, QA
+screenshots the change and the merge card shows the screenshots, so you can judge it from
+your phone without checking out the branch.
+
+- **QA captures.** For a change to something a person sees (components, pages, styles,
+  markup), QA starts the app, walks the task's path and takes screenshots: with
+  `bb browser-automation` for a web app, or computer use for a desktop app. If the repo has
+  `.factory/verification.md`, QA follows it.
+- **Stored on the task, not on GitHub.** QA attaches each screenshot to the task and
+  records it with `bb factory proof APP-12 --sha <commit> --attachment <id> --caption "…"`,
+  up to 8 per commit. Only the task's latest QA thread can, and only an image attached to
+  that task counts. The PR comment says how many there are and where; no images go to
+  GitHub or the branch.
+- **When it can't capture** (the app needs a backend or a login, or the screen only exists
+  on another platform), QA records why with `--none --reason "…"`. It never blocks QA. The
+  reason shows on the card for that commit only, and never goes to GitHub, since it's free
+  text that can name internal hosts.
+- **The merge card** shows the screenshots with their captions, and says whether they're at
+  this commit or another one; a task's earlier PR doesn't count, except screenshots of this exact commit. Only
+  screenshots of this commit count as proof: with only other commits' screenshots, Merge becomes **Merge
+  without proof of this commit**, with the same second tap. GitHub lists at most 100 changed
+  files, so a PR at that limit with no UI file among them counts as possibly UI, on the card,
+  in the merge risk and in the ready comment. Screenshots
+  recorded after the card opened bring it back with them, update the merge risk, and post
+  one PR comment saying they're there. A UI change with none shows **No visual proof**, with QA's
+  reason, and **Merge** becomes **Merge without visual proof**, which takes a second tap.
+- **Merge risk:** a UI change without screenshots of its head commit makes Verification at
+  least Medium. Turning visual proof on or off updates the open PRs' summaries.
+- **Gotchas.** When capturing the app taught QA something, it passes `--gotchas`. The Lead
+  is told and makes a task to add them to `.factory/verification.md` through a normal
+  reviewed PR, so the file only changes in ways you've merged.
+
+Visual proof is on for new factories. Existing factories turn it on with
+`bb factory visual-proof APP on`, or from **Settings** on the Factory page; turning it off
+is from your own terminal only. Screenshots only for now, no video. The factory keeps the
+screenshots of each task's latest three commits. A plain `.ts` or `.js` file counts as UI only
+in a UI folder (`components/`, `pages/`…), never an API route.
+
 ## Outcome signals
 
 The merge-risk summary is a judgment. Outcome signals check it against what happened: for

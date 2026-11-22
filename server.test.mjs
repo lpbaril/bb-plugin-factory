@@ -12,6 +12,7 @@ registerHooks({ resolve(specifier, context, next) {
 } });
 const { default: plugin, computePreset, computeTokenProfile, designRoundLenses, currentDesignReview, asSentence, PAGE_NOTICE_TIMEOUT_MS, leadCompactionDue, leadCompactBackoffMs, LEAD_COMPACT_COOLDOWN_MS, parsePersonQuestions, personQuestionsGate, parseDesignFindings, planSensitivePaths, designRoundState, designGate, trackGate, parseApproaches, exploreAssignment, readRecommendation, sectionText, supervisorAction, turnsFromEvents, creditUsage, mergeBlockers, sortChecks, latestRuns, mergeOverlapNote, migrateQaResults, qaCarryNote, leadMayMerge, rosterWarnings, computeHealth, parseDay, prsOpenedBetween, qaHold, qaNextStep, parseCoverage, changeRounds, fixLoopAdvice, holdoutGate, holdoutSummary, holdoutLine, computeHoldoutHealth, holdoutHealthLine, holdoutWriterLost, HOLDOUT_WRITER_LOST_MS, holdoutQuotes, computeRiskHealth, riskHealthLine } = await import('./server.ts');
 const { revertedPrNumbers, ciVerdict, computeOutcomeHealth, outcomeHealthLine, cleanOutcomeNote, OUTCOME_WINDOW_MS } = await import('./outcomes.ts');
+const { isUiPath } = await import('./risk.ts');
 const { riskFacts, riskFlags, riskSummary, overallRisk, verificationRating, cleanRiskReason, riskComment, isSecurityPath, RISK_REASON_MAX } = await import('./risk.ts');
 const { shareBarWidth, sharePercent } = await import('./token-profile.ts');
 const { leadCharter, leadPrompt, reReviewMessage, workerPrompt, workerReminder, designReviewPrompt, parseHoldoutScenarios, formatHoldoutScenarios, scenarioWriterPrompt, WORKER_ROLE_IDS } = await import('./roles.ts');
@@ -3605,7 +3606,7 @@ async function reopenFixture(t, pr, initial = {}, live = { isDraft: false }) {
 const FULL_A = 'a'.repeat(40);
 const FULL_B = 'b'.repeat(40);
 const readyForPerson = (over = {}) => prRecord({ headSha: FULL_A, isDraft: false, readyRequested: true, readySha: FULL_A, approvedNotifiedSha: FULL_A, reviews: bothApprove(FULL_A), ...over });
-const cardFixture = async (t, { prs = [readyForPerson()], initial = {}, live = null, settings = {}, unlistedState = () => 'OPEN', checks = () => greenChecks, mergeHead = () => FULL_A, mergeable = () => 'MERGEABLE', required = () => null, mergeState = () => 'CLEAN', threads = null, commits = () => [FULL_A], riskFiles = null, threadStatus = null, failComment = () => false, ghCommentFails = () => false } = {}) => {
+const cardFixture = async (t, { prs = [readyForPerson()], initial = {}, live = null, settings = {}, unlistedState = () => 'OPEN', checks = () => greenChecks, mergeHead = () => FULL_A, mergeable = () => 'MERGEABLE', required = () => null, mergeState = () => 'CLEAN', threads = null, commits = () => [FULL_A], riskFiles = null, threadStatus = null, failComment = () => false, ghCommentFails = () => false, cardFiles = [{ path: 'src/a.ts', additions: 3, deletions: 1 }], attachments = [] } = {}) => {
   const ghCalls = [];
   const ghComments = [];
   const sent = [];
@@ -3638,7 +3639,7 @@ const cardFixture = async (t, { prs = [readyForPerson()], initial = {}, live = n
         return { code: 0, stderr: '', stdout: JSON.stringify({ state: unlistedState(), number: 7, url: 'https://example.org/7', title: 't', headRefName: 'build', headRefOid: FULL_A, isDraft: false, additions: 1, deletions: 1 }) };
       }
       if (input.args[1] === 'view' && input.args.at(-1) === 'title,files,commits,headRefOid,statusCheckRollup,mergeable,mergeStateStatus') {
-        return { code: 0, stderr: '', stdout: JSON.stringify({ title: 'Fix the thing', mergeable: mergeable(), mergeStateStatus: mergeState(), headRefOid: FULL_A, commits: commits().map(oid => ({ oid })), files: [{ path: 'src/a.ts', additions: 3, deletions: 1 }], statusCheckRollup: checks() }) };
+        return { code: 0, stderr: '', stdout: JSON.stringify({ title: 'Fix the thing', mergeable: mergeable(), mergeStateStatus: mergeState(), headRefOid: FULL_A, commits: commits().map(oid => ({ oid })), files: cardFiles, statusCheckRollup: checks() }) };
       }
       if (input.args[1] === 'view') return { code: 0, stderr: '', stdout: JSON.stringify({ files: [{ path: 'src/a.ts' }] }) };
       return { code: 0, stdout: '', stderr: '' };
@@ -3649,6 +3650,7 @@ const cardFixture = async (t, { prs = [readyForPerson()], initial = {}, live = n
         if (failComment(input.body)) throw new Error('tasks are unavailable');
         posted.push(input.body);
       }
+      if (method === 'listAttachments') return { attachments: 'taskId' in input ? attachments : [] };
       return undefined;
     },
   });
@@ -7365,4 +7367,454 @@ test('CI checks that find nothing new make no Tasks call', async t => {
   await runPasses(harness);
   assert.equal(runCalls().length, 1, 'CI was read');
   assert.equal(methods.filter(method => method === 'getTaskByKey' || method === 'createComment').length, 0);
+});
+
+// ----- Visual proof -----
+
+test('UI paths are what a person sees; tests are not; a UI change without screenshots is at least Medium', () => {
+  for (const path of ['src/Button.tsx', 'app/page.jsx', 'src/App.vue', 'styles/main.css', 'src/components/nav.ts', 'templates/index.html']) assert.ok(isUiPath(path), path);
+  for (const path of ['src/api.ts', 'src/Button.test.tsx', 'server/db.py', 'README.md', 'pages/api/users.ts', 'app/api/route.ts', 'app/views/users.py', 'ui/server.go', 'docs/api/index.html', 'doc/style.css']) assert.ok(!isUiPath(path), path);
+  const facts = (proof) => riskFacts([file('src/Button.tsx'), file('src/Button.test.tsx')], riskEvidence({ proof }));
+  assert.equal(verificationRating(facts(true)).level, 'low');
+  const without = verificationRating(facts(false));
+  assert.equal(without.level, 'medium');
+  assert.match(without.reason, /no screenshots of the UI change/);
+  assert.equal(verificationRating(riskFacts([file('src/api.ts'), file('src/api.test.ts')], riskEvidence({ proof: false }))).level, 'low', 'no UI, nothing to show');
+});
+
+const proofAttachment = (over = {}) => ({ id: 'att_1', taskId: 'task_1', commentId: null, fileName: 'after.jpg', mime: 'image/jpeg', sizeBytes: 1000, isImage: true, createdAt: '', ...over });
+const proofFixture = async (t, { attachments = [proofAttachment()], initial = {} } = {}) => {
+  const result = await fixture(t, false, { repo: 'owner/repo', visualProofEnabled: true, agents: [builderAgent, qaAgent, leadAgent], ...initial }, {
+    tasksRpc: async ({ method, input }) => {
+      if (method === 'listAttachments') return { attachments: 'taskId' in input ? attachments.filter(entry => entry.commentId === null) : attachments.filter(entry => entry.commentId !== null) };
+      return undefined;
+    },
+  });
+  const proof = (args, threadId = 'thr_qa') => result.harness.behavior.runCli(['proof', 'TEST-1', '--sha', SHA_A, ...args], { threadId });
+  const stored = async () => (await createFactoryStorage(result.bb.storage, value => value).read('TEST')).visualProofs['TEST-1'];
+  return { ...result, proof, stored };
+};
+
+test('only the latest QA records a screenshot, and only an image attached to this task counts', async t => {
+  const { proof, stored } = await proofFixture(t, { attachments: [proofAttachment(), proofAttachment({ id: 'att_log', fileName: 'run.log', mime: 'text/plain', isImage: false }), proofAttachment({ id: 'att_c', commentId: 'comment_9' })] });
+  const builder = await proof(['--attachment', 'att_1', '--caption', 'the new menu'], 'thr_builder');
+  assert.notEqual(builder.exitCode, 0);
+  assert.match(builder.stderr, /Only the latest QA thread/);
+  const other = await proof(['--attachment', 'att_other', '--caption', 'x']);
+  assert.notEqual(other.exitCode, 0);
+  assert.match(other.stderr, /isn't attached to TEST-1/);
+  const log = await proof(['--attachment', 'att_log', '--caption', 'x']);
+  assert.match(log.stderr, /isn't an image/);
+  const noCaption = await proof(['--attachment', 'att_1']);
+  assert.match(noCaption.stderr, /--caption/);
+  assert.equal((await proof(['--attachment', 'att_1', '--caption', 'the new View menu\nwith both items'])).exitCode, 0);
+  assert.equal((await proof(['--attachment', 'att_c', '--caption', 'on a comment'])).exitCode, 0, 'an image on one of the task\'s comments counts');
+  assert.equal((await proof(['--attachment', 'att_1', '--caption', 'the new View menu with both items'])).exitCode, 0, 'the same image twice is recorded once');
+  const shots = (await stored()).shots;
+  assert.deepEqual(shots.map(shot => [shot.attachmentId, shot.caption, shot.sha]), [['att_1', 'the new View menu with both items', SHA_A], ['att_c', 'on a comment', SHA_A]]);
+});
+
+test('QA can record why there is no screenshot, and a later screenshot replaces it', async t => {
+  const { proof, stored } = await proofFixture(t);
+  const both = await proof(['--attachment', 'att_1', '--none', '--reason', 'x']);
+  assert.notEqual(both.exitCode, 0);
+  assert.equal((await proof(['--none', '--reason', 'needs a staging login'])).exitCode, 0);
+  const none = (await stored()).none;
+  assert.equal(none.reason, 'needs a staging login');
+  assert.equal(none.sha, SHA_A);
+  await proof(['--attachment', 'att_1', '--caption', 'after all']);
+  assert.equal((await stored()).none, null);
+});
+
+test('QA\'s gotchas go to the Lead as a task to make through a reviewed PR', async t => {
+  const { proof, messages } = await proofFixture(t);
+  const result = await proof(['--attachment', 'att_1', '--caption', 'menu', '--gotchas', 'build packages/ui first\nright-clicks need real mouse events']);
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.match(result.stdout, /The Lead was told about your gotchas/);
+  const told = messages.map(message => message.input[0].text).find(text => /proposed 2 gotchas/.test(text));
+  assert.ok(told);
+  assert.match(told, /- build packages\/ui first\n- right-clicks need real mouse events/);
+  assert.match(told, /\.factory\/verification\.md/);
+  assert.match(told, /reviewed PR/);
+});
+
+test('with visual proof off, proof is refused', async t => {
+  const { proof } = await proofFixture(t, { initial: { visualProofEnabled: false } });
+  const refused = await proof(['--attachment', 'att_1', '--caption', 'x']);
+  assert.notEqual(refused.exitCode, 0);
+  assert.match(refused.stderr, /visual proof off/);
+});
+
+test('the merge card shows the latest screenshots, and a UI change without any says so', async t => {
+  const visualProofs = { 'TEST-1': { shots: [{ attachmentId: 'att_old', fileName: 'a.jpg', caption: 'old', sha: 'c'.repeat(40), at: '' }, { attachmentId: 'att_1', fileName: 'b.jpg', caption: 'the new menu', sha: FULL_A, at: '' }], none: null } };
+  const shown = await cardFixture(t, { initial: { visualProofEnabled: true, visualProofs }, cardFiles: [{ path: 'src/Menu.tsx', additions: 9, deletions: 2 }] });
+  await runPasses(shown.harness);
+  const proof = shown.cards()[0].payload.proof;
+  assert.deepEqual(proof.shots, [{ url: '/api/v1/plugins/tasks/http/attachments/download?attachmentId=att_1', caption: 'the new menu', fileName: 'b.jpg' }], 'only the latest commit\'s');
+  assert.equal(proof.atHead, true);
+  assert.equal(proof.ui, 1);
+  const missing = await cardFixture(t, { initial: { visualProofEnabled: true, visualProofs: { 'TEST-1': { shots: [], none: { reason: 'desktop-only menu', sha: FULL_A, at: '' } } } }, cardFiles: [{ path: 'src/Menu.tsx', additions: 9, deletions: 2 }] });
+  await runPasses(missing.harness);
+  assert.deepEqual(missing.cards()[0].payload.proof, { ui: 1, uiUnknown: false, shots: [], sha: null, atHead: false, none: 'desktop-only menu' });
+  const notUi = await cardFixture(t, { initial: { visualProofEnabled: true } });
+  await runPasses(notUi.harness);
+  assert.equal(notUi.cards()[0].payload.proof, null, 'nothing to show for a change no one sees');
+  const off = await cardFixture(t, { cardFiles: [{ path: 'src/Menu.tsx', additions: 1, deletions: 1 }] });
+  await runPasses(off.harness);
+  assert.equal(off.cards()[0].payload.proof, null);
+});
+
+test('the ready PR comment says how many screenshots there are, never the images', async t => {
+  const readyFixture = async (visualProofs) => {
+    const bodies = [];
+    const result = await fixture(t, false, { repo: 'owner/repo', visualProofEnabled: true, visualProofs, agents: [builderAgent, leadAgent], prs: [prRecord({ headSha: SHA_A, reviews: bothApprove(SHA_A) })] }, {
+      threads: { list: threadList },
+      hostRpc: async ({ input }) => {
+        if (input.args[1] === 'comment') bodies.push(input.stdin ?? '');
+        if (input.args[1] === 'list') return { code: 0, stderr: '', stdout: ghList([{ headRefOid: SHA_A }]) };
+        if (input.args[1] === 'view') return { code: 0, stderr: '', stdout: JSON.stringify({ files: [{ path: 'src/Menu.tsx' }] }) };
+        return { code: 0, stdout: '', stderr: '' };
+      },
+    });
+    await result.harness.behavior.setSettings({ prReviews: true });
+    await runPasses(result.harness);
+    return bodies.find(body => /Marked ready for review/.test(body));
+  };
+  const withShots = await readyFixture({ 'TEST-1': { shots: [{ attachmentId: 'att_1', fileName: 'b.jpg', caption: 'menu', sha: SHA_A, at: '' }], none: null } });
+  assert.match(withShots, /Visual proof: 1 screenshot at `aaaaaaa`, on task TEST-1 in the Tasks page and on the merge card\./);
+  assert.doesNotMatch(withShots, /attachments\/download/);
+  const without = await readyFixture({});
+  assert.match(without, /No screenshots of this UI change were recorded\./);
+});
+
+test('only the person turns visual proof on or off; the page can only turn it on', async t => {
+  const { bb, harness } = await fixture(t);
+  assert.match((await harness.behavior.runCli(['visual-proof', 'TEST'])).stdout, /visual proof off/);
+  assert.notEqual((await harness.behavior.runCli(['visual-proof', 'TEST', 'on'], { threadId: 'thr_lead' })).exitCode, 0);
+  assert.equal((await harness.behavior.runCli(['visual-proof', 'TEST', 'on'])).exitCode, 0);
+  assert.equal((await createFactoryStorage(bb.storage, value => value).read('TEST')).visualProofEnabled, true);
+  await assert.rejects(harness.behavior.callRpc('factory_set_option', { prefix: 'TEST', change: { kind: 'visualProof', enabled: false } }), /visual-proof TEST off/);
+});
+
+test('QA\'s brief and reminder ask for screenshots only with visual proof on', () => {
+  const task = { key: 'TEST-1', title: 'T', description: 'D' };
+  const on = workerPrompt({ role: 'qa', factoryName: 'F', prefix: 'TEST', task, instructions: null, builderThreadId: null, visualProof: true });
+  assert.match(on, /## Visual proof of UI changes/);
+  assert.match(on, /bb factory proof TEST-1 --sha \$\(git rev-parse HEAD\) --attachment <id>/);
+  assert.match(on, /\.factory\/verification\.md/);
+  assert.match(on, /doesn't block your verdict/);
+  assert.doesNotMatch(workerPrompt({ role: 'qa', factoryName: 'F', prefix: 'TEST', task, instructions: null, builderThreadId: null }), /Visual proof of UI changes/);
+  assert.doesNotMatch(workerPrompt({ role: 'build', factoryName: 'F', prefix: 'TEST', task, instructions: null, builderThreadId: null, visualProof: true }), /Visual proof of UI changes/);
+  assert.match(workerReminder({ role: 'qa', factoryName: 'F', taskKey: 'TEST-1', visualProof: true }), /bb factory proof/);
+});
+
+test('screenshots recorded after ready update the risk summary, post one notice, and bring the card back with them', async t => {
+  const facts = riskFacts([file('src/Menu.tsx'), file('src/Menu.test.tsx')], riskEvidence({ proof: false }));
+  const risk = { sha: FULL_A, facts, threadId: null, startedAt: '', review: null, reviewedAt: null, overall: 'low', source: 'facts', settledAt: '2026-11-21T00:00:00Z', commentedAt: '2026-11-21T00:00:00Z', qaRefreshedAt: null };
+  const { bb, harness, cards, ghComments } = await cardFixture(t, {
+    prs: [readyForPerson({ risk })],
+    initial: { visualProofEnabled: true, riskSummaryEnabled: true, agents: [builderAgent, qaAgent, leadAgent] },
+    cardFiles: [{ path: 'src/Menu.tsx', additions: 9, deletions: 2 }],
+    attachments: [proofAttachment()],
+    threadStatus: () => 'idle',
+  });
+  await runPasses(harness);
+  assert.equal(cards().length, 1);
+  assert.deepEqual(cards()[0].payload.proof.shots, []);
+  const first = cards()[0].id;
+  const recorded = await harness.behavior.runCli(['proof', 'TEST-1', '--sha', FULL_A.slice(0, 7), '--attachment', 'att_1', '--caption', 'the menu'], { threadId: 'thr_qa' });
+  assert.equal(recorded.exitCode, 0, recorded.stderr);
+  const stored = (await createFactoryStorage(bb.storage, value => value).read('TEST')).visualProofs['TEST-1'];
+  assert.equal(stored.shots[0].sha, FULL_A, 'a short SHA of the head is stored as the full one');
+  const pr = (await readPrs(bb))[0];
+  assert.equal(pr.risk.facts.proof, true);
+  assert.equal(pr.risk.commentedAt, null, 'posted again');
+  await runPasses(harness);
+  assert.equal(ghComments.filter(body => /QA added visual proof at `aaaaaaa`: 1 screenshot, on task TEST-1 in the Tasks page/.test(body)).length, 1, 'posted by the PR pass');
+  assert.equal(cards().length, 1);
+  assert.notEqual(cards()[0].id, first, 'the card came back');
+  assert.equal(cards()[0].payload.proof.shots.length, 1);
+  assert.ok(ghComments.some(body => /Factory merge risk: .*updated after QA reported/.test(body)));
+  await harness.behavior.runCli(['proof', 'TEST-1', '--sha', FULL_A, '--attachment', 'att_1', '--caption', 'again'], { threadId: 'thr_qa' });
+  await runPasses(harness);
+  assert.equal(ghComments.filter(body => /QA added visual proof/.test(body)).length, 1, 'one notice per commit');
+});
+
+test('a reason for an older commit isn\'t shown for the head, and an earlier PR\'s proof doesn\'t count', async t => {
+  const old = { 'TEST-1': { shots: [], none: { reason: 'needs staging login', sha: 'c'.repeat(40), at: '' } } };
+  const stale = await cardFixture(t, { initial: { visualProofEnabled: true, visualProofs: old }, cardFiles: [{ path: 'src/Menu.tsx', additions: 1, deletions: 1 }] });
+  await runPasses(stale.harness);
+  assert.equal(stale.cards()[0].payload.proof.none, null);
+  const earlierPr = prRecord({ number: 5, state: 'closed', closedAt: '2026-11-20T00:00:00Z', headSha: 'e'.repeat(40) });
+  const proofs = { 'TEST-1': { shots: [{ attachmentId: 'att_old', fileName: 'a.jpg', caption: 'the old PR', sha: 'e'.repeat(40), at: '2026-11-19T00:00:00Z' }], none: null } };
+  const next = await cardFixture(t, { prs: [earlierPr, readyForPerson({ openedAt: '2026-11-21T00:00:00Z' })], live: [{ number: 7, url: 'https://example.org/7', headRefName: 'build', headRefOid: FULL_A, isDraft: false }], initial: { visualProofEnabled: true, visualProofs: proofs }, cardFiles: [{ path: 'src/Menu.tsx', additions: 1, deletions: 1 }] });
+  await runPasses(next.harness);
+  assert.deepEqual(next.cards()[0].payload.proof.shots, [], 'the closed PR\'s screenshot isn\'t this PR\'s');
+});
+
+test('only the latest three commits\' screenshots are kept per task, and the factory summary leaves them out', async t => {
+  const attachments = ['a', 'b', 'c', 'd'].map(id => proofAttachment({ id: `att_${id}` }));
+  const { stored, harness } = await proofFixture(t, { attachments });
+  for (const [index, id] of ['a', 'b', 'c', 'd'].entries()) {
+    const result = await harness.behavior.runCli(['proof', 'TEST-1', '--sha', String(index + 1).repeat(40), '--attachment', `att_${id}`, '--caption', id], { threadId: 'thr_qa' });
+    assert.equal(result.exitCode, 0, result.stderr);
+    await new Promise(resolve => setTimeout(resolve, 5));
+  }
+  assert.deepEqual((await stored()).shots.map(shot => shot.attachmentId), ['att_b', 'att_c', 'att_d']);
+  const listed = JSON.parse((await harness.behavior.runCli(['list', '--json'])).stdout);
+  const summary = Array.isArray(listed) ? listed[0] : listed.factories?.[0] ?? listed;
+  assert.equal(summary.visualProofs, undefined);
+});
+
+// QA 'none' matches readyForPerson, which has no QA result, so only proof changes the summary.
+const uiRisk = (proof, files = [file('src/Menu.tsx'), file('src/Menu.test.tsx')]) => ({ sha: FULL_A, facts: riskFacts(files, riskEvidence({ proof, qa: 'none', qaGate: false })), threadId: null, startedAt: '', review: null, reviewedAt: null, overall: 'medium', source: 'facts', settledAt: '2026-11-21T00:00:00Z', commentedAt: '2026-11-21T00:00:00Z', qaRefreshedAt: null });
+
+test('turning visual proof off clears the missing-screenshot mark from open PRs\' risk', async t => {
+  const risk = uiRisk(false);
+  risk.overall = riskSummary(risk.facts, null, true).overall;
+  const verification = (facts) => riskSummary(facts, null, true).lines.find(line => line.category === 'verification');
+  assert.match(verification(risk.facts).reason, /no screenshots of the UI change/);
+  const { bb, harness, ghComments } = await cardFixture(t, { prs: [readyForPerson({ risk })], initial: { visualProofEnabled: true, riskSummaryEnabled: true }, cardFiles: [{ path: 'src/Menu.tsx', additions: 1, deletions: 1 }], threadStatus: () => 'idle' });
+  assert.equal((await harness.behavior.runCli(['visual-proof', 'TEST', 'off'])).exitCode, 0);
+  const after = (await readPrs(bb))[0].risk;
+  assert.equal(after.facts.proof, true);
+  assert.doesNotMatch(verification(after.facts).reason, /no screenshots/);
+  assert.equal(after.commentedAt, null, 'what it says changed, so it is posted again');
+  await runPasses(harness);
+  const reposted = ghComments.filter(body => body.startsWith('**Factory merge risk'));
+  assert.equal(reposted.length, 1);
+  assert.doesNotMatch(reposted[0], /no screenshots/);
+  assert.doesNotMatch(reposted[0], /updated after QA reported/, 'the person changed a setting; QA did nothing');
+  assert.match(reposted[0], /updated after visual proof was turned on or off/);
+});
+
+test('a screenshot on a PR with no UI files doesn\'t post the risk summary again', async t => {
+  const risk = uiRisk(false, [file('src/api.ts'), file('src/api.test.ts')]);
+  risk.overall = 'low';
+  const { bb, harness, ghComments } = await cardFixture(t, { prs: [readyForPerson({ risk })], initial: { visualProofEnabled: true, riskSummaryEnabled: true, agents: [builderAgent, qaAgent, leadAgent] }, attachments: [proofAttachment()], threadStatus: () => 'idle' });
+  assert.equal((await harness.behavior.runCli(['proof', 'TEST-1', '--sha', FULL_A, '--attachment', 'att_1', '--caption', 'x'], { threadId: 'thr_qa' })).exitCode, 0);
+  const after = (await readPrs(bb))[0].risk;
+  assert.equal(after.facts.proof, true);
+  assert.notEqual(after.commentedAt, null, 'nothing changed, nothing to post');
+  await runPasses(harness);
+  assert.equal(ghComments.filter(body => body.startsWith('**Factory merge risk')).length, 0);
+});
+
+test('a "QA added visual proof" notice that fails to post is tried again', async t => {
+  let failures = 1;
+  const proofs = { 'TEST-1': { shots: [{ attachmentId: 'att_1', fileName: 'a.jpg', caption: 'menu', sha: FULL_A, at: '' }], none: null } };
+  const { bb, harness, ghComments } = await cardFixture(t, { initial: { visualProofEnabled: true, visualProofs: proofs }, cardFiles: [{ path: 'src/Menu.tsx', additions: 1, deletions: 1 }], ghCommentFails: body => /QA added visual proof/.test(body) && failures-- > 0 });
+  await runPasses(harness);
+  assert.equal((await readPrs(bb))[0].proofNoticeSha, null, 'not marked as posted');
+  await runPasses(harness);
+  assert.equal(ghComments.filter(body => /QA added visual proof/.test(body)).length, 1);
+  assert.equal((await readPrs(bb))[0].proofNoticeSha, FULL_A);
+});
+
+test('screenshots of an earlier commit don\'t count as proof of the head', async t => {
+  const proofs = { 'TEST-1': { shots: [{ attachmentId: 'att_1', fileName: 'a.jpg', caption: 'before the push', sha: 'c'.repeat(40), at: '' }], none: null } };
+  const { cards } = await (async () => {
+    const result = await cardFixture(t, { initial: { visualProofEnabled: true, visualProofs: proofs }, cardFiles: [{ path: 'src/Menu.tsx', additions: 1, deletions: 1 }] });
+    await runPasses(result.harness);
+    return result;
+  })();
+  const proof = cards()[0].payload.proof;
+  assert.equal(proof.atHead, false);
+  assert.equal(proof.shots.length, 1, 'still shown, as an earlier commit');
+  const facts = riskFacts([file('src/Menu.tsx')], riskEvidence({ proof: false }));
+  assert.equal(verificationRating(facts).level, 'medium');
+});
+
+test('when GitHub\'s file list can\'t be read, the card falls back to the risk summary, or treats the change as possibly UI', async t => {
+  const risk = uiRisk(false);
+  const fallback = await cardFixture(t, { prs: [readyForPerson({ risk })], initial: { visualProofEnabled: true, riskSummaryEnabled: true }, cardFiles: [], threadStatus: () => 'idle' });
+  await runPasses(fallback.harness);
+  assert.equal(fallback.cards()[0].payload.proof.ui, 1);
+  assert.equal(fallback.cards()[0].payload.proof.uiUnknown, false);
+  const unknown = await cardFixture(t, { initial: { visualProofEnabled: true }, cardFiles: [] });
+  await runPasses(unknown.harness);
+  assert.equal(unknown.cards()[0].payload.proof.uiUnknown, true);
+});
+
+test('a short SHA recorded before the PR exists becomes the full one when it arrives', async t => {
+  const attachments = ['a', 'b'].map(id => proofAttachment({ id: `att_${id}` }));
+  const { harness, stored } = await proofFixture(t, { attachments });
+  await harness.behavior.runCli(['proof', 'TEST-1', '--sha', SHA_A.slice(0, 7), '--attachment', 'att_a', '--caption', 'short'], { threadId: 'thr_qa' });
+  await harness.behavior.runCli(['proof', 'TEST-1', '--sha', SHA_A, '--attachment', 'att_b', '--caption', 'full'], { threadId: 'thr_qa' });
+  assert.deepEqual((await stored()).shots.map(shot => shot.sha), [SHA_A, SHA_A], 'one commit');
+});
+
+test('the ready comment that counted the head\'s screenshots stands in for the notice', async t => {
+  const bodies = [];
+  const proofs = { 'TEST-1': { shots: [{ attachmentId: 'att_1', fileName: 'b.jpg', caption: 'menu', sha: SHA_A, at: '' }], none: null } };
+  const result = await fixture(t, false, { repo: 'owner/repo', visualProofEnabled: true, visualProofs: proofs, agents: [builderAgent, leadAgent], prs: [prRecord({ headSha: SHA_A, reviews: bothApprove(SHA_A) })] }, {
+    threads: { list: threadList },
+    hostRpc: async ({ input }) => {
+      if (input.args[1] === 'comment') bodies.push(input.stdin ?? '');
+      if (input.args[1] === 'list') return { code: 0, stderr: '', stdout: ghList([{ headRefOid: SHA_A }]) };
+      if (input.args[1] === 'view') return { code: 0, stderr: '', stdout: JSON.stringify({ files: [{ path: 'src/Menu.tsx' }] }) };
+      return { code: 0, stdout: '', stderr: '' };
+    },
+  });
+  await result.harness.behavior.setSettings({ prReviews: true });
+  await runPasses(result.harness, 2);
+  assert.equal(bodies.filter(body => /Visual proof: 1 screenshot/.test(body)).length, 1);
+  assert.equal(bodies.filter(body => /QA added visual proof/.test(body)).length, 0, 'no repeat');
+});
+
+test('screenshots recorded while the risk was being assessed are picked up on the next pass', async t => {
+  const risk = uiRisk(false);
+  const proofs = { 'TEST-1': { shots: [{ attachmentId: 'att_1', fileName: 'a.jpg', caption: 'menu', sha: FULL_A, at: '' }], none: null } };
+  const { bb, harness } = await cardFixture(t, { prs: [readyForPerson({ risk })], initial: { visualProofEnabled: true, riskSummaryEnabled: true, visualProofs: proofs }, cardFiles: [{ path: 'src/Menu.tsx', additions: 1, deletions: 1 }], threadStatus: () => 'idle' });
+  await runPasses(harness);
+  assert.equal((await readPrs(bb))[0].risk.facts.proof, true);
+});
+
+test('a proof notice that keeps failing never keeps the merge card away', async t => {
+  const proofs = { 'TEST-1': { shots: [{ attachmentId: 'att_1', fileName: 'a.jpg', caption: 'menu', sha: FULL_A, at: '' }], none: null } };
+  const { bb, harness, cards } = await cardFixture(t, { initial: { visualProofEnabled: true, visualProofs: proofs }, cardFiles: [{ path: 'src/Menu.tsx', additions: 1, deletions: 1 }], ghCommentFails: body => /QA added visual proof/.test(body) });
+  await runPasses(harness, 2);
+  assert.equal(cards().length, 1);
+  assert.equal((await readPrs(bb))[0].proofNoticeSha, null, 'still owed');
+});
+
+const readyProofFixture = async (t, { visualProofs = {}, files = [{ path: 'src/Menu.tsx' }], commentFails = () => false, filesFail = false } = {}) => {
+  const bodies = [];
+  const result = await fixture(t, false, { repo: 'owner/repo', visualProofEnabled: true, visualProofs, agents: [builderAgent, leadAgent], prs: [prRecord({ headSha: SHA_A, reviews: bothApprove(SHA_A) })] }, {
+    threads: { list: threadList },
+    hostRpc: async ({ input }) => {
+      if (input.args[1] === 'comment') {
+        if (commentFails(input.stdin ?? '')) return { code: 1, stdout: '', stderr: 'HTTP 502' };
+        bodies.push(input.stdin ?? '');
+      }
+      if (input.args[1] === 'list') return { code: 0, stderr: '', stdout: ghList([{ headRefOid: SHA_A }]) };
+      if (input.args[1] === 'view' && filesFail && input.args.at(-1) === 'files') return { code: 1, stdout: '', stderr: 'HTTP 502' };
+      if (input.args[1] === 'view') return { code: 0, stderr: '', stdout: JSON.stringify({ files }) };
+      return { code: 0, stdout: '', stderr: '' };
+    },
+  });
+  await result.harness.behavior.setSettings({ prReviews: true });
+  return { ...result, bodies };
+};
+
+test('when the ready comment fails, the proof notice is still owed and posted later', async t => {
+  let failures = 1;
+  const proofs = { 'TEST-1': { shots: [{ attachmentId: 'att_1', fileName: 'b.jpg', caption: 'menu', sha: SHA_A, at: '' }], none: null } };
+  const { harness, bodies } = await readyProofFixture(t, { visualProofs: proofs, commentFails: body => /Marked ready for review/.test(body) && failures-- > 0 });
+  await runPasses(harness, 2);
+  assert.equal(bodies.filter(body => /QA added visual proof at `aaaaaaa`/.test(body)).length, 1);
+});
+
+test('with the changed files unreadable, the ready comment doesn\'t call it a UI change', async t => {
+  const { harness, bodies } = await readyProofFixture(t, { files: [] });
+  await runPasses(harness);
+  const ready = bodies.find(body => /Marked ready for review/.test(body));
+  assert.match(ready, /the changed files couldn't be read to tell whether this is a UI change/);
+  assert.doesNotMatch(ready, /this UI change were recorded/);
+});
+
+test('a short SHA after a full one is stored as the full one', async t => {
+  const attachments = ['a', 'b'].map(id => proofAttachment({ id: `att_${id}` }));
+  const { harness, stored } = await proofFixture(t, { attachments });
+  await harness.behavior.runCli(['proof', 'TEST-1', '--sha', SHA_A, '--attachment', 'att_a', '--caption', 'full'], { threadId: 'thr_qa' });
+  await harness.behavior.runCli(['proof', 'TEST-1', '--sha', SHA_A.slice(0, 7), '--attachment', 'att_b', '--caption', 'short'], { threadId: 'thr_qa' });
+  assert.deepEqual((await stored()).shots.map(shot => shot.sha), [SHA_A, SHA_A]);
+});
+
+test('QA hears when its gotchas couldn\'t reach the Lead', async t => {
+  const result = await fixture(t, false, { repo: 'owner/repo', visualProofEnabled: true, agents: [builderAgent, qaAgent, leadAgent] }, {
+    threads: { send: async () => { throw new Error('thread archived'); } },
+    tasksRpc: async ({ method }) => method === 'listAttachments' ? { attachments: [proofAttachment()] } : undefined,
+  });
+  const recorded = await result.harness.behavior.runCli(['proof', 'TEST-1', '--sha', SHA_A, '--attachment', 'att_1', '--caption', 'menu', '--gotchas', 'build packages/ui first'], { threadId: 'thr_qa' });
+  assert.equal(recorded.exitCode, 0, recorded.stderr);
+  assert.match(recorded.stdout, /couldn't reach the Lead\. Put it in your task comment under "Proposed gotchas" instead/);
+});
+
+test('screenshots of this exact head count even when an earlier PR of the task closed after they were taken', async t => {
+  const earlierPr = prRecord({ number: 5, state: 'closed', closedAt: '2026-11-20T12:00:00Z', headSha: FULL_A });
+  const proofs = { 'TEST-1': { shots: [{ attachmentId: 'att_1', fileName: 'a.jpg', caption: 'this commit', sha: FULL_A, at: '2026-11-20T10:00:00Z' }], none: null } };
+  const { cards } = await (async () => {
+    const result = await cardFixture(t, { prs: [earlierPr, readyForPerson({ openedAt: '2026-11-21T00:00:00Z' })], live: [{ number: 7, url: 'https://example.org/7', headRefName: 'build', headRefOid: FULL_A, isDraft: false }], initial: { visualProofEnabled: true, visualProofs: proofs }, cardFiles: [{ path: 'src/Menu.tsx', additions: 1, deletions: 1 }] });
+    await runPasses(result.harness);
+    return result;
+  })();
+  assert.equal(cards()[0].payload.proof.shots.length, 1);
+  assert.equal(cards()[0].payload.proof.atHead, true);
+});
+
+test('recording the same screenshot again updates its caption, and says so', async t => {
+  const { proof, stored } = await proofFixture(t);
+  await proof(['--attachment', 'att_1', '--caption', 'the mneu']);
+  const again = await proof(['--attachment', 'att_1', '--caption', 'the menu']);
+  assert.match(again.stdout, /already recorded .*its caption is now the new one/);
+  assert.deepEqual((await stored()).shots.map(shot => shot.caption), ['the menu']);
+  const same = await proof(['--attachment', 'att_1', '--caption', 'the menu']);
+  assert.match(same.stdout, /Nothing changed/);
+});
+
+test('changing the setting leaves a backend-only PR\'s open card alone', async t => {
+  const risk = uiRisk(true, [file('src/api.ts'), file('src/api.test.ts')]);
+  risk.overall = 'low';
+  const { harness, cards } = await cardFixture(t, { prs: [readyForPerson({ risk })], initial: { riskSummaryEnabled: true }, threadStatus: () => 'idle' });
+  await runPasses(harness);
+  const shown = cards()[0].id;
+  assert.equal((await harness.behavior.runCli(['visual-proof', 'TEST', 'on'])).exitCode, 0);
+  await runPasses(harness);
+  assert.equal(cards()[0].id, shown, 'the same card stays');
+});
+
+test('the first risk comment on a PR doesn\'t say it was updated', async t => {
+  const risk = uiRisk(false);
+  risk.overall = riskSummary(risk.facts, null, true).overall;
+  risk.commentedAt = null;
+  const { harness, ghComments } = await cardFixture(t, { prs: [readyForPerson({ risk })], initial: { visualProofEnabled: true, riskSummaryEnabled: true, agents: [builderAgent, qaAgent, leadAgent] }, cardFiles: [{ path: 'src/Menu.tsx', additions: 1, deletions: 1 }], attachments: [proofAttachment()], threadStatus: () => 'idle' });
+  assert.equal((await harness.behavior.runCli(['proof', 'TEST-1', '--sha', FULL_A, '--attachment', 'att_1', '--caption', 'menu'], { threadId: 'thr_qa' })).exitCode, 0);
+  await runPasses(harness);
+  const posted = ghComments.filter(body => body.startsWith('**Factory merge risk'));
+  assert.equal(posted.length, 1);
+  assert.doesNotMatch(posted[0], /updated after QA reported/);
+});
+
+test('a failed file read gives the ready comment the card\'s "couldn\'t be read" wording', async t => {
+  const { harness, bodies } = await readyProofFixture(t, { filesFail: true });
+  await runPasses(harness);
+  assert.match(bodies.find(body => /Marked ready for review/.test(body)), /the changed files couldn't be read to tell whether this is a UI change/);
+});
+
+test('screenshots of another PR\'s head don\'t count, even when that PR closed after this one opened', async t => {
+  const earlierPr = prRecord({ number: 5, state: 'closed', closedAt: '2026-11-22T00:00:00Z', headSha: 'e'.repeat(40) });
+  const proofs = { 'TEST-1': { shots: [{ attachmentId: 'att_old', fileName: 'a.jpg', caption: 'the other PR', sha: 'e'.repeat(40), at: '2026-11-21T12:00:00Z' }], none: null } };
+  const result = await cardFixture(t, { prs: [earlierPr, readyForPerson({ openedAt: '2026-11-21T00:00:00Z' })], live: [{ number: 7, url: 'https://example.org/7', headRefName: 'build', headRefOid: FULL_A, isDraft: false }], initial: { visualProofEnabled: true, visualProofs: proofs }, cardFiles: [{ path: 'src/Menu.tsx', additions: 1, deletions: 1 }] });
+  await runPasses(result.harness);
+  assert.deepEqual(result.cards()[0].payload.proof.shots, []);
+});
+
+test('a proof command or setting that changes nothing leaves the open card alone', async t => {
+  const proofs = { 'TEST-1': { shots: [{ attachmentId: 'att_1', fileName: 'a.jpg', caption: 'menu', sha: FULL_A, at: '' }], none: null } };
+  const { harness, cards } = await cardFixture(t, { initial: { visualProofEnabled: true, visualProofs: proofs, agents: [builderAgent, qaAgent, leadAgent] }, cardFiles: [{ path: 'src/Menu.tsx', additions: 1, deletions: 1 }], attachments: [proofAttachment()] });
+  await runPasses(harness);
+  const shown = cards()[0].id;
+  const same = await harness.behavior.runCli(['proof', 'TEST-1', '--sha', FULL_A, '--attachment', 'att_1', '--caption', 'menu'], { threadId: 'thr_qa' });
+  assert.match(same.stdout, /Nothing changed/);
+  assert.match((await harness.behavior.runCli(['visual-proof', 'TEST', 'on'])).stdout, /already on/);
+  await runPasses(harness);
+  assert.equal(cards()[0].id, shown);
+});
+
+test('a PR at GitHub\'s 100-file limit with no UI file listed counts as possibly UI', async t => {
+  const backend = Array.from({ length: 100 }, (_, index) => ({ path: `server/module${index}.py`, additions: 1, deletions: 0 }));
+  const { harness, cards } = await cardFixture(t, { initial: { visualProofEnabled: true }, cardFiles: backend });
+  await runPasses(harness);
+  assert.equal(cards()[0].payload.proof.uiUnknown, true);
+  const facts = riskFacts(backend, riskEvidence());
+  assert.equal(facts.ui, 0, 'risk.ts counts what it sees; the server raises it for a full list');
+});
+
+test('the same gotchas reach the Lead once per task', async t => {
+  const { proof, messages } = await proofFixture(t);
+  await proof(['--attachment', 'att_1', '--caption', 'a', '--gotchas', 'build packages/ui first']);
+  const again = await proof(['--attachment', 'att_1', '--caption', 'b', '--gotchas', 'Build packages/ui first']);
+  assert.match(again.stdout, /already reached the Lead/);
+  assert.equal(messages.filter(message => /proposed a gotcha/.test(message.input[0].text)).length, 1);
 });

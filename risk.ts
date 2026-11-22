@@ -54,6 +54,20 @@ const DEPENDENCY_PATH = /(^|\/)(package\.json|package-lock\.json|pnpm-lock\.yaml
 const CONFIG_PATH = /(^|\/)(\.github\/workflows\/|\.circleci\/|\.gitlab-ci\.yml$|Dockerfile[^/]*$|docker-compose[^/]*$|compose\.ya?ml$|terraform\/|k8s\/|helm\/|[^/]*\.tf$|vercel\.json$|netlify\.toml$|wrangler\.toml$|fly\.toml$|Procfile$|nginx[^/]*\.conf$|\.env\.example$)/i;
 /** Test files, so a change that adds code without tests shows. */
 const TEST_PATH = /(^|\/)(tests?|__tests__|spec|e2e)\/|\.(test|spec)\.[a-z0-9]+$|_test\.(go|py|rb)$|(^|\/)test_[^/]+\.py$/i;
+/**
+ * Files a person sees: markup, styles and components. A component file is known by its extension;
+ * plain .ts or .js counts only inside a UI folder, and never an API route (`pages/api/`, `app/api/`).
+ * Server code such as Django's views.py doesn't count, whatever its folder. Tests don't count.
+ */
+const UI_FILE = /\.(tsx|jsx|vue|svelte|astro|css|scss|sass|less|html|erb|hbs)$/i;
+const UI_SCRIPT_IN_UI_FOLDER = /(^|\/)(components?|pages|views|screens|layouts|styles|ui)\/.*\.(ts|js|mjs)$/i;
+const API_ROUTE = /(^|\/)(pages|app|src)\/api\//i;
+/** Documentation folders: generated HTML or CSS there isn't the product's UI. */
+const DOCS_FOLDER = /(^|\/)(docs?|\.specify)\//i;
+export function isUiPath(path: string): boolean {
+  if (TEST_PATH.test(path) || API_ROUTE.test(path) || DOCS_FOLDER.test(path)) return false;
+  return UI_FILE.test(path) || UI_SCRIPT_IN_UI_FOLDER.test(path);
+}
 /** Files that aren't code: a change made only of these needs no tests. */
 const NON_CODE_PATH = /\.(md|mdx|txt|rst|png|jpe?g|gif|svg|webp|ico)$|(^|\/)(docs?|\.specify)\//i;
 
@@ -65,6 +79,8 @@ export type RiskEvidence = {
   qa: "pass" | "carried" | "skipped" | "fail" | "none";
   /** Whether the factory runs QA as a gate for this PR. */
   qaGate: boolean;
+  /** With visual proof on: whether QA recorded screenshots of the change. True when it's off. */
+  proof?: boolean;
 };
 export type RiskFacts = {
   files: number;
@@ -78,6 +94,9 @@ export type RiskFacts = {
   deep: boolean;
   qa: RiskEvidence["qa"];
   qaGate: boolean;
+  /** Files a person sees, and whether QA recorded screenshots of them. */
+  ui: number;
+  proof: boolean;
 };
 
 export function riskFacts(files: readonly RiskFile[], evidence: RiskEvidence): RiskFacts {
@@ -96,6 +115,8 @@ export function riskFacts(files: readonly RiskFile[], evidence: RiskEvidence): R
     deep: evidence.deep,
     qa: evidence.qa,
     qaGate: evidence.qaGate,
+    ui: files.filter((file) => isUiPath(file.path)).length,
+    proof: evidence.proof ?? true,
   };
 }
 
@@ -125,8 +146,17 @@ export type RiskSummary = {
   source: "review" | "facts" | "unfinished";
 };
 
-/** Verification from evidence, never opinion: QA at this commit, and whether code came with tests. */
+/**
+ * Verification from evidence, never opinion: QA at this commit, whether code came with tests, and,
+ * with visual proof on, whether a UI change has screenshots. A UI change without them is at least Medium.
+ */
 export function verificationRating(facts: RiskFacts): RiskRating {
+  const rating = baseVerification(facts);
+  if ((facts.ui ?? 0) === 0 || facts.proof !== false) return rating;
+  return { level: rating.level === "low" ? "medium" : rating.level, reason: `${rating.reason}; no screenshots of the UI change` };
+}
+
+function baseVerification(facts: RiskFacts): RiskRating {
   const testsNote = facts.code === 0 ? "no code changed" : facts.tests > 0 ? `tests changed in ${plural(facts.tests, "file")}` : "no test files changed";
   const testsOk = facts.code === 0 || facts.tests > 0;
   switch (facts.qa) {
@@ -214,12 +244,16 @@ export function riskLevelWord(level: RiskLevel): string {
 }
 
 /** The PR comment. Reasons are plain text inside a list, so no markdown in them is needed. */
-export function riskComment(summary: RiskSummary, sha: string, updated = false): string {
+/** Why a summary posted again for the same commit: QA reported, or the person changed visual proof. */
+export type RiskUpdate = "qa" | "setting" | null;
+const UPDATE_WORDS: Record<"qa" | "setting", string> = { qa: "updated after QA reported on this commit", setting: "updated after visual proof was turned on or off" };
+export function riskComment(summary: RiskSummary, sha: string, updated: RiskUpdate | boolean = null): string {
+  const update = updated === true ? "qa" : updated === false ? null : updated;
   const lines = summary.lines.map((line) => `- **${line.label}:** ${line.level === null ? "not judged" : LEVEL_WORDS[line.level]}: ${escapeMarkdown(line.reason)}`);
   const source = summary.source === "review" ? "The Risk reviewer judged Impact, Rollback and Error detection; Verification comes from the factory's evidence."
     : summary.source === "unfinished" ? "Something was flagged, but no rating came back from the Risk reviewer in time, so this is from the diff and the evidence alone."
     : "Nothing was flagged, so this is from the diff and the evidence alone.";
-  return `**Factory merge risk: ${LEVEL_WORDS[summary.overall]}** at \`${sha.slice(0, 7)}\`${updated ? ", updated after QA reported on this commit" : ""}\n\n${lines.join("\n")}\n\n${source} It's informational: it doesn't change who may merge.`;
+  return `**Factory merge risk: ${LEVEL_WORDS[summary.overall]}** at \`${sha.slice(0, 7)}\`${update === null ? "" : `, ${UPDATE_WORDS[update]}`}\n\n${lines.join("\n")}\n\n${source} It's informational: it doesn't change who may merge.`;
 }
 
 function escapeMarkdown(text: string): string {
