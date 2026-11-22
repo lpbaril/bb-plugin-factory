@@ -39,6 +39,7 @@ import {
 export { computePreset, rosterWarnings, ROSTER_PRESETS, ROSTER_PRESET_LABELS };
 import { holdoutHealthLine, holdoutLine, type HoldoutHealth, type HoldoutSummary } from "./holdout-text";
 import { ciVerdict, cleanOutcomeNote, computeOutcomeHealth, outcomeHealthLine, revertedPrNumbers, CI_NO_RUNS_MS, CI_RERUN_WATCH_MS, MANUAL_OUTCOME_KINDS, OUTCOME_KINDS, OUTCOME_WINDOW_DAYS, OUTCOME_WINDOW_MS, type CiRun, type MergedPr, type OutcomeHealth } from "./outcomes";
+import { isUiPath } from "./risk";
 import { cleanRiskReason, riskComment, riskFacts, riskFlags, riskLevelWord, riskSummary, RISK_LEVELS, RISK_REVIEW_WAIT_MS, type RiskFacts, type RiskLevel, type RiskReview, type RiskSummary } from "./risk";
 export { holdoutHealthLine, holdoutLine, type HoldoutHealth, type HoldoutSummary };
 import { TOKEN_OUTCOMES, TOKEN_OUTCOME_LABELS, compactTokens, computeTokenProfile, sharePercent, type TokenProfile } from "./token-profile";
@@ -199,7 +200,9 @@ const prRiskSchema = z.object({
     files: z.number(), lines: z.number(), sensitive: z.number(), migrations: z.number(), dependencies: z.number(),
     config: z.number(), tests: z.number(), code: z.number(), deep: z.boolean(),
     qa: z.enum(["pass", "carried", "skipped", "fail", "none"]), qaGate: z.boolean(),
-  }) satisfies z.ZodType<RiskFacts>,
+    // Older summaries had no visual proof: no UI counted, nothing missing.
+    ui: z.number().default(0), proof: z.boolean().default(true),
+  }) satisfies z.ZodType<RiskFacts, unknown>,
   /** The Risk reviewer's thread, or null when nothing was flagged or it couldn't start. */
   threadId: z.string().nullable(),
   startedAt: z.string(),
@@ -213,8 +216,23 @@ const prRiskSchema = z.object({
   commentedAt: z.string().nullable(),
   /** When QA's standing changed after the summary settled, so the next comment says it's an update. */
   qaRefreshedAt: z.string().nullable().default(null),
+  /** When the summary was first posted at this commit; it isn't cleared by a repost. */
+  postedAt: z.string().nullable().default(null),
+  /** Why the next post is an update, once one was posted: QA reported, or the setting changed. */
+  updateReason: z.enum(["qa", "setting"]).nullable().default(null),
 });
 type PrRisk = z.infer<typeof prRiskSchema>;
+
+/** A task's visual proof: QA's screenshots, stored as task attachments, at the commits it checked. */
+const visualProofSchema = z.object({
+  shots: z.array(z.object({ attachmentId: z.string(), fileName: z.string(), caption: z.string(), sha: z.string(), at: z.string() })).default([]),
+  none: z.object({ reason: z.string(), sha: z.string(), at: z.string() }).nullable().default(null),
+  /** Gotchas already forwarded to the Lead, so a repeat isn't sent again. */
+  gotchasSent: z.array(z.string()).default([]),
+});
+type VisualProof = z.infer<typeof visualProofSchema>;
+/** Screenshots kept per commit: enough for the paths a change touches. */
+const MAX_PROOF_SHOTS = 8;
 
 /** Something that happened after a PR merged: see outcomes.ts. */
 const outcomeSignalSchema = z.object({
@@ -286,6 +304,8 @@ const prSchema = z.object({
   /** The commit the merge made on the base branch, and when, read from GitHub once the PR merged. */
   mergeSha: z.string().nullable().default(null),
   mergedAt: z.string().nullable().default(null),
+  /** The head whose "QA added visual proof" comment was posted, so it's posted once per commit. */
+  proofNoticeSha: z.string().nullable().default(null),
   /** The branch it merged into, so only that branch's CI counts. */
   baseBranch: z.string().nullable().default(null),
   /** CI on the base branch at the merge commit, checked with outcome signals on. settledAt: no more checks. */
@@ -945,6 +965,8 @@ export type MergeCardPayload = {
   moreFiles: number;
   /** The merge-risk summary for this commit, once settled. Informational: it doesn't change who may merge. */
   risk: RiskSummary | null;
+  /** Screenshots QA recorded, for a UI change; null with visual proof off or nothing to show. */
+  proof: { ui: number; uiUnknown: boolean; shots: { url: string; caption: string; fileName: string }[]; sha: string | null; atHead: boolean; none: string | null } | null;
 };
 export const MERGE_CARD_RENDERER = "merge-review";
 
@@ -1414,6 +1436,10 @@ const factorySchema = z.object({
   riskSummaryEnabled: z.boolean().default(false),
   /** Outcome signals after merge (reverts, post-merge CI): on for new factories, and a person's choice for existing ones. */
   outcomesEnabled: z.boolean().default(false),
+  /** Visual proof of UI changes, recorded by QA: on for new factories, and a person's choice for existing ones. */
+  visualProofEnabled: z.boolean().default(false),
+  /** QA's screenshots per task, as task attachments, and any reason it couldn't take them. Per task, since QA often runs before the PR. */
+  visualProofs: z.record(z.string(), visualProofSchema).default({}),
   /** A Planner's or Explorer's advice to close a task, which only the person can act on. */
   closeAdvice: z.record(z.string(), z.object({ role: z.enum(["plan", "explore"]), threadId: z.string(), commentId: z.string(), at: z.string() })).default({}),
   /** Each time a Builder stopped and reported instead of working around a rule, a check or a criterion. */
@@ -1479,7 +1505,7 @@ const boardTaskSchema = z.object({
 export type BoardTask = z.infer<typeof boardTaskSchema>;
 
 // Holdout scenarios are left out: a summary reaches the page and `bb factory list --json`, which any agent can run.
-const factorySummarySchema = factorySchema.omit({ agents: true, prs: true, holdouts: true }).extend({
+const factorySummarySchema = factorySchema.omit({ agents: true, prs: true, holdouts: true, visualProofs: true }).extend({
   bbProjectName: z.string(),
   /** Automatic PR actions paused (the `pr-watch-paused:` KV), which lives outside the factory record. */
   reviewsPaused: z.boolean(),
@@ -1908,6 +1934,7 @@ export const rpcContract = defineRpcContract({
         z.object({ kind: z.literal("holdouts"), enabled: z.boolean() }),
         z.object({ kind: z.literal("riskSummary"), enabled: z.boolean() }),
         z.object({ kind: z.literal("outcomes"), enabled: z.boolean() }),
+        z.object({ kind: z.literal("visualProof"), enabled: z.boolean() }),
         z.object({ kind: z.literal("mergePolicy"), policy: z.enum(MERGE_POLICIES) }),
         z.object({ kind: z.literal("reviewsPaused"), paused: z.boolean() }),
       ]),
@@ -1917,7 +1944,7 @@ export const rpcContract = defineRpcContract({
 });
 
 export type FactoryOptionChange =
-  | { kind: "tracks" | "designReview" | "evidenceContract" | "holdouts" | "riskSummary" | "outcomes"; enabled: boolean }
+  | { kind: "tracks" | "designReview" | "evidenceContract" | "holdouts" | "riskSummary" | "outcomes" | "visualProof"; enabled: boolean }
   | { kind: "mergePolicy"; policy: (typeof MERGE_POLICIES)[number] }
   | { kind: "reviewsPaused"; paused: boolean };
 /**
@@ -1931,6 +1958,7 @@ export function factoryOptionLoosens(change: FactoryOptionChange): { what: strin
   if (change.kind === "holdouts" && !change.enabled) return { what: "Turning holdout scenarios off", command: (prefix) => `holdouts ${prefix} off` };
   if (change.kind === "riskSummary" && !change.enabled) return { what: "Turning the merge-risk summary off", command: (prefix) => `risk-summary ${prefix} off` };
   if (change.kind === "outcomes" && !change.enabled) return { what: "Turning outcome signals off", command: (prefix) => `outcomes ${prefix} off` };
+  if (change.kind === "visualProof" && !change.enabled) return { what: "Turning visual proof off", command: (prefix) => `visual-proof ${prefix} off` };
   return null;
 }
 
@@ -2676,7 +2704,7 @@ export default async function plugin(bb: BbPluginApi) {
     const { factory, agent } = entry;
     if (agent.role === "lead") return leadCharter({ factoryName: factory.name, prefix: factory.prefix, mergePolicy: factory.mergePolicy, evidenceContract: factory.evidenceContract, tracks: factory.tracksEnabled, designReview: factory.designReviewEnabled, holdouts: factory.holdoutsEnabled });
     if (agent.taskKey === null) return null;
-    return workerReminder({ role: agent.role, factoryName: factory.name, taskKey: agent.taskKey, evidenceContract: factory.evidenceContract, tracks: factory.tracksEnabled, designReview: factory.designReviewEnabled, holdouts: factory.holdoutsEnabled });
+    return workerReminder({ role: agent.role, factoryName: factory.name, taskKey: agent.taskKey, evidenceContract: factory.evidenceContract, tracks: factory.tracksEnabled, designReview: factory.designReviewEnabled, holdouts: factory.holdoutsEnabled, visualProof: factory.visualProofEnabled });
   });
   /** Serializes read-modify-write of one factory record; keep `change` free of slow I/O. */
   const factoryLocks = new Map<string, Promise<unknown>>();
@@ -2698,7 +2726,7 @@ export default async function plugin(bb: BbPluginApi) {
     } catch {
       // A deleted project keeps its id as the name.
     }
-    const { agents: _agents, prs: _prs, holdouts: _holdouts, ...rest } = factory;
+    const { agents: _agents, prs: _prs, holdouts: _holdouts, visualProofs: _visualProofs, ...rest } = factory;
     const reviewsPaused = (await bb.storage.kv.get(`pr-watch-paused:${factory.prefix}`)) === true;
     return { ...rest, bbProjectName, reviewsPaused };
   }
@@ -2766,6 +2794,8 @@ export default async function plugin(bb: BbPluginApi) {
       holdouts: [],
       riskSummaryEnabled: true,
       outcomesEnabled: true,
+      visualProofEnabled: true,
+      visualProofs: {},
       leadThreadId: null,
       agents: [],
       createdAt: new Date().toISOString(),
@@ -4270,6 +4300,7 @@ export default async function plugin(bb: BbPluginApi) {
         tracks: factory.tracksEnabled,
         designReview: factory.designReviewEnabled,
         holdouts: factory.holdoutsEnabled,
+        visualProof: factory.visualProofEnabled,
         instructions: [
           args.instructions,
           args.candidate === undefined ? null : exploreAssignment(args.candidate, EXPLORE_TIMEBOX_MINUTES),
@@ -4478,10 +4509,15 @@ export default async function plugin(bb: BbPluginApi) {
       return false;
     }
   }
-  async function prComment(hostId: string, repo: string, number: number, body: string): Promise<void> {
-    await gh(hostId, ["pr", "comment", String(number), "--repo", repo, "--body-file", "-"], body).catch((error: unknown) =>
-      bb.log.warn(`could not comment on PR #${number}: ${String(error)}`),
-    );
+  /** Posts a PR comment, logging a failure. Returns whether it posted, for callers that record it. */
+  async function prComment(hostId: string, repo: string, number: number, body: string): Promise<boolean> {
+    try {
+      await gh(hostId, ["pr", "comment", String(number), "--repo", repo, "--body-file", "-"], body);
+      return true;
+    } catch (error) {
+      bb.log.warn(`could not comment on PR #${number}: ${String(error)}`);
+      return false;
+    }
   }
 
   // Rafter's REST API, as used by rafter-cli: POST starts a scan, GET polls it.
@@ -4874,6 +4910,7 @@ ${sections.join("\n\n---\n\n")}`;
         mergeSha: null,
         mergedAt: null,
         baseBranch: null,
+        proofNoticeSha: null,
         postMergeCi: null,
         outcomes: [],
       });
@@ -5271,6 +5308,269 @@ ${sections.join("\n\n---\n\n")}`;
     });
   }
 
+  // ----- Visual proof -----
+
+  const attachmentSchema = z.object({ id: z.string(), taskId: z.string().nullable(), commentId: z.string().nullable(), fileName: z.string(), mime: z.string(), sizeBytes: z.number(), isImage: z.boolean(), createdAt: z.string() });
+  /** Where the bb app serves a task attachment; the Tasks plugin's own page uses the same path. */
+  const attachmentUrl = (id: string) => `/api/v1/plugins/tasks/http/attachments/download?attachmentId=${encodeURIComponent(id)}`;
+  const PROOF_TEXT_MAX = 200;
+  const cleanProofText = (text: string) => {
+    const line = text.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim();
+    return line.length > PROOF_TEXT_MAX ? `${line.slice(0, PROOF_TEXT_MAX - 1)}…` : line;
+  };
+
+  /** `gh pr view --json files` lists at most this many files. */
+  const GH_FILE_LIST_CAP = 100;
+  /** Kept per task: the shots of this many recent commits, and this many tasks. */
+  const PROOF_COMMITS_KEPT = 3;
+  const PROOF_TASKS_KEPT = 300;
+  const shaMatches = (full: string, given: string) => full.startsWith(given) || given.startsWith(full);
+
+  /**
+   * The screenshots that belong to this PR: recorded since the task's previous PR closed, since proof
+   * is kept per task. Those at the PR's head win; otherwise the most recently recorded commit's, marked
+   * as another commit. QA's "couldn't capture" counts only at the head.
+   */
+  function proofForPr(factory: Factory, pr: Pr): { shots: VisualProof["shots"]; sha: string | null; atHead: boolean; none: string | null; any: boolean } {
+    const proof = factory.visualProofs[pr.taskKey];
+    if (proof === undefined) return { shots: [], sha: null, atHead: false, none: null, any: false };
+    const opened = Date.parse(pr.openedAt);
+    const since = Math.max(0, ...factory.prs
+      .filter((other) => other.number !== pr.number && other.taskKey === pr.taskKey && other.closedAt !== null && Number.isFinite(opened) && Date.parse(other.closedAt) <= opened)
+      .map((other) => Date.parse(other.closedAt!)));
+    // Shots of this exact head are this PR's whatever their time; the cutoff only drops other commits,
+    // and a shot of another PR's head is that PR's, whenever it closed.
+    const otherHeads = factory.prs.filter((other) => other.number !== pr.number && other.taskKey === pr.taskKey && other.headSha !== pr.headSha).map((other) => other.headSha);
+    const relevant = proof.shots.filter((shot) => shaMatches(pr.headSha, shot.sha)
+      || (!(Date.parse(shot.at) < since) && !otherHeads.some((head) => shaMatches(head, shot.sha))));
+    const atHead = relevant.filter((shot) => shaMatches(pr.headSha, shot.sha));
+    const newest = [...relevant].sort((a, b) => Date.parse(b.at) - Date.parse(a.at))[0];
+    const shots = atHead.length > 0 ? atHead : newest === undefined ? [] : relevant.filter((shot) => shot.sha === newest.sha);
+    const none = proof.none !== null && shaMatches(pr.headSha, proof.none.sha) ? proof.none.reason : null;
+    return { shots, sha: shots[0]?.sha ?? null, atHead: atHead.length > 0, none, any: relevant.length > 0 };
+  }
+
+  /**
+   * The same commit given short and in full is one commit: stored SHAs that this one extends take
+   * the longer form, so counting, the per-commit cap and pruning all see one commit.
+   */
+  function upgradeShas(proof: VisualProof, sha: string): void {
+    for (const shot of proof.shots) if (shaMatches(shot.sha, sha) && sha.length > shot.sha.length) shot.sha = sha;
+    if (proof.none !== null && shaMatches(proof.none.sha, sha) && sha.length > proof.none.sha.length) proof.none.sha = sha;
+  }
+
+  /** The longest form of this commit's SHA already stored, or the one given: a short SHA after a full one is the same commit. */
+  function canonicalSha(proof: VisualProof, sha: string): string {
+    const known = [...proof.shots.map((shot) => shot.sha), ...(proof.none === null ? [] : [proof.none.sha])].filter((stored) => shaMatches(stored, sha));
+    return [sha, ...known].sort((a, b) => b.length - a.length)[0]!;
+  }
+
+  /** Keeps the record small: the latest commits' shots per task, and the most recently proven tasks. */
+  function pruneProofs(factory: Factory): void {
+    for (const proof of Object.values(factory.visualProofs)) {
+      const recent = [...new Map([...proof.shots].sort((a, b) => Date.parse(b.at) - Date.parse(a.at)).map((shot) => [shot.sha, true])).keys()].slice(0, PROOF_COMMITS_KEPT);
+      proof.shots = proof.shots.filter((shot) => recent.includes(shot.sha));
+    }
+    const last = (proof: VisualProof) => Math.max(0, ...proof.shots.map((shot) => Date.parse(shot.at)), proof.none === null ? 0 : Date.parse(proof.none.at));
+    const keys = Object.keys(factory.visualProofs).sort((a, b) => last(factory.visualProofs[b]!) - last(factory.visualProofs[a]!));
+    for (const key of keys.slice(PROOF_TASKS_KEPT)) delete factory.visualProofs[key];
+  }
+
+  /**
+   * Proof or the setting changed: open PRs' risk summaries take the new standing (only screenshots
+   * at the head count, and nothing counts with visual proof off). A settled summary is posted again
+   * only when that changes what it says. An open merge card for them is taken back, so it comes back
+   * with the screenshots. The "QA added visual proof" PR comment is left to the PR pass, which
+   * retries it until it posts. taskKey null: every open PR of the factory.
+   */
+  async function refreshProof(prefix: string, taskKey: string | null, reason: "qa" | "setting"): Promise<void> {
+    const now = new Date().toISOString();
+    const touched = new Set<number>();
+    await mutateFactory(prefix, (current) => {
+      for (const pr of current.prs.filter((candidate) => candidate.state === "open" && (taskKey === null || candidate.taskKey === taskKey))) {
+        const risk = pr.risk;
+        // QA's proof changed this task's cards. A setting change changes only cards with UI files or
+        // screenshots to show; one whose UI count isn't known yet counts as possibly UI.
+        if (reason === "qa" || proofForPr(current, pr).any || (risk?.sha === pr.headSha ? risk.facts.ui > 0 : true)) touched.add(pr.number);
+        const proven = !current.visualProofEnabled || proofForPr(current, pr).atHead;
+        if (risk === null || risk.sha !== pr.headSha || risk.facts.proof === proven) continue;
+        const before = risk.overall === null ? null : riskSummaryOf(risk);
+        risk.facts.proof = proven;
+        if (before === null) continue;
+        const after = riskSummaryOf(risk);
+        const verification = (summary: RiskSummary) => summary.lines.find((line) => line.category === "verification");
+        // A PR with no UI files reads the same either way: nothing to post again.
+        if (after.overall === before.overall && verification(after)?.level === verification(before)?.level && verification(after)?.reason === verification(before)?.reason) continue;
+        risk.overall = after.overall;
+        risk.source = after.source;
+        risk.settledAt = now;
+        // The comment says "updated after QA reported" only when QA did; a setting change just reposts.
+        // A repost says why. Records from before postedAt existed count their last comment.
+        risk.postedAt ??= risk.commentedAt;
+        if (risk.postedAt !== null) risk.updateReason = reason;
+        if (reason === "qa" && risk.postedAt !== null) risk.qaRefreshedAt = now;
+        risk.commentedAt = null;
+      }
+      return current;
+    });
+    const open = openMergeCards.get(prefix);
+    if (open !== undefined && touched.has(open.pr)) {
+      open.controller.abort();
+      openMergeCards.delete(prefix);
+    }
+    wakePrWatch();
+  }
+
+  /** Once per head, after a PR was announced ready: say on the PR that QA added screenshots of it. */
+  async function maybePostProofNotice(prefix: string, hostId: string, repo: string, prNumber: number): Promise<void> {
+    const factory = await findFactory(prefix);
+    const pr = factory.prs.find((candidate) => candidate.number === prNumber);
+    if (!factory.visualProofEnabled || pr === undefined || pr.state !== "open" || pr.approvedNotifiedSha !== pr.headSha || pr.proofNoticeSha === pr.headSha) return;
+    const shown = proofForPr(factory, pr);
+    if (!shown.atHead) return;
+    // Never throws: the merge card comes after it in the same pass. An unposted notice stays owed.
+    const posted = await prComment(hostId, repo, pr.number, `**Factory:** QA added visual proof at \`${pr.headSha.slice(0, 7)}\`: ${shown.shots.length} screenshot${shown.shots.length === 1 ? "" : "s"}, on task ${pr.taskKey} in the Tasks page and on the merge card.`);
+    if (!posted) return;
+    await mutateFactory(prefix, (current) => {
+      const target = current.prs.find((candidate) => candidate.number === prNumber);
+      if (target !== undefined && target.headSha === pr.headSha) target.proofNoticeSha = pr.headSha;
+    });
+  }
+
+  /** The setting changed: every open PR's risk takes the new standing, and an open card comes back. */
+  async function withdrawCardForProof(prefix: string): Promise<void> {
+    await refreshProof(prefix, null, "setting");
+  }
+
+  /**
+   * QA records a screenshot it attached to the task, or why it couldn't take one. Only the task's
+   * latest QA thread can, and only an image already attached to this task or one of its comments
+   * counts, so a proof can't point at another task's file. Proposed gotchas go to the Lead, who
+   * makes a task to add them to the repo's `.factory/verification.md` through a reviewed PR.
+   */
+  async function recordProof(args: { taskKey: string; threadId: string | null; sha: string; attachmentId: string | null; caption: string | null; noneReason: string | null; gotchas: string | null }): Promise<string> {
+    const task = await getTaskByKey(args.taskKey);
+    const factory = await factoryForTaskKey(task.key);
+    const latestQa = factory.agents.filter((agent) => agent.role === "qa" && agent.taskKey === task.key).at(-1);
+    if (args.threadId === null || latestQa?.threadId !== args.threadId) {
+      throw new PluginCliError(`Only the latest QA thread the factory started for ${task.key} can record visual proof.`, { code: "not_the_qa" });
+    }
+    const given = args.sha.trim().toLowerCase();
+    if (!/^[0-9a-f]{7,40}$/.test(given)) throw new PluginCliError("--sha must be a commit hash: git rev-parse HEAD.", { code: "proof_sha_input" });
+    // A short SHA of an open PR's head is stored as the full one, so the same commit is one commit.
+    const sha = factory.prs.find((pr) => pr.taskKey === task.key && pr.state === "open" && pr.headSha.startsWith(given))?.headSha ?? given;
+    if ((args.attachmentId === null) === (args.noneReason === null)) {
+      throw new PluginCliError("Give either --attachment with --caption, or --none with --reason.", { code: "proof_input" });
+    }
+    const now = new Date().toISOString();
+    let stdout: string;
+    // Only a real change refreshes the PRs: a repeat must not take back the person's open card.
+    let changed = false;
+    if (args.attachmentId !== null) {
+      const caption = cleanProofText(args.caption ?? "");
+      if (caption === "") throw new PluginCliError("Say what the screenshot shows with --caption: the person reads it on the merge card.", { code: "proof_caption_required" });
+      const [own, onComments] = await Promise.all([
+        tasksRpc("listAttachments", { taskId: task.id }, z.object({ attachments: z.array(attachmentSchema) })),
+        tasksRpc("listAttachments", { commentsOfTaskId: task.id }, z.object({ attachments: z.array(attachmentSchema) })),
+      ]);
+      const attachment = [...own.attachments, ...onComments.attachments].find((entry) => entry.id === args.attachmentId);
+      if (attachment === undefined) {
+        throw new PluginCliError(`${args.attachmentId} isn't attached to ${task.key}.`, { code: "proof_not_attached", hint: `Attach it first: bb tasks attachment add ${task.key} --file <screenshot> --json, then pass the id it prints.` });
+      }
+      if (!attachment.isImage) throw new PluginCliError(`${attachment.fileName} isn't an image. Visual proof is a screenshot (PNG, JPEG, GIF or WebP).`, { code: "proof_not_image" });
+      let count = 0;
+      let already = false;
+      let updatedCaption = false;
+      await mutateFactory(factory.prefix, (current) => {
+        const proof = current.visualProofs[task.key] ?? { shots: [], none: null };
+        const canonical = canonicalSha(proof, sha);
+        upgradeShas(proof, canonical);
+        const atSha = proof.shots.filter((shot) => shaMatches(shot.sha, canonical));
+        const existing = atSha.find((shot) => shot.attachmentId === attachment.id);
+        if (existing !== undefined) {
+          // The same image again: only its caption can change.
+          if (existing.caption !== caption) { existing.caption = caption; updatedCaption = true; changed = true; }
+          count = atSha.length;
+          already = true;
+          return;
+        }
+        if (atSha.length >= MAX_PROOF_SHOTS) throw new PluginCliError(`${task.key} already has ${MAX_PROOF_SHOTS} screenshots at ${sha.slice(0, 7)}. Keep the ones that show the change best.`, { code: "proof_too_many" });
+        proof.shots.push({ attachmentId: attachment.id, fileName: attachment.fileName.slice(0, 200), caption, sha: canonical, at: now });
+        changed = true;
+        // A screenshot replaces an earlier "couldn't capture" for the same commit.
+        if (proof.none !== null && shaMatches(proof.none.sha, canonical)) proof.none = null;
+        current.visualProofs[task.key] = proof;
+        pruneProofs(current);
+        count = atSha.length + 1;
+      });
+      stdout = !already ? `Recorded screenshot ${count} of ${task.key} at ${sha.slice(0, 7)}. It shows on the merge card with your caption.`
+        : updatedCaption ? `That screenshot was already recorded at ${sha.slice(0, 7)}; its caption is now the new one.`
+        : `That screenshot was already recorded at ${sha.slice(0, 7)}, with the same caption. Nothing changed.`;
+    } else {
+      const reason = cleanProofText(args.noneReason ?? "");
+      if (reason === "") throw new PluginCliError("Say why there's no screenshot with --reason: the person reads it on the merge card.", { code: "proof_reason_required" });
+      await mutateFactory(factory.prefix, (current) => {
+        const proof = current.visualProofs[task.key] ?? { shots: [], none: null };
+        const canonical = canonicalSha(proof, sha);
+        upgradeShas(proof, canonical);
+        changed = proof.none === null || proof.none.reason !== reason || !shaMatches(proof.none.sha, canonical);
+        proof.none = { reason, sha: canonical, at: now };
+        current.visualProofs[task.key] = proof;
+        pruneProofs(current);
+      });
+      stdout = `Recorded that ${task.key} has no screenshot at ${sha.slice(0, 7)}, and why. The merge card says so, and the person confirms before merging.`;
+    }
+    const proposed = (args.gotchas ?? "").split("\n").map(cleanProofText).filter((line) => line !== "").slice(0, 5);
+    // Lines already forwarded for this task aren't sent again.
+    const sent = new Set((factory.visualProofs[task.key]?.gotchasSent ?? []).map((line) => line.toLowerCase()));
+    const gotchas = proposed.filter((line) => !sent.has(line.toLowerCase()));
+    if (proposed.length > 0 && gotchas.length === 0) stdout += " Your gotchas already reached the Lead.";
+    if (gotchas.length > 0) {
+      const told = factory.leadThreadId !== null && await tellLead(factory, `[factory] QA on ${task.key} proposed ${gotchas.length === 1 ? "a gotcha" : `${gotchas.length} gotchas`} for capturing this app, for \`.factory/verification.md\`:\n${gotchas.map((line) => `- ${line}`).join("\n")}\nCreate one task for a Builder to add them to that file through a normal reviewed PR, unless the file already says the same. Don't edit it yourself.`);
+      if (told) {
+        await mutateFactory(factory.prefix, (current) => {
+          const proof = current.visualProofs[task.key] ?? { shots: [], none: null, gotchasSent: [] };
+          proof.gotchasSent = [...(proof.gotchasSent ?? []), ...gotchas].slice(-20);
+          current.visualProofs[task.key] = proof;
+        });
+      }
+      stdout += told
+        ? ` The Lead was told about ${gotchas.length === 1 ? "your gotcha" : "your gotchas"}.`
+        : ` Your ${gotchas.length === 1 ? "gotcha" : "gotchas"} couldn't reach the Lead. Put ${gotchas.length === 1 ? "it" : "them"} in your task comment under "Proposed gotchas" instead.`;
+    }
+    if (changed) await refreshProof(factory.prefix, task.key, "qa");
+    bb.realtime.publish(BOARD_CHANGED, { prefix: factory.prefix });
+    return stdout;
+  }
+
+  async function prFilesForProof(hostId: string, repo: string, prNumber: number): Promise<{ path: string }[]> {
+    const view = JSON.parse(await gh(hostId, ["pr", "view", String(prNumber), "--repo", repo, "--json", "files"])) as { files?: { path: string }[] };
+    return view.files ?? [];
+  }
+
+  /** What the merge card shows about a UI change's screenshots. Null with visual proof off. */
+  function cardProof(factory: Factory, pr: Pr, files: readonly { path: string }[]): MergeCardPayload["proof"] {
+    if (!factory.visualProofEnabled) return null;
+    // GitHub's file list can come back empty when it couldn't be read: then the risk summary's count
+    // stands in. gh also lists at most 100 files, so a full list may leave UI files out. With no
+    // count to go on, the files count as unknown, which the card treats as possibly UI.
+    const fromRisk = pr.risk?.sha === pr.headSha ? pr.risk.facts.ui : null;
+    const listed = files.filter((file) => isUiPath(file.path)).length;
+    const truncated = files.length >= GH_FILE_LIST_CAP;
+    const unknown = (files.length === 0 && fromRisk === null) || (truncated && listed === 0 && !(fromRisk !== null && fromRisk > 0));
+    const ui = files.length > 0 ? Math.max(listed, fromRisk ?? 0) : fromRisk ?? 0;
+    const shown = proofForPr(factory, pr);
+    if (ui === 0 && !unknown && shown.shots.length === 0) return null;
+    return {
+      ui,
+      uiUnknown: unknown,
+      shots: shown.shots.map((shot) => ({ url: attachmentUrl(shot.attachmentId), caption: shot.caption, fileName: shot.fileName })),
+      sha: shown.sha === null ? null : shown.sha.slice(0, 7),
+      atHead: shown.atHead,
+      none: shown.none,
+    };
+  }
+
   // ----- Outcome signals -----
 
   /** Reverts and post-merge CI are read at most this often per factory: they change slowly. */
@@ -5515,15 +5815,24 @@ ${sections.join("\n\n---\n\n")}`;
       if (risk === null) return;
       // QA can report after the PR went ready, on the same commit: Verification follows it.
       if (risk.facts.qa !== riskQaState(pr)) await refreshRiskQa(prefix, pr.number, risk.sha, riskQaState(pr));
+      // So can its screenshots, including ones recorded while this record was being made.
+      const latest = await findFactory(prefix);
+      const latestPr = latest.prs.find((candidate) => candidate.number === prNumber);
+      if (latestPr?.risk?.sha === pr.headSha && latestPr.risk.facts.proof !== (!latest.visualProofEnabled || proofForPr(latest, latestPr).atHead)) {
+        await refreshProof(prefix, pr.taskKey, "qa");
+      }
       const current = (await findFactory(prefix)).prs.find((candidate) => candidate.number === prNumber)?.risk;
       if (current?.sha === pr.headSha && current.overall === null && (await riskSettled(current))) await settleRisk(prefix, pr.number, current.sha);
       const settled = (await findFactory(prefix)).prs.find((candidate) => candidate.number === prNumber)?.risk;
       if (settled?.sha === pr.headSha && settled.overall !== null && settled.commentedAt === null) {
         // Not prComment, which only logs a failure: an unposted summary is retried on the next pass.
-        await gh(hostId, ["pr", "comment", String(pr.number), "--repo", repo, "--body-file", "-"], riskComment(riskSummaryOf(settled), settled.sha, settled.qaRefreshedAt !== null));
+        await gh(hostId, ["pr", "comment", String(pr.number), "--repo", repo, "--body-file", "-"], riskComment(riskSummaryOf(settled), settled.sha, (settled.postedAt ?? (settled.qaRefreshedAt === null ? null : "posted")) === null ? null : settled.updateReason ?? "qa"));
         await mutateFactory(prefix, (target) => {
           const record = target.prs.find((candidate) => candidate.number === prNumber)?.risk;
-          if (record?.sha === settled.sha) record.commentedAt = new Date().toISOString();
+          if (record?.sha === settled.sha) {
+            record.commentedAt = new Date().toISOString();
+            record.postedAt ??= record.commentedAt;
+          }
         });
       }
     } catch (error) {
@@ -5535,9 +5844,11 @@ ${sections.join("\n\n---\n\n")}`;
     const view = JSON.parse(await gh(hostId, ["pr", "view", String(pr.number), "--repo", repo, "--json", "files,headRefOid"])) as { files?: { path: string; additions?: number; deletions?: number }[]; headRefOid?: string };
     if (view.headRefOid !== undefined && view.headRefOid !== pr.headSha) return null;
     const files = (view.files ?? []).map((file) => ({ path: file.path, additions: file.additions ?? 0, deletions: file.deletions ?? 0 }));
-    const facts = riskFacts(files, { deep: pr.deep, qa: riskQaState(pr), qaGate: factory.evidenceContract });
+    const facts = riskFacts(files, { deep: pr.deep, qa: riskQaState(pr), qaGate: factory.evidenceContract, proof: !factory.visualProofEnabled || proofForPr(factory, pr).atHead });
+    // A full list may leave UI files out: count the PR as possibly UI rather than as none.
+    if (files.length >= GH_FILE_LIST_CAP && facts.ui === 0) facts.ui = 1;
     const flags = riskFlags(facts);
-    const record: PrRisk = { sha: pr.headSha, facts, threadId: null, startedAt: new Date().toISOString(), review: null, reviewedAt: null, overall: null, source: null, settledAt: null, commentedAt: null, qaRefreshedAt: null };
+    const record: PrRisk = { sha: pr.headSha, facts, threadId: null, startedAt: new Date().toISOString(), review: null, reviewedAt: null, overall: null, source: null, settledAt: null, commentedAt: null, qaRefreshedAt: null, postedAt: null, updateReason: null };
     let saved = false;
     await mutateFactory(factory.prefix, (current) => {
       const target = current.prs.find((candidate) => candidate.number === pr.number);
@@ -5593,7 +5904,12 @@ ${sections.join("\n\n---\n\n")}`;
       risk.overall = summary.overall;
       risk.source = summary.source;
       risk.settledAt = new Date().toISOString();
-      risk.qaRefreshedAt = risk.settledAt;
+      // "Updated" only if a summary was already on the PR; otherwise this is its first comment.
+      risk.postedAt ??= risk.commentedAt;
+      if (risk.postedAt !== null) {
+        risk.qaRefreshedAt = risk.settledAt;
+        risk.updateReason = "qa";
+      }
       risk.commentedAt = null;
     });
     const open = openMergeCards.get(prefix);
@@ -5775,6 +6091,7 @@ ${sections.join("\n\n---\n\n")}`;
       files: files.slice(0, 60),
       moreFiles: Math.max(0, files.length - 60),
       risk: factory.riskSummaryEnabled && pr.risk?.sha === pr.headSha && pr.risk.overall !== null ? riskSummaryOf(pr.risk) : null,
+      proof: cardProof(factory, pr, files),
     } };
   }
 
@@ -5987,7 +6304,26 @@ ${sections.join("\n\n---\n\n")}`;
     const overlaps = await findMergeOverlaps(factory, hostId, repo, pr);
     const qaNote = await currentQaCarryNote(factory, hostId, repo, pr);
     const overlapComment = overlaps.length === 0 ? "" : ` It shares files with ${overlaps.map((overlap) => `#${overlap.number}`).join(" and ")}, so merging either first may conflict with the other.`;
-    await prComment(hostId, repo, pr.number, `**Factory:** every reviewer approves \`${pr.headSha.slice(0, 7)}\` (${labels}). Marked ready for review${scanNote}. ${leadMayMerge(factory, pr) ? "The Lead may merge once its gates pass." : scanning ? "Merging is up to you once it finishes." : "Merging is up to you."}${overlapComment}${qaNote === "" ? "" : ` ${qaNote}`}`);
+    // Screenshots stay on the task: GitHub gets only how many there are and where.
+    // A failed file read is treated as an unreadable list, as the card does.
+    // Read fresh, so screenshots QA recorded during this pass are counted.
+    const fresh = await findFactory(factory.prefix);
+    const freshPr = fresh.prs.find((candidate) => candidate.number === pr.number) ?? pr;
+    const shown = fresh.visualProofEnabled ? await prFilesForProof(hostId, repo, pr.number).catch(() => []).then((files) => cardProof(fresh, freshPr, files)) : null;
+    const proofComment = shown === null ? ""
+      : shown.shots.length > 0 ? ` Visual proof: ${shown.shots.length} screenshot${shown.shots.length === 1 ? "" : "s"} at \`${shown.sha}\`${shown.atHead ? "" : ", another commit"}, on task ${pr.taskKey} in the Tasks page and on the merge card.`
+      // QA's reason is free text, which can name internal hosts: it stays on the task and the card.
+      : shown.uiUnknown ? ` No screenshots were recorded, and the changed files couldn't be read to tell whether this is a UI change.`
+      : ` No screenshots of this UI change were recorded${shown.none === null ? "" : "; QA recorded why, on the task"}.`;
+    const readyPosted = await prComment(hostId, repo, pr.number, `**Factory:** every reviewer approves \`${pr.headSha.slice(0, 7)}\` (${labels}). Marked ready for review${scanNote}. ${leadMayMerge(factory, pr) ? "The Lead may merge once its gates pass." : scanning ? "Merging is up to you once it finishes." : "Merging is up to you."}${overlapComment}${proofComment}${qaNote === "" ? "" : ` ${qaNote}`}`);
+    // The ready comment already counted the head's screenshots: no separate notice for them. Only
+    // if it posted, though: otherwise the notice is still owed.
+    if (readyPosted && shown?.atHead === true) {
+      await mutateFactory(factory.prefix, (current) => {
+        const target = current.prs.find((candidate) => candidate.number === pr.number);
+        if (target !== undefined && target.headSha === pr.headSha) target.proofNoticeSha = pr.headSha;
+      });
+    }
     const task = await getTaskByKey(pr.taskKey);
     await comment(task.id, `[PR #${pr.number}](${pr.url}) approved by ${labels} and marked ready for review.`);
     // If anything here fails, the PR is already ready, so maybeAnnounceReapproval delivers this on a
@@ -6266,6 +6602,7 @@ ${sections.join("\n\n---\n\n")}`;
         await maybeAnnounceReapproval(factory, hostId, repo, pr);
         await maybeMarkReady(factory, hostId, repo, pr);
         await maybeAssessRisk(prefix, hostId, repo, pr.number);
+        await maybePostProofNotice(prefix, hostId, repo, pr.number);
         await maybeOfferMergeCard(prefix, hostId, repo, pr.number);
       });
     }
@@ -7212,6 +7549,11 @@ ${findings}`;
             await mutateFactory(factory.prefix, (current) => { current.riskSummaryEnabled = change.enabled; });
             wakePrWatch();
             break;
+          case "visualProof":
+            if (factory.visualProofEnabled === change.enabled) break;
+            await mutateFactory(factory.prefix, (current) => { current.visualProofEnabled = change.enabled; });
+            await withdrawCardForProof(factory.prefix);
+            break;
           case "outcomes":
             await mutateFactory(factory.prefix, (current) => { current.outcomesEnabled = change.enabled; });
             outcomeChecks.delete(factory.prefix);
@@ -7964,6 +8306,54 @@ ${findings}`;
               threadId: ctx.threadId ?? null,
             });
             return { exitCode: 0, stdout: `Recorded the merge risk of PR #${pr.number}. The factory posts it on the PR and the merge card. You're done.` };
+          },
+        }),
+        proof: cliCommand({
+          summary: "Record visual proof of a UI change: a screenshot attached to the task, or why none could be taken (the task's latest QA thread only)",
+          positionals: [{ name: "task", description: "Task key, such as APP-12", required: true }],
+          options: {
+            sha: { type: "string", required: true, description: "The commit you checked: git rev-parse HEAD" },
+            attachment: { type: "string", description: "The id from bb tasks attachment add <KEY> --file <screenshot> --json" },
+            caption: { type: "string", description: "What the screenshot shows, in one line" },
+            none: { type: "boolean", description: "No screenshot could be taken; say why with --reason" },
+            reason: { type: "string", description: "Why no screenshot could be taken" },
+            gotchas: { type: "string", description: "Tips for capturing this app that the repo's .factory/verification.md should have, one per line" },
+          },
+          async run(input, ctx) {
+            const factory = await factoryForTaskKey((await getTaskByKey(input.positionals.task)).key);
+            if (!factory.visualProofEnabled) throw new PluginCliError(`${factory.prefix} has visual proof off.`, { code: "visual_proof_off", hint: `Only the person can turn it on, with \`bb factory visual-proof ${factory.prefix} on\`.` });
+            if (input.options.none === true && input.options.attachment !== undefined) throw new PluginCliError("Give either --attachment or --none, not both.", { code: "proof_input" });
+            const stdout = await recordProof({
+              taskKey: input.positionals.task,
+              threadId: ctx.threadId ?? null,
+              sha: input.options.sha,
+              attachmentId: input.options.attachment?.trim() || null,
+              caption: input.options.caption ?? null,
+              noneReason: input.options.none === true ? input.options.reason ?? "" : null,
+              gotchas: input.options.gotchas ?? null,
+            });
+            return { exitCode: 0, stdout };
+          },
+        }),
+        "visual-proof": cliCommand({
+          summary: "Show or set whether QA records screenshots of UI changes for the merge card: on or off (setting it is for the person only)",
+          positionals: [
+            { name: "factory", description: "Factory prefix", required: true },
+            { name: "state", description: "on or off; omit to show it" },
+          ],
+          async run(input, ctx) {
+            const factory = await findFactory(input.positionals.factory);
+            const requested = input.positionals.state;
+            if (requested === undefined) return { exitCode: 0, stdout: `${factory.prefix}: visual proof ${factory.visualProofEnabled ? "on" : "off"}` };
+            if (requested !== "on" && requested !== "off") throw new PluginCliError("The state is on or off.", { code: "visual_proof_input" });
+            if (ctx.threadId != null) throw new PluginCliError("Only the person can change this, from outside an agent thread.", { code: "visual_proof_person_only" });
+            if (factory.visualProofEnabled === (requested === "on")) return { exitCode: 0, stdout: `${factory.prefix}: visual proof is already ${requested}.` };
+            await mutateFactory(factory.prefix, (current) => { current.visualProofEnabled = requested === "on"; });
+            await withdrawCardForProof(factory.prefix);
+            bb.realtime.publish(BOARD_CHANGED, { prefix: factory.prefix });
+            return { exitCode: 0, stdout: requested === "on"
+              ? `${factory.prefix}: visual proof on. QA assigned from now on screenshots the UI changes it checks and attaches them to the task. The merge card shows them, and asks you to confirm before merging a UI change without any. It never blocks QA. Running QA picks up the rule on its next turn.`
+              : `${factory.prefix}: visual proof off. QA no longer records screenshots; ones already attached stay on their tasks.` };
           },
         }),
         outcome: cliCommand({

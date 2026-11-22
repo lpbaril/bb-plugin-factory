@@ -421,6 +421,9 @@ const DESIGN_REMINDERS: Partial<Record<WorkerRoleId, string>> = {
   plan: "A READY plan needs \"## Success checks\", and lists each question only the person can answer under Open questions as `- For the person: Q1. <question> Assumed: <what the plan builds on>`. Resolve each design finding with `bb factory design-resolve <KEY> --finding <id> --as fix|contest|escalate|decline --note \"...\"`; after any fix, post a new complete READY plan and mark it ready again.",
 };
 
+/** With visual proof on, QA screenshots UI changes for the merge card. */
+const VISUAL_PROOF_REMINDER = "For a UI change, attach screenshots to the task and record each with `bb factory proof <KEY> --sha <commit> --attachment <id> --caption \"...\"`, or why you couldn't with `--none --reason`.";
+
 /** With holdouts on, QA runs the hidden scenarios and the Builder knows they exist. */
 const HOLDOUT_REMINDERS: Partial<Record<WorkerRoleId, string>> = {
   qa: "Run the holdout scenarios too (`bb factory scenarios <KEY>`) and record each with `bb factory scenario <KEY> <id> --result pass|fail|invalid --sha <commit>`. Report a failure as a symptom, never by copying a scenario, and never post the scenarios anywhere.",
@@ -432,8 +435,8 @@ const TRACK_REMINDERS: Partial<Record<WorkerRoleId, string>> = {
   design: "When more than one interaction model is reasonable, propose two or more with their trade-offs.",
 };
 
-export function workerReminder(args: { role: WorkerRoleId; factoryName: string; taskKey: string; evidenceContract?: boolean; tracks?: boolean; designReview?: boolean; holdouts?: boolean }): string {
-  const track = [args.tracks ? TRACK_REMINDERS[args.role] : undefined, args.designReview ? DESIGN_REMINDERS[args.role] : undefined, args.holdouts ? HOLDOUT_REMINDERS[args.role] : undefined].filter((part) => part !== undefined).join(" ") || undefined;
+export function workerReminder(args: { role: WorkerRoleId; factoryName: string; taskKey: string; evidenceContract?: boolean; tracks?: boolean; designReview?: boolean; holdouts?: boolean; visualProof?: boolean }): string {
+  const track = [args.tracks ? TRACK_REMINDERS[args.role] : undefined, args.designReview ? DESIGN_REMINDERS[args.role] : undefined, args.holdouts ? HOLDOUT_REMINDERS[args.role] : undefined, args.visualProof && args.role === "qa" ? VISUAL_PROOF_REMINDER : undefined].filter((part) => part !== undefined).join(" ") || undefined;
   const offTask = args.role === "designreview" || args.role === "scenarios" || args.role === "risk";
   return `# Standing role: ${ROLES[args.role].label} in the "${args.factoryName}" software factory, on task ${args.taskKey}
 
@@ -654,11 +657,26 @@ This factory keeps holdout scenarios: end-to-end checks written from the origina
 4. **Keep them hidden.** Report a failure, to the Builder and in your task comment, as a symptom: what you did, what you expected and what happened, as you would any bug. Never copy a scenario's text or title, and never post the scenarios anywhere. The factory passes your final message to the Lead only if it quotes none, and tells the person about a comment that quotes one.`;
 }
 
+/** QA's part in visual proof, for factories with it on. */
+function qaVisualProofBrief(taskKey: string): string {
+  return `## Visual proof of UI changes
+
+When the change touches something a person sees (components, pages, styles, markup), show it. The person merges from a phone and reads your screenshots instead of checking out the branch.
+
+1. If the repository has \`.factory/verification.md\`, follow it: it says how to start this app and what to watch out for.
+2. Start the app and walk the path the task describes. For a bug, show the symptom is gone; for a feature, show the new behavior and its key states. Use \`bb browser-automation\` for a web app (\`open\`, then \`run\` to drive it and \`screenshot\`), or computer use for a desktop app.
+3. Attach each screenshot to the task and record it, up to 8 per commit: \`bb tasks attachment add ${taskKey} --file <screenshot> --json\`, then \`bb factory proof ${taskKey} --sha $(git rev-parse HEAD) --attachment <id> --caption "<what it shows>"\`. Prefer the final state worth inspecting closely; never commit screenshots to the branch.
+4. If you can't capture it (the app needs a backend or a login you don't have, or the screen exists only on another platform), record why instead: \`bb factory proof ${taskKey} --sha $(git rev-parse HEAD) --none --reason "<why>"\`. Never claim a check you didn't make. This doesn't block your verdict; the person decides at merge.
+5. If capturing this app taught you something the next QA should know, add \`--gotchas "<one tip per line>"\` to a \`bb factory proof\` call. The Lead turns them into a reviewed change to \`.factory/verification.md\`.
+6. Stop the app and close the browser session when you're done.`;
+}
+
 const BUILD_HOLDOUT_BRIEF = `## Holdout scenarios
 
 QA also checks this task against hidden scenarios, written from the original request by another agent. Don't look for them or ask for them: build the whole request, its failure cases included, not only what the plan's checks name.`;
 
 export function workerPrompt(args: {
+  visualProof?: boolean;
   holdouts?: boolean;
   designReview?: boolean;
   tracks?: boolean;
@@ -698,7 +716,7 @@ export function workerPrompt(args: {
 You are part of the "${args.factoryName}" software factory. ${isShadow ? "The factory started you for a reviewer trial; your work is collected for comparison and does not go to the Lead." : isRisk ? "The factory started you to rate a PR's merge risk. Your rating goes on the merge card and the PR, for the person; it doesn't go to the Lead, and it doesn't change who may merge." : `${isPrReview ? "The factory started you for a PR review. The Lead is your parent, but routine final replies are suppressed; record your verdict so the factory can report the complete round. If stuck, block the task and explicitly tell the Lead." : "The Lead assigned you this task and is your parent thread: your final message is reported to it automatically."}`}
 
 ${CULTURE}
-${args.evidenceContract ? `\n${evidenceBrief(args.role, args.task.key)}\n` : ""}${args.holdouts && args.role === "qa" ? `\n${qaHoldoutBrief(args.task.key)}\n` : ""}${args.holdouts && args.role === "build" ? `\n${BUILD_HOLDOUT_BRIEF}\n` : ""}
+${args.evidenceContract ? `\n${evidenceBrief(args.role, args.task.key)}\n` : ""}${args.holdouts && args.role === "qa" ? `\n${qaHoldoutBrief(args.task.key)}\n` : ""}${args.visualProof && args.role === "qa" ? `\n${qaVisualProofBrief(args.task.key)}\n` : ""}${args.holdouts && args.role === "build" ? `\n${BUILD_HOLDOUT_BRIEF}\n` : ""}
 ${trackerCommands(args.prefix)}
 
 ## Your task: ${args.task.key} · ${args.task.title}
